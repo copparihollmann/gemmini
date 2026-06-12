@@ -1,0 +1,75 @@
+### Optimization Plan
+
+The baseline implementation computes the entire matrix multiplication using a single large `gemmini_loop_ws_spad` invocation, followed by a single `gemmini_mx_read_smem` call. This serialization leaves the systolic array idle while the completed output is drained to DRAM. 
+
+To resolve this, we will apply **Strategy 5: Software-pipelined double-buffering in mx_smem**. Since the matrix has `tiles_I = 2` (32 rows), we can split the computation along the $I$ dimension into two steps of `block_I = 1` (16 rows each).
+
+1. **Hoist Weight Loads**: Since matrix B is shared across all row blocks of A, we can load all B tiles into the scratchpad once at the very beginning of the function, eliminating redundant weight loads.
+2. **Double-buffered SMEM allocation**: We will define two alternating SMEM destinations:
+   - `SPAD_DEST_0 = SPAD_DEST` (128)
+   - `SPAD_DEST_1 = SPAD_DEST + 256` (384)
+   Each destination accommodates $1 \times 16$ tiles of 256 BF16 elements ($16 \times 16 \times 16 = 4096$ half-words, corresponding to 256 rows in SMEM).
+3. **Pipelined Loop over $I$**:
+   - In iteration `i0 = 0`: Load A tiles for rows 0–15, compute block 0, and write output to `SPAD_DEST_0`.
+   - In iteration `i0 = 1`: Load A tiles for rows 16–31, initiate computation of block 1 writing to `SPAD_DEST_1`, and simultaneously drain block 0's SMEM buffer (`SPAD_DEST_0`) to `C_hw` in DRAM using `gemmini_mx_read_smem`.
+4. **Post-Loop Clean up**: Drain the final block 1 from `SPAD_DEST_1` to `C_hw` in DRAM, followed by a single synchronization `gemmini_fence()`.
+
+---
+
+### Optimized C Code
+
+```c
+void solution(void) {
+  // 1. Flush and configure Gemmini MX weight-stationary mode
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // 2. Load all B tiles into the scratchpad once (hoisted out of the computation loop)
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+  for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + j * DIM),
+                            b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+    }
+  }
+
+  // Calculate dynamic rows to read for the two double-buffered chunks
+  int rows_to_read_0 = (REAL_M > 16) ? 16 : REAL_M;
+  int rows_to_read_1 = (REAL_M > 16) ? (REAL_M - 16) : 0;
+
+  // 3. Software-pipelined double-buffered execution loop
+  for (int i0 = 0; i0 < 2; i0++) {
+    // MVIN A tiles for the current row block (block_I = 1)
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * DIM) * MATMUL_K + k * DIM),
+                            a_base + k * DIM, DIM, DIM);
+    }
+
+    // Alternate SMEM output destinations
+    uint32_t cur_spad_dest = (i0 == 0) ? SPAD_DEST : (SPAD_DEST + 256);
+    int cur_pad_i = (i0 == 0) ? 0 : PAD_I;
+
+    // Configure requantization parameters for the current block_I = 1
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, 1, tiles_J, tiles_K, 0, 0, 1);
+
+    // Compute block i0
+    gemmini_loop_ws_spad(1, tiles_J, tiles_K, cur_pad_i, PAD_J, PAD_K, a_base, BANK_NUM * BANK_ROWS, 0,
+                         cur_spad_dest, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+    // Overlap: Drain the PREVIOUS block's SMEM buffer to DRAM while the current block computes
+    if (i0 > 0) {
+      gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, rows_to_read_0 * MATMUL_N);
+    }
+  }
+
+  // 4. Drain the last block (block 1) to DRAM
+  if (rows_to_read_1 > 0) {
+    gemmini_mx_read_smem(&C_hw[16][0], (SPAD_DEST + 256) * 16, rows_to_read_1 * MATMUL_N);
+  }
+
+  gemmini_fence();
+}
+```

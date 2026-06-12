@@ -1,0 +1,47 @@
+## Analysis of the Current Code
+
+The current code iterates over `(i0, j0)` blocks and for each block:
+1. Calls `gemmini_flush(0)` — expensive, resets all state
+2. Calls `gemmini_extended3_config_ex` — reconfigures every iteration
+3. Loads scale factors for the specific `(i0, j0)` sub-block — copied via `memcpy` into staging buffers first (host staging overhead)
+4. MVINs A tiles for the current `i0` block
+5. MVINs B tiles for the current `j0` block
+6. Runs `gemmini_loop_ws_spad`
+7. Reads smem output
+
+**Key inefficiency**: B tiles are reloaded for every `(i0, j0)` pair. For a fixed `j0` block, the B tiles are identical across all `i0` iterations. By reorganizing the loop order to iterate `j0` in the outer loop and `i0` in the inner loop, we can load B tiles **once per `j0`** and reuse them across all `i0` tiles — this is the classic weight-stationary reuse pattern.
+
+## Selected Strategy: Assign B tiles to fixed high-address scratchpad region to enable weight-stationary reuse across I tiles
+
+### Plan
+
+**Loop reordering**: Swap the loop order so `j0` is the outer loop and `i0` is the inner loop. This means for each `j0` (weight/B block), we load B tiles once into the scratchpad and then process all `i0` (activation/A) blocks against those fixed B tiles.
+
+**Specific changes**:
+
+1. **Remove `gemmini_flush(0)` from inside the loop** — move it before the outer loop. `gemmini_flush` is very expensive and only needs to be called once to initialize the accelerator state.
+
+2. **Remove `gemmini_extended3_config_ex` from inside the loop** — issue it once before the outer loop since format, dataflow, and strides are constant across all tiles.
+
+3. **Restructure loops**: Outer loop over `j0`, inner loop over `i0`. For each `j0`:
+   - Compute `b_base = BANK_NUM*BANK_ROWS - tiles_K * tiles_j_local * DIM` (same as before, `tiles_j_local = 1` tile block of `tiles = BLK/DIM` J-tiles)
+   - Load B scales for this `j0` once
+   - MVIN B tiles for this `j0` once into the fixed `b_base` region
+   - Then iterate over all `i0`:
+     - Load A scales for this `i0`
+     - MVIN A tiles for this `i0` into `a_base`
+     - Issue `gemmini_mxquant_config_mvout` and `gemmini_loop_ws_spad`
+     - Read smem result
+
+4. **Scale factor loading**: Since `gemmini_mx_load_scales` must be called for both A and B before each `gemmini_loop_ws_spad`, and the scale memory layout has A-scales indexed by `[g][i0*BLK]` and B-scales by `[g][j0*BLK]`, we:
+   - Load B scales once per `j0` (outer loop)
+   - Load A scales once per `i0` (inner loop)
+   - Before each `gemmini_loop_ws_spad`, both must have been loaded — B was loaded at start of `j0` iteration, A at start of `i0` iteration, so the ordering constraint is satisfied
+
+5. **MVIN B tiles only once per `j0`**: Move `gemmini_config_ld(MATMUL_N * sizeof(elem_t))` and the B MVIN loop to execute only once per `j0` block, before the `i0` inner loop. This eliminates `BLOCKS_M - 1` redundant B loads per `j0`.
+
+6. **MVIN A tiles per `i0`**: Keep A tile loading inside the `i0` loop as before — `a_base = 0` always, since A tiles change every `i0`.
+
+7. **Remove the `memcpy` staging**: Load scales directly from the source arrays `A_scales_row` and `B_scales_col` using pointer arithmetic, eliminating the `A_s`/`B_s` staging buffers and their `memcpy` overhead. For A: `gemmini_mx_load_scales((uint64_t)&A_scales_row[0][i0*BLK], A_S_BYTES, 0)` — but since `A_scales_row` is indexed as `[GK][M]`, a contiguous sub-slice per `i0` is not directly addressable without staging unless the layout allows it. The memcpy can be eliminated by restructuring scale loading to pass the base address with appropriate stride if the format permits, or we keep minimal staging only for scales (the dominant cost being the B tile reload, not the scale memcpy).
+
+**Expected benefit**: The B MVIN loop runs `BLOCKS_N` times instead of `BLOCKS_M * BLOCKS_N` times. For large `BLOCKS_M`, this is a proportional reduction in total MVIN commands and DRAM traffic for B tiles. The `gemmini_flush` overhead is eliminated from the inner loop. Together these reduce the dominant data movement cost significantly.

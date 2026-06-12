@@ -1,0 +1,81 @@
+An elegant and highly effective optimization plan to reduce the execution time of the matrix multiplication kernel is to **reuse loaded B (weight) tiles across multiple I-tile iterations without re-mvin (Strategy 7)**.
+
+### Inefficiency Analysis
+The baseline implementation only computes a single 64×64 block of the total 128×128 output matrix, omitting the outer loops required to cover the full output space. If we were to naively wrap the computation in nested loops, we would reload the B (weight) tiles from DRAM 4 times (once for every combination of `bi` and `bj` blocks). DRAM access is a major bottleneck on Gemmini. 
+
+### Optimization Plan
+1. **Loop Nesting and B-Tile Reuse**: We will restructure the kernel to loop over the 128×128 grid in 2×2 blocks of size 64×64 (`ti = 4`, `tj = 4`). By placing the N-dimension block loop (`bj`) on the outside and the M-dimension block loop (`bi`) on the inside, we can load the B-tiles into the top of the scratchpad *once* per `bj` iteration, and reuse them across both `bi` iterations without any redundant DRAM fetches. This eliminates 50% of the B matrix DRAM loading overhead.
+2. **Coalesced SMEM Writes (Strategy 13)**: To write back each block's output correctly, we will allocate a temporary aligned DRAM buffer `temp_C` of size 64×64 BF16 words (64×16 `uint64_t` words). We will perform a single, large block transfer from `mx_smem` to `temp_C` using `gemmini_mx_read_smem`, and then let the CPU scatter the result into the non-contiguous rows of `C_hw`. This maximizes DRAM write-burst efficiency.
+3. **Hoisting Configs and Scales**: Hoist format-invariant instructions—including LUT loads (`gemmini_mx_load_lut`), scale loads (`gemmini_mx_load_scales`), and strides (`gemmini_config_st`)—completely out of all loops to eliminate instruction-dispatch overhead.
+
+---
+
+### Optimized Code
+
+```c
+// Optimized MX matmul kernel (128x128x256, fp6:e3m2) with B-tile reuse across I-tile iterations.
+void solution(void) {
+  {
+    int ti = MATMUL_M / DIM / 2, tj = MATMUL_N / DIM / 2, tk = MATMUL_K / DIM;
+    uint32_t ab = 0;
+    uint32_t bb = BANK_NUM * BANK_ROWS - tk * tj * DIM;
+    int SDST = 128;
+    
+    // Aligned temporary DRAM buffer for high-efficiency contiguous SMEM reads
+    uint64_t temp_C[64][16] __attribute__((aligned(64)));
+
+    // Configure execution format and pre-load all format-invariant tables
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 1, 1, 3, 1);
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mx_load_lut((uint64_t)B_lut_p, 1, 0);
+    gemmini_mx_load_lut((uint64_t)A_lut_p, 1, 1);
+
+    // Outer loop over N-dimension blocks (bj)
+    for (int bj = 0; bj < 2; bj++) {
+      
+      // Load B block `bj` into scratchpad (reused across all `bi` iterations)
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2);
+      for (int k = 0; k < tk; k++) {
+        for (int j = 0; j < tj; j += 2) {
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + k * DIM * (MATMUL_N / 2) + (bj * tj + j) * DIM), 
+                                bb + (k * tj + j) * DIM, 
+                                2 * DIM, 
+                                DIM);
+        }
+      }
+
+      // Inner loop over M-dimension blocks (bi)
+      for (int bi = 0; bi < 2; bi++) {
+        
+        // Load A block `bi` into scratchpad
+        gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+        for (int i = 0; i < ti; i++) {
+          for (int k = 0; k < tk; k += 2) {
+            gemmini_extended_mvin((void*)(((elem_t*)A_in_hw) + (bi * ti + i) * DIM * MATMUL_K + k * DIM), 
+                                  ab + (i * tk + k) * DIM, 
+                                  2 * DIM, 
+                                  DIM);
+          }
+        }
+
+        // Configure output requantizer and execute the fused WS compute loop
+        gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti, tj, tk, 0, 0, 9);
+        gemmini_loop_ws_spad(ti, tj, tk, 0, 0, 0, ab, BANK_NUM * BANK_ROWS, 0, SDST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+        // Batched SMEM read to temporary contiguous DRAM buffer
+        gemmini_mx_read_smem(temp_C, SDST * 16, ti * tj * DIM * DIM);
+        gemmini_fence();
+
+        // Copy block output from temporary contiguous buffer to destination C_hw subgrid
+        for (int i = 0; i < 64; i++) {
+          for (int j = 0; j < 16; j++) {
+            C_hw[bi * 64 + i][bj * 16 + j] = temp_C[i][j];
+          }
+        }
+      }
+    }
+  }
+}
+```

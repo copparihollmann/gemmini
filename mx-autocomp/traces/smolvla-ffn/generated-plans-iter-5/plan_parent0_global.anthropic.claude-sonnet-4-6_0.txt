@@ -1,0 +1,44 @@
+## Analysis of the Current Code
+
+The current code iterates over `(i0, j0)` output blocks. For each `(i0, j0)` pair, it:
+1. Calls `gemmini_flush(0)` — expensive pipeline drain every iteration
+2. Calls `gemmini_extended3_config_ex` — redundant reconfiguration every iteration
+3. Copies scale factors via `memcpy` into staging buffers `A_s` and `B_s` — CPU host staging
+4. Loads scales, mvins A and B tiles, computes, reads results
+
+The key inefficiency relevant to **strategy 4 (reuse loaded B tiles across multiple I-tile iterations)** is:
+
+For each `j0`, the B tiles are identical regardless of which `i0` we're on. Yet the current code re-mvins B tiles for every `(i0, j0)` pair. Additionally, `gemmini_flush`, `gemmini_extended3_config_ex`, and scale loading are all repeated per `(i0, j0)`.
+
+## Selected Strategy: Strategy 4 — Reuse B Tiles Across I-tile Iterations
+
+### Plan
+
+**Restructure the loop order from `(i0, j0)` to `(j0, i0)`**, and hoist B-tile loading (and the configuration that doesn't change per-i0) outside the inner `i0` loop:
+
+1. **Hoist `gemmini_flush` and `gemmini_extended3_config_ex`** completely outside both loops — they are format/dataflow configuration that doesn't change per tile.
+
+2. **Move the `j0` loop to the outer position** and the `i0` loop to the inner position. For a fixed `j0`, B tiles are the same for all `i0` values.
+
+3. **Inside the `j0` loop (but outside `i0`):**
+   - Compute `b_base` based on `j0` (since `tiles_J=1` per block, B tiles for this `j0` block are fixed).
+   - Mvin B tiles once for this `j0` block.
+   - Load B scale factors once (they depend only on `j0`, not `i0`).
+
+4. **Inside the `i0` loop (inner):**
+   - Load only A scale factors (they depend on `i0`).
+   - Mvin A tiles.
+   - Configure mvout, run `gemmini_loop_ws_spad`, read smem.
+
+5. **Eliminate the `memcpy` CPU staging**: load A scales directly from `A_scales_row[g][i0*BLK]` and B scales from `B_scales_col[g][j0*BLK]` into appropriately-sized sub-arrays, or better — since `gemmini_mx_load_scales` takes a DRAM address and length, load directly from the source arrays without any memcpy by passing a pointer into `A_scales_row` and `B_scales_col` with the correct byte length.
+
+   For B: call `gemmini_mx_load_scales` once per `j0` (outside `i0` loop).  
+   For A: call `gemmini_mx_load_scales` once per `i0` (inside `i0` loop, since A scales vary with `i0`).
+
+6. **B tiles are loaded once per `j0`**, shared across all `BLOCKS_M` values of `i0` — this reduces B mvin count from `BLOCKS_M * BLOCKS_N` to `BLOCKS_N`.
+
+7. **Scratchpad capacity check**: With `tiles = BLK/DIM` A-tiles and `tiles * tiles_K` B-tiles, the layout `(tiles_I*tiles_K + tiles_J*tiles_K)*DIM` must still fit within 8192 rows. Since B is reused, b_base must be stable across `i0` iterations — it only depends on `tiles` (tiles_J per block) and `tiles_K`, which are loop-invariant. A tiles are re-mvined each `i0` into `a_base=0`, overwriting the previous A block. This is safe.
+
+8. **Per the programming model sequence**, for each `(i0, j0)` compute invocation: scales must be loaded before `gemmini_loop_ws_spad`. B scales are loaded once at `j0` entry; A scales are loaded at each `i0`. The sequence per inner iteration becomes: load A scales → mvin A tiles → mxquant_config_mvout → loop_ws_spad → mx_read_smem. B scales and B tiles were already loaded at `j0` entry, satisfying the requirement that both A and B scales are present before compute.
+
+This directly reduces the number of B mvins by factor `BLOCKS_M`, eliminates redundant `gemmini_flush` and `gemmini_extended3_config_ex` calls from `BLOCKS_M * BLOCKS_N` down to 1, and eliminates all `memcpy` CPU staging by reading scale factors directly from the source arrays.

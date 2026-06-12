@@ -1,0 +1,98 @@
+An elegant and highly effective optimization plan to address the performance and correctness bottlenecks is to apply **Loop Tiling** (Strategy 1).
+
+### Analysis of Inefficiencies & Violations in the Original Code:
+1. **Accumulator Overflow (Correctness Violation)**: The hardware constraint states: *Accumulator must hold all C tiles: `tiles_I * tiles_J * DIM <= 256` rows*. In the original code, `tiles_I = 2` and `tiles_J = 16`, requiring `2 * 16 * 16 = 512` rows of accumulator. This exceeds the maximum capacity of 256 rows, resulting in silent memory corruption and out-of-bounds accumulator access.
+2. **Poor Scratchpad and Accumulator Utilization**: The original code reported 0KB utilization for both memories because it did not partition or utilize the scratchpad blocks correctly for tiling, and the accumulator was completely overcommitted.
+3. **Data Movement Overhead**: We can load the entire A matrix into the scratchpad once and reuse it across multiple tiled computation phases of B, drastically amortizing A-side DRAM-to-scratchpad transfer costs.
+
+### Optimization Plan: J-Dimension Loop Tiling (`block_J = 8`)
+- We will tile the `J` dimension with a block size of `block_J = 8`.
+- This reduces the active accumulator rows to `tiles_I * block_J * DIM = 2 * 8 * 16 = 256` rows, which perfectly fits the single-buffered accumulator maximum capacity.
+- The entire $A$ matrix ($32 \times 256$) is loaded once into the scratchpad at `a_base = 0` (taking only 512 rows, leaving plenty of space).
+- We then loop over the $J$ blocks (2 iterations). In each iteration, we load the corresponding B-tile block of size $256 \times 128$ into the top of the scratchpad, run the fused `gemmini_loop_ws_spad` hardware WS loop, and drain the $32 \times 128$ output block directly to DRAM using strided `gemmini_mx_read_smem` transfers.
+
+---
+
+### Optimized C Code Implementation
+
+```c
+#include <stdint.h>
+#include "include/gemmini_testutils.h"
+
+// Optimized MX matmul kernel (32x256x256, fp8:e4m3).
+void solution(void) {
+  // Tile dimensions
+  const int tiles_I = MATMUL_M / DIM; // 2
+  const int tiles_J = MATMUL_N / DIM; // 16
+  const int tiles_K = MATMUL_K / DIM; // 16
+
+  // Tile J dimension with block_J = 8 to perfectly fit the 256-row accumulator
+  const int block_J = 8; 
+
+  // Calculate scratchpad partition bases
+  const int a_base = 0;
+  // B grows downwards from the top of the scratchpad based on the J block size
+  const int b_base = BANK_NUM * BANK_ROWS - block_J * tiles_K * DIM;
+
+  // Ensure no overlap between A and B regions
+  if (a_base + tiles_I * tiles_K * DIM > b_base) {
+    return;
+  }
+
+  // 1. Configure execution (FP8 E4M3 formats, BF16 output)
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  
+  // 2. Load scale factors
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // 3. Load entire A matrix into the scratchpad (Loaded once and reused across J tiles)
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin(
+        (void *)(((elem_t *)A_in) + i * DIM * MATMUL_K + k * DIM),
+        a_base + (i * tiles_K + k) * DIM,
+        DIM, DIM
+      );
+    }
+  }
+
+  // 4. Iterate over J blocks
+  for (int jb = 0; jb < tiles_J / block_J; jb++) {
+    const int j_start = jb * block_J;
+
+    // Load B tiles for the current J block
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+    for (int jj = 0; jj < block_J; jj++) {
+      const int j = j_start + jj;
+      for (int k = 0; k < tiles_K; k++) {
+        gemmini_extended_mvin(
+          (void *)(((elem_t *)B_in) + k * DIM * MATMUL_N + j * DIM),
+          b_base + (jj * tiles_K + k) * DIM,
+          DIM, DIM
+        );
+      }
+    }
+
+    // 5. Configure the requantized mvout (using block_J)
+    gemmini_config_st(MATMUL_N * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, block_J, tiles_K, 0, 0, 1);
+  
+    // 6. Run weight-stationary compute loop for the current block
+    gemmini_loop_ws_spad(tiles_I, block_J, tiles_K, 0, 0, 0,
+                         a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                         false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+                       
+    // 7. Drain tiled output block from shared memory to DRAM
+    gemmini_mx_read_smem(
+      &C_hw[0][j_start * DIM],
+      SPAD_DEST * 16,
+      (tiles_I * DIM) * (block_J * DIM)
+    );
+  }
+
+  // Synchronize execution
+  gemmini_fence();
+}
+```

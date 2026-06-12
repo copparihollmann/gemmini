@@ -1,0 +1,67 @@
+### Optimization Plan
+
+We will apply **Strategy 13: Set `lut_update_granularity` to its maximum 16-bit hardware limit (0xFFFF) when the quantization LUT is completely static, bypassing all runtime refresh state-machine checks in the requantizer hardware.**
+
+#### Analysis & Action:
+1. **Dequantization LUT Analysis**: In the given FP6 execution path, the look-up tables `B_lut_p` and `A_lut_p` are loaded once prior to starting the computations and remain entirely static throughout the entire matrix multiplication.
+2. **Hardware Overhead**: When the `lut_update_granularity` is set to a low value, the hardware requantizer periodically pauses to refresh or verify the LUT state during K-reductions, adding unnecessary pipeline stalls.
+3. **Bypassing Checks**: By configuring `lut_update_granularity` to its maximum 16-bit limit of `0xFFFF`, we signal to the hardware that the LUT is completely static. This completely bypasses the runtime refresh state-machine checks in the requantizer hardware, reducing overall execution latency.
+4. **Ordering Correctness**: We will also re-order the instruction stream to strictly match the requested programming model sequence: `gemmini_extended3_config_ex` $\rightarrow$ `gemmini_mx_load_scales` $\rightarrow$ `gemmini_mx_load_lut` $\rightarrow$ `mvin` tiles $\rightarrow$ `gemmini_mxquant_config_mvout` (with `0xFFFF`) $\rightarrow$ `gemmini_loop_ws_spad` $\rightarrow$ `gemmini_mx_read_smem` $\rightarrow$ `gemmini_fence()`.
+
+---
+
+### Optimized Code
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+
+// OPTIMIZED MX matmul kernel (128x128x256, fp6:e3m2).
+void solution(void) {
+  {
+    int ti = MATMUL_M / DIM / 2, tj = MATMUL_N / DIM / 2, tk = MATMUL_K / DIM;
+    uint32_t ab = 0;
+    uint32_t bb = BANK_NUM * BANK_ROWS - tk * tj * DIM;
+    int SDST = 128;
+    
+    // 1. Configure execution (FP6 format, WEIGHT_STATIONARY, USE_LUT)
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 1, 1, 3, 1);
+    
+    // 2. Load scale factors for both A and B
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+    
+    // 3. Load static LUTs for activation (A) and weights (B)
+    gemmini_mx_load_lut((uint64_t)B_lut_p, 1, 0);
+    gemmini_mx_load_lut((uint64_t)A_lut_p, 1, 1);
+    
+    // 4. Batch MVIN for A: Load 2 tiles (32 columns) at once
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i = 0; i < ti; i++) {
+      for (int k = 0; k < tk; k += 2) {
+        gemmini_extended_mvin((void*)(((elem_t*)A_in_hw) + i*DIM*MATMUL_K + k*DIM), ab + (i*tk + k)*DIM, 2 * DIM, DIM);
+      }
+    }
+    
+    // Batch MVIN for B: Load 2 tiles (32 columns) at once
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2);
+    for (int k = 0; k < tk; k++) {
+      for (int j = 0; j < tj; j += 2) {
+        gemmini_extended_mvin((void*)(((elem_t*)B_in) + k*DIM*(MATMUL_N/2) + j*DIM), bb + (k*tj + j)*DIM, 2 * DIM, DIM);
+      }
+    }
+    
+    // 5. Configure output store & requantizer with 0xFFFF to bypass LUT refresh checks
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti, tj, tk, 0, 0, 0xFFFF);
+    
+    // 6. Fused hardware compute loop
+    gemmini_loop_ws_spad(ti, tj, tk, 0, 0, 0, ab, BANK_NUM * BANK_ROWS, 0, SDST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    
+    // 7. Drain BF16-packed results and wait for DMA completion
+    gemmini_mx_read_smem(&C_hw[0][0], SDST * 16, MATMUL_M * MATMUL_N);
+    gemmini_fence();
+  }
+}
+```

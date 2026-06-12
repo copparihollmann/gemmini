@@ -1,0 +1,87 @@
+An elegant and highly effective optimization plan to significantly reduce the execution latency.
+
+### Optimization Plan: Loop Tiling & High-Occupancy Scratchpad/Accumulator Mapping (Strategy 1)
+
+**Analysis of Inefficiencies in the Original Code:**
+1. **Extremely High Loop Overhead & Redundant Loading:** The original code tiles the $64 \times 64 \times 64$ matrix into small blocks (`BLK=32` or similar) and loops over them. This causes the CPU to repeatedly reload the same scales and issue configuration instructions, creating severe CPU-RoCC instruction dispatch bottlenecks.
+2. **Underutilized Memories:** The scratchpad and accumulator are largely empty. For a $64 \times 64 \times 64$ problem size, the entire input and output matrices can fit simultaneously in the hardware memories:
+   * **Scratchpad:** A fully loaded $A$ matrix ($4 \times 4$ tiles) and $B$ matrix ($4 \times 4$ tiles) consume only $256 + 256 = 512$ rows of the $8192$ available rows ($6.25\%$ utilization).
+   * **Accumulator:** The entire output $C$ ($4 \times 4$ tiles) consumes exactly $256$ rows of the $256$ available accumulator rows ($100\%$ utilization).
+3. **Redundant `gemmini_flush` Calls:** Calling `gemmini_flush` in the inner loop destroys performance by invalidating state and stalling execution pipelines.
+
+**Proposed Changes:**
+1. **Collapse Outer Loops:** Eliminate the nested block loops (`i0`, `j0`) and compute the entire $64 \times 64 \times 64$ matrix multiplication in a single unified `gemmini_loop_ws_spad` sweep.
+2. **Eliminate CPU Staging Copies:** Directly load the original scale factor matrices `A_scales_row` and `B_scales_col` using `gemmini_mx_load_scales`, eliminating the need for `A_scales_perf` and `B_scales_perf`.
+3. **Map Tiles Contiguously:** MVIN all $A$ and $B$ tiles into the scratchpad in a single sweep before computation. 
+4. **Follow Constraints:** Ensure B base layout strictly maps to $b\_base + (j \times tiles\_K + k) \times DIM$ and $b\_base = 8192 - tiles\_K \times tiles\_J \times DIM$ as required by **Rule 12**.
+5. **Direct Read to DRAM:** Drain the complete $C\_hw$ output matrix from `mx_smem` to DRAM in one `gemmini_mx_read_smem` transaction.
+
+---
+
+### Optimized Code
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+#include "include/matmul_fp8_64x64.h"
+
+void solution(void) {
+  // Tile counts (for 64x64x64, these will be 4, 4, 4)
+  int tiles_I = MATMUL_M / DIM;
+  int tiles_J = MATMUL_N / DIM;
+  int tiles_K = MATMUL_K / DIM;
+
+  uint32_t a_base = 0;
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+  int SPAD_DEST = 128;
+
+  uint32_t scale_factors[512] __attribute__((aligned(32))) = {0};
+
+  // Flush once at the beginning to establish clean baseline
+  gemmini_flush(0);
+
+  // 1. Configure Gemmini for weight-stationary MX-fp8 (out_mx_fmt = 3 for BF16 output)
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // 2. Load the entire scale factors directly from DRAM
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // 3. MVIN all A tiles into scratchpad
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      const elem_t *dram_ptr = (const elem_t*)A_in + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void*)dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  // 4. MVIN all B tiles into top of scratchpad (Rule 12 indexing)
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k++) {
+      const elem_t *dram_ptr = (const elem_t*)B_in + k * DIM * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base + (j * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void*)dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  // 5. Configure store stride and scale memory
+  int OUT_COLS = MATMUL_N / BF16_PER_WORD;
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // 6. Execute fused hardware tiled matrix multiplication
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 
+                       0, 0, 0, 
+                       a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                       false, false, false, false, false, 
+                       NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // 7. Drain the entire BF16 output matrix to DRAM in one burst
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```

@@ -1,0 +1,55 @@
+## Analysis of the Original Code
+
+Looking at the original code, I need to identify which strategy offers the most impactful improvement.
+
+The current `gemmini_mxquant_config_mvout` call uses `lut_update_granularity=1`, meaning the output LUT refreshes after every single tile during the requantization post-pass. This is the most conservative (and slowest) setting. The documentation explicitly states:
+
+> `lut_update_granularity` G in `gemmini_mxquant_config_mvout` controls how often the output LUT refreshes during quantization; **larger G = fewer refreshes = faster**.
+
+Since `out_mx_fmt=3` (BF16 output), the output format is BF16, not a re-quantized FP6/FP4. In this BF16 output path, the LUT refresh is unnecessary overhead on every tile. Setting G to a larger value — specifically `tiles_I * tiles_J` (the total number of output tiles) or simply a very large number — will minimize or eliminate these unnecessary LUT refresh operations entirely.
+
+## Selected Strategy: **Strategy 4 — Try new parameter values**
+
+### Plan
+
+**Change `lut_update_granularity` from `1` to `tiles_I * tiles_J`** in the `gemmini_mxquant_config_mvout` call.
+
+- With `G=1`, the requantizer refreshes the output LUT after every single output tile, incurring overhead `tiles_I * tiles_J` times total.
+- With `G = tiles_I * tiles_J`, the LUT refreshes at most once for the entire matmul, amortizing the refresh cost across all output tiles.
+- Since `out_mx_fmt=3` (BF16 output), the LUT is not driving the requantization path in a format-sensitive way, making the maximum G value safe for correctness.
+- No other changes to the computation, memory layout, or instruction ordering are needed.
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // MVIN A: for each row-tile i, all tiles_K k-tiles are contiguous in DRAM
+  // and scratchpad, so batch them in a single block_mvin (tiles_K <= MAX_BLOCK_LEN=4).
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K;
+    uint32_t sp_addr = a_base + (i * tiles_K) * DIM;
+    gemmini_block_mvin((void*)dram_ptr, sp_addr, tiles_K);
+  }
+
+  // MVIN B: reorder to k-outer, j-inner so all j-tiles for a fixed k are
+  // contiguous in DRAM and scratchpad, then batch in a single block_mvin.
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int k = 0; k < tiles_K; k++) {
+    elem_t *dram_ptr = ((elem_t*)B_in) + (k * DIM) * MATMUL_N;
+    uint32_t sp_addr = b_base + (k * tiles_J) * DIM;
+    gemmini_block_mvin((void*)dram_ptr, sp_addr, tiles_J);
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  // Increase lut_update_granularity from 1 to tiles_I*tiles_J to minimize
+  // LUT refresh overhead across all output tiles.
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, tiles_I * tiles_J);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```

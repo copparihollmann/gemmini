@@ -1,0 +1,44 @@
+## Analysis of the Current Code
+
+The current code issues **4 separate `gemmini_extended_mvin` commands for A** (one per i-tile, each batching 4 k-tiles via `gemmini_block_mvin`) and **4 separate commands for B** (one per k-tile, each batching 4 j-tiles). This is already reasonably efficient.
+
+However, looking at the B-tile layout more carefully:
+
+- B is stored in the scratchpad at `b_base + (k*tiles_J + j)*DIM`
+- For the `gemmini_loop_ws_spad` call, the hardware iterates over all (i, j, k) combinations
+- **B tiles are loaded once and reused across all `tiles_I=4` i-tile iterations** — this is correct
+- But the **loop order for B mvin** is outer-k, inner-j, which means DRAM accesses for B aren't maximally contiguous
+
+The key inefficiency I see is in the **B mvin**: the current loop iterates `k` outer, `j` inner, with stride `MATMUL_N * sizeof(elem_t)` configured. For fixed `k`, tiles `j=0..3` are contiguous in DRAM (correct), so `block_mvin` works. This is already good.
+
+## Selected Strategy: **Strategy 6 — Reuse loaded B (weight) tiles across multiple I-tile iterations without re-mvin**
+
+Looking more carefully, the current code already does this implicitly (B is loaded once, A is loaded once, then `gemmini_loop_ws_spad` handles all I×J×K in hardware). So the real opportunity is **Strategy 14**: the `scale_factors` array is declared as a zero-initialized runtime array on the stack, which requires a `memset`-equivalent zeroing at runtime on every `solution()` call.
+
+Re-examining: the most impactful single strategy here is **Strategy 13/14** combined — but let me focus on the most clearly applicable one.
+
+## Selected Strategy: **Strategy 14 — Eliminate runtime `scale_factors` zero-array indirection**
+
+## Plan
+
+The `scale_factors` array is declared as:
+```c
+uint32_t scale_factors[512] __attribute__((aligned(32))) = {0};
+```
+This is a **local variable** initialized to zero on each call. The C runtime must zero 512×4 = 2048 bytes on the critical path before `gemmini_mxquant_config_mvout` can be called. Since it's only used as the DRAM destination address passed to `gemmini_mxquant_config_mvout` (the hardware writes scale outputs there), and the initial value doesn't affect correctness (the hardware overwrites it), we should make this a **static** variable to eliminate the per-call zeroing cost.
+
+**Change**: Declare `scale_factors` as `static uint32_t scale_factors[512] __attribute__((aligned(32)));` — this moves it to BSS (zeroed once at program load) and eliminates the runtime `memset` on every `solution()` invocation. The hardware still writes into it after the matmul, so correctness is preserved.
+
+Additionally, looking at the `OUT_COLS` computation: the current code uses `OUT_COLS` from the header. The `gemmini_config_st` call passes `OUT_COLS * sizeof(out_t)` where `out_t = uint64_t` (8 bytes). This should be verified but is likely correct per the reference pattern.
+
+**Concrete change to make:**
+
+```c
+// Before (on critical path, zeroed every call):
+uint32_t scale_factors[512] __attribute__((aligned(32))) = {0};
+
+// After (in BSS, zeroed once at load time):
+static uint32_t scale_factors[512] __attribute__((aligned(32)));
+```
+
+This is a focused, low-risk change that removes 2KB of zeroing from the critical path with zero correctness impact, directly reducing latency.

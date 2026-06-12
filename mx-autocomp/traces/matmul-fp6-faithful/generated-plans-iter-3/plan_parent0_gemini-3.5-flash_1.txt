@@ -1,0 +1,68 @@
+An elegant and highly effective way to optimize this kernel is to apply **Strategy 8: raise `lut_update_granularity`**.
+
+### Optimization Plan
+
+1. **Analyze the Inefficiency**:
+   In the original code, the `lut_update_granularity` parameter in `gemmini_mxquant_config_mvout` was set to `9`. Since the reduction dimension tile count `tk` is `16` (derived from `MATMUL_K / DIM = 256 / 16 = 16`), this leads to frequent, redundant output LUT updates. Because the output requantization LUT is invariant across the entire $K$ reduction, we can raise the update granularity to `tk` (`16`). This ensures that the output LUT is refreshed exactly once per output $(i, j)$ tile (every `tk` steps), eliminating the extra hardware refresh overhead and improving performance.
+
+2. **Enforce Correct Programming Model Sequence**:
+   The hardware requires a strict instruction sequence to prevent stale configuration states:
+   `gemmini_extended3_config_ex` $\rightarrow$ `gemmini_mx_load_scales` $\rightarrow$ `gemmini_mx_load_lut` $\rightarrow$ `gemmini_extended_mvin` (scratchpad loads) $\rightarrow$ `gemmini_mxquant_config_mvout` $\rightarrow$ `gemmini_loop_ws_spad` $\rightarrow$ `gemmini_mx_read_smem` $\rightarrow$ `gemmini_fence`.
+   We will rearrange the operations to strictly respect this order (moving `gemmini_mxquant_config_mvout` to execute after scratchpad loads, right before computation starts).
+
+### Optimized C Code
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+
+// AUTO-GENERATED optimized MX matmul kernel (128x128x256, fp6:e3m2).
+void solution(void) {
+  {
+    int ti = MATMUL_M / DIM / 2, tj = MATMUL_N / DIM / 2, tk = MATMUL_K / DIM;
+    uint32_t ab = 0;
+    uint32_t bb = BANK_NUM * BANK_ROWS - tk * tj * DIM;
+    int SDST = 128;
+    
+    // 1. Configure Gemmini execution and format
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 1, 1, 3, 1);
+    
+    // 2. Load scale factors
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+    
+    // 3. Load dequantization LUTs
+    gemmini_mx_load_lut((uint64_t)B_lut_p, 1, 0);
+    gemmini_mx_load_lut((uint64_t)A_lut_p, 1, 1);
+    
+    // 4. Batch MVIN for A: Load 2 tiles (32 columns) at once
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i = 0; i < ti; i++) {
+      for (int k = 0; k < tk; k += 2) {
+        gemmini_extended_mvin((void*)(((elem_t*)A_in_hw) + i*DIM*MATMUL_K + k*DIM), ab + (i*tk + k)*DIM, 2 * DIM, DIM);
+      }
+    }
+    
+    // Batch MVIN for B: Load 2 tiles (32 columns) at once
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2);
+    for (int k = 0; k < tk; k++) {
+      for (int j = 0; j < tj; j += 2) {
+        gemmini_extended_mvin((void*)(((elem_t*)B_in) + k*DIM*(MATMUL_N/2) + j*DIM), bb + (k*tj + j)*DIM, 2 * DIM, DIM);
+      }
+    }
+    
+    // 5. Configure the output stride and requantizer
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    // Raised lut_update_granularity to 'tk' (16) to refresh once per output tile
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti, tj, tk, 0, 0, tk);
+    
+    // 6. Run fused compute loop
+    gemmini_loop_ws_spad(ti, tj, tk, 0, 0, 0, ab, BANK_NUM * BANK_ROWS, 0, SDST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    
+    // 7. Drain results to DRAM and synchronize
+    gemmini_mx_read_smem(&C_hw[0][0], SDST * 16, MATMUL_M * MATMUL_N);
+    gemmini_fence();
+  }
+}
+```

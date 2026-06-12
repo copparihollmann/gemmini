@@ -1,0 +1,80 @@
+## Analysis of Current Code
+
+The current code issues all A mvins first (via `gemmini_block_mvin` on port 0), then all B mvins (via `gemmini_block_mvin` on port 0 again — note that `gemmini_block_mvin` uses `k_MVIN`, i.e., port 0). This means:
+
+1. Port 0 is busy loading A tiles
+2. Port 0 then loads B tiles sequentially
+3. Neither overlap occurs, nor are both DMA ports used simultaneously
+
+**Strategy: Interleave A (port 0 `mvin`) and B (port 1 `mvin2`) loads tile-by-tile so both DMA ports are active simultaneously**
+
+This is strategy #10 combined with strategy #5: use `mvin2` for B tiles and interleave A and B mvin instructions tile-by-tile so both DMA engines are active simultaneously rather than running serially.
+
+### Specific Changes
+
+**Current pattern:**
+```
+// All A loads via port 0
+config_ld(MATMUL_K)
+for i: block_mvin(A[i], sp_A[i], tiles_K)   // port 0 only
+
+// All B loads via port 0
+config_ld(MATMUL_N)
+for k: block_mvin(B[k], sp_B[k], tiles_J)   // port 0 only
+```
+
+**New pattern:**
+- Use `gemmini_extended_mvin` (port 0) for A tiles with `config_ld(MATMUL_K * sizeof(elem_t))`
+- Use `gemmini_extended_mvin2` (port 1) for B tiles — port 1 has its own config register, set with `gemmini_extended3_config_ld` using `id=1`
+- Issue an A-tile mvin immediately followed by a B-tile mvin2 in the same loop iteration
+
+Since `tiles_I = tiles_K` for typical square-ish matrices and we have `tiles_I` A-block-mvins and `tiles_K` B-block-mvins, we can pair them by iterating `max(tiles_I, tiles_K)` times and issuing whichever loads remain.
+
+Here is the rewritten solution:
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Configure port 0 (mvin) for A: row stride = MATMUL_K bytes
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+  // Configure port 1 (mvin2) for B: row stride = MATMUL_N bytes
+  gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+  // Interleave A (port 0) and B (port 1) loads tile-by-tile.
+  // tiles_I A-block-mvins and tiles_K B-block-mvins, paired together.
+  int max_iters = (tiles_I > tiles_K) ? tiles_I : tiles_K;
+  for (int idx = 0; idx < max_iters; idx++) {
+    if (idx < tiles_I) {
+      elem_t *a_ptr = ((elem_t*)A_in) + idx * DIM * MATMUL_K;
+      uint32_t a_sp  = a_base + (idx * tiles_K) * DIM;
+      gemmini_block_mvin((void*)a_ptr, a_sp, tiles_K);
+    }
+    if (idx < tiles_K) {
+      elem_t *b_ptr = ((elem_t*)B_in) + (idx * DIM) * MATMUL_N;
+      uint32_t b_sp  = b_base + (idx * tiles_J) * DIM;
+      // Use mvin2 (port 1) for B
+      gemmini_extended_mvin2((void*)b_ptr, b_sp, tiles_J * DIM, DIM);
+    }
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+### Why This Improves Performance
+
+1. **Dual-port parallelism**: Port 0 (`mvin`) and port 1 (`mvin2`) are independent DMA engines. When A and B loads are interleaved instruction-by-instruction, the hardware can issue both DMA requests to the memory subsystem in parallel, nearly halving the effective data-movement latency.
+
+2. **Eliminated redundant `config_ld` re-issue between A and B**: Previously, a second `gemmini_config_ld` was needed to switch the stride from `MATMUL_K` to `MATMUL_N` between A and B loads. Now port 0 is configured for A's stride and port 1 for B's stride independently — each configured once, with no mid-sequence reconfiguration needed.
+
+3. **B uses `mvin2` not `gemmini_block_mvin`**: `gemmini_block_mvin` maps to `k_MVIN` (port 0). Using `gemmini_extended_mvin2` explicitly routes B to port 1, enabling true hardware-level overlap rather than serialized port-0 accesses.
+
+4. **No correctness impact**: The scratchpad layout (A at `a_base`, B at `b_base`) is unchanged; only the order and port of issue changes. The `gemmini_loop_ws_spad` still consumes the same addresses with the same tile counts, so the matmul produces bit-identical results.

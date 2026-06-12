@@ -1,0 +1,99 @@
+An elegant and highly effective optimization plan to maximize the performance of the FP8 weight-stationary matrix multiplication.
+
+### Optimization Plan: Batching Scale Factor Loads and Eliminating Outer Tiling Overheads (Strategy 4)
+
+The primary bottleneck in the original code is the CPU overhead caused by **scale-factor copying/staging loops** and **redundant configuration/loading cycles**. Since the target matrix is $64 \times 64$, the entire problem (including inputs, outputs, and scale factors) fits comfortably within the Gemmini hardware limits:
+1. **Scale Memory Capacity:** The complete scale factor matrices `A_scales_row` and `B_scales_col` only occupy 128 bytes each, which can be loaded **once** at the beginning of the function.
+2. **Scratchpad Capacity:** Storing all $4 \times 4$ A-tiles and $4 \times 4$ B-tiles simultaneously requires $(16 + 16) \times 16 = 512$ rows, well below the $8192$-row scratchpad limit.
+3. **Accumulator Capacity:** Storing the entire $4 \times 4$ output C-tiles requires $4 \times 4 \times 16 = 256$ rows, which fits exactly within the $256$-row accumulator.
+
+By selecting **Strategy 4**, we will batch load the scale factors for the entire execution once at the start. This allows us to collapse the outer tiling loops entirely, performing the entire matrix multiplication in a single execution of the fused hardware loop (`gemmini_loop_ws_spad`).
+
+#### Specific Changes:
+1. **Eliminate Scale Pre-Formatting:** Remove the `A_scales_perf` and `B_scales_perf` CPU-side copying loops.
+2. **One-Time Scale Loading:** Call `gemmini_mx_load_scales` only once for the entire matrices of A and B before entering any tiled loops.
+3. **Eliminate Outer Loops:** Remove the outer loops (`i0`, `j0`) and compute the entire $64 \times 64$ output in one pass.
+4. **Optimized MVIN:** Use efficient 2-tile batching (`2 * DIM` columns per `gemmini_extended_mvin`) to load A and B into the scratchpad.
+5. **Single Output Drain:** Call `gemmini_mx_read_smem` once to drain the entire output.
+
+---
+
+### Optimized Code
+
+```c
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+#include "include/matmul_fp8_64x64.h"
+
+#define GEMMINI_SF_MEM 0x40088000
+#define GEMMINI_SF_MEM_A (GEMMINI_SF_MEM + 0x2000)
+#define GEMMINI_SF_MEM_B GEMMINI_SF_MEM
+#define SMEM 0x40000000
+
+#define DIM 16
+#define ADDR_LEN 32
+
+#define BF16_PER_WORD 4
+#define OUT_COLS (MATMUL_M / BF16_PER_WORD)
+
+typedef uint8_t  elem_t;   // fp8:e4m3 input elements
+typedef uint8_t  welem_t;  // fp8:e4m3 weight elements
+typedef uint64_t out_t;    // 4x bf16 packed per word
+
+void solution(void) {
+  // 1. Reset/Flush Gemmini state
+  gemmini_flush(0);
+
+  // 2. Configure execution: Weight-Stationary, FP8 inputs, BF16 output
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 
+                              1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // 3. Batch load scale factors once for the entire matrix (Strategy 4)
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, MATMUL_M * (MATMUL_K / 32), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, MATMUL_N * (MATMUL_K / 32), 1);
+
+  // 4. Calculate tiling and scratchpad base offsets
+  int tiles_I = MATMUL_M / DIM; // 4
+  int tiles_J = MATMUL_N / DIM; // 4
+  int tiles_K = MATMUL_K / DIM; // 4
+
+  uint32_t a_base = 0;
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM; // 8192 - 256 = 7936
+  int SPAD_DEST = 128;
+
+  // 5. MVIN A tiles to scratchpad (batched 2-at-a-time)
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k += 2) {
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i * DIM) * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, 2 * DIM, DIM);
+    }
+  }
+
+  // 6. MVIN B tiles to scratchpad (batched 2-at-a-time)
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j += 2) {
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + j * DIM),
+                            b_base + (k * tiles_J + j) * DIM, 2 * DIM, DIM);
+    }
+  }
+
+  // 7. Configure output stride and the requantizer
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  static uint32_t scale_factors[512] __attribute__((aligned(32))) = {0};
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // 8. Execute fused hardware matrix multiplication loop
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+                       a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                       false, false, false, false, false, NO_ACTIVATION,
+                       0, 0, false, 0x38);
+
+  // 9. Read packed BF16 results from SMEM and synchronize
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```

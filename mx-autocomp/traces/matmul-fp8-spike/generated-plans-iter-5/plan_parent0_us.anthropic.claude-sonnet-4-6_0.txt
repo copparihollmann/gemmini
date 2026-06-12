@@ -1,0 +1,143 @@
+## Strategy: Eliminate the `scale_factors` scratch buffer by passing a null/dummy address and relying on the hardware's internal scale accumulation
+
+### Analysis of the Current Code
+
+Looking at the current code, there is one subtle inefficiency that none of the listed strategies directly addresses:
+
+**The `scale_factors` array is allocated as a 512-element `uint32_t` buffer (2048 bytes, cache-aligned) and passed to `gemmini_mxquant_config_mvout` as the `scale_dram` address.** However, examining the reference patterns carefully:
+
+- In `matmul_tiled_fp8_64x64.c`, `scale_factors` is declared as `uint32_t scale_factors[512] = {0}` — zero-initialized.
+- In `matmul_ws_mx_generic.c`, it is declared as `static uint32_t scale_factors[MATMUL_M * MATMUL_N / 32]` zero-initialized.
+- The hardware writes output e8m0 scale codes to `scale_dram` during requantization, but **the current kernel never reads this buffer back** — it only reads the BF16 results from `mx_smem` via `gemmini_mx_read_smem`.
+
+The real inefficiency I want to target is different: **the `gemmini_config_st` call uses `OUT_COLS * sizeof(out_t)` as the output stride, but `out_t = uint64_t` (8 bytes) and `OUT_COLS = MATMUL_N/BF16_PER_WORD = 64/4 = 16`, so the stride is `16 * 8 = 128` bytes.** However, since results are drained via `gemmini_mx_read_smem` (not via `gemmini_extended_mvout`), `gemmini_config_st` is **completely irrelevant to the MX read-smem output path** and constitutes dead configuration work.
+
+### New Strategy: Remove the Dead `gemmini_config_st` Call
+
+**The `gemmini_config_st` instruction is a wasted RoCC instruction issue.** In the MX path:
+- Output flows: `systolic array → mx_smem → (MX_READ_SMEM) → DRAM`
+- `gemmini_config_st` configures the legacy `MVOUT` path (funct 4), which writes from the accumulator to DRAM directly
+- `MVOUT_SPAD` (funct 23) is documented as a no-op in Spike
+- `gemmini_mx_read_smem` uses neither the config-ST stride nor the accumulator MVOUT path — it reads directly from `mx_smem` using its own `smem_off_bf16` and `num_bf16` parameters
+
+**Removing `gemmini_config_st` eliminates one RoCC instruction dispatch**, which on the Spike simulator involves:
+1. A full `ROCC_INSTRUCTION_RS1_RS2` macro expansion (register writes + custom instruction issue)
+2. Spike's RoCC decode + dispatch overhead
+3. A CONFIG_ST state update that is never consumed
+
+Additionally, the `scale_factors` local buffer (2048 bytes) causes a **stack frame allocation** that touches extra cache lines. Since the buffer is never read by the host (only written by hardware), we can reduce it to the minimum required size. For `tiles_I=4, tiles_J=4, tiles_K=4`, the hardware only needs `tiles_I * tiles_J = 16` scale output slots. However, since the hardware writes to this address and the host never reads it, passing any writable aligned address (even a small one) is sufficient for correctness.
+
+### Implementation Plan
+
+1. **Remove `gemmini_config_st`** entirely — it configures the legacy MVOUT path which is not used in the MX `gemmini_mx_read_smem` drain path.
+
+2. **Shrink `scale_factors`** from `uint32_t[512]` (2048 bytes) to `uint32_t[tiles_I * tiles_J]` = `uint32_t[16]` (64 bytes), reducing stack pressure and improving cache behavior. The hardware writes `tiles_I * tiles_J` output scale codes (one per output tile), so 16 entries is exactly sufficient.
+
+### Corrected Code
+
+```c
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+#include "include/matmul_fp8_64x64.h"
+
+void solution(void) {
+    // Tile counts
+    const int tiles_I = MATMUL_M / DIM;  // 4
+    const int tiles_J = MATMUL_N / DIM;  // 4
+    const int tiles_K = MATMUL_K / DIM;  // 4
+
+    // Scratchpad layout
+    const uint32_t a_base    = 0;
+    const uint32_t b_base    = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    const uint32_t SPAD_DEST = 0;
+
+    // Minimal scale_factors buffer: hardware writes tiles_I*tiles_J output
+    // scale codes; host never reads them. Shrink from [512] to [tiles_I*tiles_J]
+    // to reduce stack frame size and cache footprint.
+    uint32_t scale_factors[16] __attribute__((aligned(32))) = {0};
+
+    // -----------------------------------------------------------------------
+    // 1. Configure execution (fp8 e4m3 inputs, BF16 output, weight-stationary)
+    // -----------------------------------------------------------------------
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+        /*C_stride*/1, /*A_stride*/1,
+        /*A_transpose*/0, /*B_transpose*/0,
+        /*set_only_strides*/false,
+        /*act_mx_fmt*/0, /*wgt_mx_fmt*/0, /*out_mx_fmt*/3, /*uselut*/0);
+
+    // -----------------------------------------------------------------------
+    // 2. Load scale factors (A: sel=0, B: sel=1)
+    // -----------------------------------------------------------------------
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+    // -----------------------------------------------------------------------
+    // 3. MVIN A tiles: batch all tiles_K=4 k-tiles per i-row into one
+    //    block_mvin (tiles_K == MAX_BLOCK_LEN == 4).
+    //    Stride: MATMUL_K bytes (64) — set once, also covers B mvin below
+    //    since MATMUL_N == MATMUL_K == 64.
+    // -----------------------------------------------------------------------
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    {
+        const elem_t *A_ptr = (const elem_t *)A_in;
+        for (int i = 0; i < tiles_I; i++) {
+            const void *dram_ptr = (const void *)(A_ptr + (i * DIM) * MATMUL_K);
+            uint32_t    sp_addr  = a_base + i * tiles_K * DIM;
+            gemmini_block_mvin(dram_ptr, sp_addr, tiles_K);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 4. MVIN B tiles: batch all tiles_J=4 j-tiles per k-row into one
+    //    block_mvin (tiles_J == MAX_BLOCK_LEN == 4).
+    //    gemmini_config_ld from step 3 still in effect (stride=64=MATMUL_N).
+    // -----------------------------------------------------------------------
+    {
+        const elem_t *B_ptr = (const elem_t *)B_in;
+        for (int k = 0; k < tiles_K; k++) {
+            const void *dram_ptr = (const void *)(B_ptr + (k * DIM) * MATMUL_N);
+            uint32_t    sp_addr  = b_base + k * tiles_J * DIM;
+            gemmini_block_mvin(dram_ptr, sp_addr, tiles_J);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 5. Configure requantizer only.
+    //    gemmini_config_st is OMITTED: it configures the legacy accumulator
+    //    MVOUT path (funct 4), which is never used in the MX flow. Output
+    //    is drained exclusively via gemmini_mx_read_smem (funct 28), which
+    //    reads mx_smem directly and ignores the config-ST stride register.
+    //    Removing this dead instruction eliminates one RoCC dispatch.
+    // -----------------------------------------------------------------------
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+        tiles_I, tiles_J, tiles_K,
+        /*scale_act_sel*/0, /*scale_w_sel*/0,
+        /*lut_update_granularity*/1);
+
+    // -----------------------------------------------------------------------
+    // 6. Execute fused weight-stationary tiled matmul
+    //    skip_mask=0x38: skip ldA + ldB + ldD (already in spad).
+    //    SPAD_DEST=0: results written to mx_smem at word offset 0.
+    // -----------------------------------------------------------------------
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+        a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+        false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+    // -----------------------------------------------------------------------
+    // 7. Drain BF16 results from shared memory to DRAM, then fence.
+    //    smem_off_bf16 = SPAD_DEST*16 = 0.
+    // -----------------------------------------------------------------------
+    gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+    gemmini_fence();
+}
+```
+
+### Why This Improves Performance
+
+1. **One fewer RoCC instruction issued**: `gemmini_config_st` expands to a full `ROCC_INSTRUCTION_RS1_RS2` macro which involves register setup and a custom instruction dispatch through Spike's decode pipeline. Eliminating it removes this overhead entirely with zero correctness impact, since the MX output path never consults the config-ST state.
+
+2. **Smaller stack frame**: Reducing `scale_factors` from `uint32_t[512]` (2KB) to `uint32_t[16]` (64 bytes) means the stack allocation fits in fewer cache lines, reducing potential D-cache pressure from the frame setup and teardown, and keeping more cache capacity available for the mvin/read-smem data path.
+
+3. **Zero semantic change**: The BF16 results in `C_hw` are determined entirely by `gemmini_loop_ws_spad` → `gemmini_mx_read_smem`, neither of which consults the config-ST stride. The `scale_factors` write-destination is only used by the hardware requantizer to store intermediate e8m0 codes that are never consumed by the host in this kernel.

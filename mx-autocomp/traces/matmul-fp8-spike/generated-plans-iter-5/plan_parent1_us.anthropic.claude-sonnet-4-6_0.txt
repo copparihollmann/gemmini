@@ -1,0 +1,152 @@
+# Strategy: Parallel DMA via Dual mvin Ports (mvin vs mvin2) for A and B Tiles
+
+## Analysis of the Current Code
+
+In the current implementation, both A and B tile loads use `gemmini_block_mvin` (which maps to `k_MVIN`, port 0). This means:
+
+1. A tiles are loaded sequentially via mvin (port 0)
+2. B tiles are loaded sequentially via mvin (port 0) — **same port**
+3. The two loops execute back-to-back with no overlap
+
+The hardware exposes **three independent mvin ports** (`k_MVIN`, `k_MVIN2`, `k_MVIN3`). Ports 0 and 1 target different scratchpad banks and can issue DMA transfers concurrently. Since A tiles (going to the bottom of scratchpad, address ~0) and B tiles (going to the top of scratchpad, `b_base = 8192 - tiles_K*tiles_J*DIM`) target non-overlapping scratchpad regions, they can be loaded in parallel without bank conflicts.
+
+## The New Strategy: Interleave A and B Loads on Separate DMA Ports
+
+Instead of loading all A tiles first (all on port 0), then all B tiles (all on port 0), we interleave the A and B mvin commands in the same loop, issuing A loads on `k_MVIN` (via `gemmini_extended_mvin`) and B loads on `k_MVIN2` (via `gemmini_extended_mvin2`). The hardware can then execute both DMAs concurrently, halving the effective memory load time.
+
+For this 64×64×64 problem:
+- `tiles_I = tiles_J = tiles_K = 4`
+- A needs 4 block-mvins (one per i-tile, each batching 4 k-tiles = 16 rows)
+- B needs 4 block-mvins (one per k-tile, each batching 4 j-tiles = 16 rows)
+
+These 8 commands can be interleaved: issue one A-mvin on port 0 followed immediately by one B-mvin on port 1, repeating for each tile index. Since `tiles_I == tiles_K == 4`, the loop trip count is identical for both, making the interleaving exact with no leftover commands.
+
+## Why This Improves Performance
+
+- **True parallel DMA**: `k_MVIN` and `k_MVIN2` are independent issue slots in the Gemmini command queue; the hardware can service both simultaneously when their scratchpad targets don't conflict (A is at rows 0–63, B is at rows 8128–8191 — no overlap).
+- **Halved effective load latency**: The combined DRAM→scratchpad time for A+B drops from `T_A + T_B` to `max(T_A, T_B)`. Since both are 4 block-mvins of equal size, the load phase takes roughly half as long.
+- **No correctness change**: The same data ends up in the same scratchpad addresses; only the issue port and timing change. The subsequent `gemmini_loop_ws_spad` sees identical scratchpad contents.
+- **No additional instructions**: We replace 8 sequential same-port mvins with 8 interleaved dual-port mvins — same instruction count, better hardware utilization.
+
+## Rewritten Code
+
+```c
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+#include "include/matmul_fp8_64x64.h"
+
+void solution(void) {
+    // Tile counts
+    const int tiles_I = MATMUL_M / DIM;  // 4
+    const int tiles_J = MATMUL_N / DIM;  // 4
+    const int tiles_K = MATMUL_K / DIM;  // 4
+
+    // Scratchpad layout
+    const uint32_t a_base    = 0;
+    const uint32_t b_base    = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    const uint32_t SPAD_DEST = 128;
+
+    // -----------------------------------------------------------------------
+    // 1. Configure execution (fp8 e4m3 inputs, BF16 output, weight-stationary)
+    // -----------------------------------------------------------------------
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+        /*C_stride*/1, /*A_stride*/1,
+        /*A_transpose*/0, /*B_transpose*/0,
+        /*set_only_strides*/false,
+        /*act_mx_fmt*/0, /*wgt_mx_fmt*/0, /*out_mx_fmt*/3, /*uselut*/0);
+
+    // -----------------------------------------------------------------------
+    // 2. Load scale factors (A: sel=0, B: sel=1)
+    // -----------------------------------------------------------------------
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+    // -----------------------------------------------------------------------
+    // 3. Configure DRAM stride for both mvin ports.
+    //    MATMUL_K == MATMUL_N == 64, so one config_ld covers both A and B.
+    //    mvin (port 0) config is set by id=0; mvin2 (port 1) by id=1.
+    //    Both use stride = 64 bytes (MATMUL_K * sizeof(elem_t)).
+    // -----------------------------------------------------------------------
+    gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, /*id*/0);
+    gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, /*id*/1);
+
+    // -----------------------------------------------------------------------
+    // 4. Interleaved MVIN of A tiles (port 0 / k_MVIN) and B tiles
+    //    (port 1 / k_MVIN2) within the same loop, so the hardware can
+    //    execute both DMA transfers concurrently.
+    //
+    //    tiles_I == tiles_K == 4, so we iterate once per {i, k} pair:
+    //      - A: load i-th row-group of DIM rows, all tiles_K k-tiles batched
+    //           (block_len=4), into scratchpad starting at
+    //           a_base + i*tiles_K*DIM.
+    //      - B: load k-th row-group of DIM rows, all tiles_J j-tiles batched
+    //           (block_len=4), into scratchpad starting at
+    //           b_base + k*tiles_J*DIM.
+    //    Because both block lengths equal MAX_BLOCK_LEN=4, a single
+    //    gemmini_extended_mvin / gemmini_extended_mvin2 pair covers an entire
+    //    i-tile (A) or k-tile (B) without further inner loops.
+    //
+    //    A scratchpad range: rows   0 ..  63  (a_base + 0..63)
+    //    B scratchpad range: rows 8128..8191  (b_base + 0..63)
+    //    → no overlap; both ports write to disjoint banks.
+    // -----------------------------------------------------------------------
+    {
+        const elem_t *A_ptr = (const elem_t *)A_in;
+        const elem_t *B_ptr = (const elem_t *)B_in;
+
+        // Loop trip count = 4 = tiles_I = tiles_K
+        for (int ik = 0; ik < tiles_I; ik++) {
+            // --- A tile: row-group ik, all k-tiles batched (port 0 / mvin) ---
+            const void *a_dram = (const void *)(A_ptr + (ik * DIM) * MATMUL_K);
+            uint32_t    a_sp   = a_base + ik * tiles_K * DIM;
+            // cols = tiles_K * DIM = 64, rows = DIM = 16
+            gemmini_extended_mvin(a_dram, a_sp,
+                                  (uint32_t)(tiles_K * DIM), (uint32_t)DIM);
+
+            // --- B tile: k-group ik, all j-tiles batched (port 1 / mvin2) ---
+            const void *b_dram = (const void *)(B_ptr + (ik * DIM) * MATMUL_N);
+            uint32_t    b_sp   = b_base + ik * tiles_J * DIM;
+            // cols = tiles_J * DIM = 64, rows = DIM = 16
+            gemmini_extended_mvin2(b_dram, b_sp,
+                                   (uint32_t)(tiles_J * DIM), (uint32_t)DIM);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 5. Configure output store and requantizer
+    // -----------------------------------------------------------------------
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+        tiles_I, tiles_J, tiles_K,
+        /*scale_act_sel*/0, /*scale_w_sel*/0,
+        /*lut_update_granularity*/1);
+
+    // -----------------------------------------------------------------------
+    // 6. Execute fused weight-stationary tiled matmul
+    //    skip_mask=0x38: skip ldA + ldB + ldD (already in spad).
+    // -----------------------------------------------------------------------
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+        a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+        false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+    // -----------------------------------------------------------------------
+    // 7. Drain BF16 results from shared memory to DRAM, then fence
+    // -----------------------------------------------------------------------
+    gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+    gemmini_fence();
+}
+```
+
+## Summary of Changes
+
+| Aspect | Before | After |
+|--------|--------|-------|
+| A mvin port | `k_MVIN` (port 0) in dedicated loop | `k_MVIN` (port 0) interleaved |
+| B mvin port | `k_MVIN` (port 0) in dedicated loop | `k_MVIN2` (port 1) interleaved |
+| DMA parallelism | Serial: A then B | Parallel: A∥B per iteration |
+| Loop structure | Two separate loops of 4 iters each | One combined loop of 4 iters |
+| Port 1 config | Not configured | `gemmini_extended3_config_ld(..., id=1)` added |
+| Instruction count | 8 mvin commands (all port 0) | 8 mvin commands (4×port0 + 4×port1) |
+| Correctness | Correct | Identical scratchpad layout, identical compute |

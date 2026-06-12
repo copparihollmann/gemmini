@@ -1,0 +1,74 @@
+## Analysis of the Current Code
+
+The current code has a simple structure:
+1. Configure
+2. Load scales (once - already good)
+3. MVIN A: 4 iterations (i=0..3), each calling `gemmini_block_mvin` with `len=tiles_K=4`
+4. MVIN B: 4 iterations (k=0..3), each calling `gemmini_block_mvin` with `len=tiles_J=4`
+5. Config mvout
+6. Loop WS spad
+7. Read smem + fence
+
+## Strategy Selection: Strategy 6
+
+**Load all A tiles in a single flat DMA command** (one `gemmini_block_mvin` with `len = tiles_I * tiles_K`) when the entire A matrix fits contiguously in DRAM and scratchpad.
+
+## Plan
+
+### Verification of Contiguity
+
+For A matrix:
+- DRAM layout: A is row-major, `MATMUL_M × MATMUL_K = 64×64` bytes
+- The current loop does: for each `i`, `dram_ptr = A_ptr + (i*DIM)*MATMUL_K`, `sp_addr = a_base + i*tiles_K*DIM`, len=`tiles_K=4`
+- For `i=0`: dram_ptr = A_ptr + 0, sp_addr = 0, len=4 → rows 0..3
+- For `i=1`: dram_ptr = A_ptr + 64*16, sp_addr = 64, len=4 → rows 4..7
+- For `i=2`: dram_ptr = A_ptr + 64*32, sp_addr = 128, len=4 → rows 8..11
+- For `i=3`: dram_ptr = A_ptr + 64*48, sp_addr = 192, len=4 → rows 12..15
+
+Since `block_mvin(ptr, sp, len)` expands to `mvin(ptr, sp, len*DIM, DIM)` — i.e., it transfers `len*DIM` columns × `DIM` rows from a contiguous DRAM block. Each block is `len*DIM = 64` columns × 16 rows = 1024 bytes, which is exactly one full row-group of A (64 bytes/row × 16 rows). The DRAM stride is configured to `MATMUL_K = 64` bytes, so consecutive scratchpad rows map to consecutive DRAM rows.
+
+The full A matrix is `64×64 = 4096` bytes, contiguous in DRAM. The scratchpad slots `a_base=0` through `a_base + tiles_I*tiles_K*DIM - 1 = 255` are contiguous. So the entire A load is `tiles_I * tiles_K = 16` consecutive scratchpad rows from a contiguous DRAM region.
+
+**However**, `MAX_BLOCK_LEN = 4`, so a single `gemmini_block_mvin` cannot transfer more than 4 rows at once. We cannot issue one command of length 16.
+
+### Revised Strategy: Unroll the A mvin loop (Strategy 8)
+
+Since `tiles_I = 4` is a compile-time constant and the loop has 4 iterations, we can eliminate the loop entirely with `#pragma GCC unroll 4` or manual unrolling. Each iteration issues one `gemmini_block_mvin(len=4)`. This removes the branch overhead and loop counter updates (4 branch instructions, 4 compare-and-increment sequences), exposes all 4 DMA commands to the issue window simultaneously, and allows the hardware scheduler to pipeline them without software loop stalls.
+
+Similarly, the B mvin loop over `tiles_K=4` iterations can be unrolled.
+
+### Concrete Changes
+
+**For A mvin loop** — replace:
+```c
+for (int i = 0; i < tiles_I; i++) {
+    const void *dram_ptr = (const void *)(A_ptr + (i * DIM) * MATMUL_K);
+    uint32_t    sp_addr  = a_base + i * tiles_K * DIM;
+    gemmini_block_mvin(dram_ptr, sp_addr, tiles_K);
+}
+```
+With manually unrolled (4 known iterations, `tiles_I=MATMUL_M/DIM=4`):
+```c
+gemmini_block_mvin((const void*)(A_ptr + 0*DIM*MATMUL_K), a_base + 0*tiles_K*DIM, tiles_K);
+gemmini_block_mvin((const void*)(A_ptr + 1*DIM*MATMUL_K), a_base + 1*tiles_K*DIM, tiles_K);
+gemmini_block_mvin((const void*)(A_ptr + 2*DIM*MATMUL_K), a_base + 2*tiles_K*DIM, tiles_K);
+gemmini_block_mvin((const void*)(A_ptr + 3*DIM*MATMUL_K), a_base + 3*tiles_K*DIM, tiles_K);
+```
+
+**For B mvin loop** — replace:
+```c
+for (int k = 0; k < tiles_K; k++) {
+    const void *dram_ptr = (const void *)(B_ptr + (k * DIM) * MATMUL_N);
+    uint32_t    sp_addr  = b_base + k * tiles_J * DIM;
+    gemmini_block_mvin(dram_ptr, sp_addr, tiles_J);
+}
+```
+With manually unrolled (4 known iterations, `tiles_K=MATMUL_K/DIM=4`):
+```c
+gemmini_block_mvin((const void*)(B_ptr + 0*DIM*MATMUL_N), b_base + 0*tiles_J*DIM, tiles_J);
+gemmini_block_mvin((const void*)(B_ptr + 1*DIM*MATMUL_N), b_base + 1*tiles_J*DIM, tiles_J);
+gemmini_block_mvin((const void*)(B_ptr + 2*DIM*MATMUL_N), b_base + 2*tiles_J*DIM, tiles_J);
+gemmini_block_mvin((const void*)(B_ptr + 3*DIM*MATMUL_N), b_base + 3*tiles_J*DIM, tiles_J);
+```
+
+All addresses and counts are identical to the original — this is purely a loop elimination. The 8 `gemmini_block_mvin` calls are now a flat straight-line sequence, enabling the compiler and hardware to overlap instruction dispatch with DMA initiation and reducing branch misprediction/overhead. Add `static_assert(MATMUL_M/DIM == 4 && MATMUL_K/DIM == 4, "unroll count mismatch")` to catch any future dimension changes.

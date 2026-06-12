@@ -1,0 +1,51 @@
+## Analysis of the Original Code
+
+The original code has this loop structure:
+```
+for i0 in BLOCKS_M:
+  for j0 in BLOCKS_N:
+    load A scales for (i0 block)
+    load B scales for (j0 block)
+    mvin A tiles (i0 block, all K)
+    mvin B tiles (j0 block, all K)
+    compute
+    read smem
+```
+
+**Key inefficiency targeted by Strategy 5:** For each `j0` iteration, B tiles are loaded fresh. But for different `i0` values with the same `j0`, the B tiles are identical — only A changes. By making `j0` the outer loop and `i0` the inner loop, we load B once per `j0` block and reuse it across all `i0` rows.
+
+## Plan: Apply Strategy 5 — Restructure to j0-outer, i0-inner (Weight-Stationary B Reuse)
+
+### What changes
+
+**Swap the loop order** so `j0` is outermost and `i0` is innermost. Inside each `j0` iteration:
+1. Load B scales once (for the j0 block)
+2. Mvin all B tiles once (for the j0 block, all K)
+3. For each `i0`:
+   - Load A scales (for the i0 block)
+   - Mvin A tiles (for the i0 block, all K)
+   - Configure and compute
+   - Read smem
+
+### Why this is correct
+
+- B tiles at `b_base` are fixed for the entire `j0` loop body — they don't depend on `i0`
+- A tiles are loaded fresh for each `i0` at `a_base`, overwriting the previous A
+- `gemmini_mx_load_scales` for A must still happen per-`i0` (A scales depend on i0 block)
+- B scales only change when `j0` changes, so one `gemmini_mx_load_scales` for B per outer iteration is correct
+- The programming model sequence is preserved: config_ex → load_scales(A+B) → mvin → mxquant_config_mvout → loop_ws_spad → read_smem. We must move `gemmini_mx_load_scales` for B before the i0 loop, but the A-scale load stays inside i0. **Both A and B scales must be loaded before `gemmini_loop_ws_spad`** — this is satisfied because A scales are loaded inside i0 just before compute, and B scales were loaded at the j0 level (and persist in hardware state until overwritten, per the architecture spec).
+
+### Concrete changes to the code
+
+1. **Swap loop order**: outer = `j0` (0..BLOCKS_N), inner = `i0` (0..BLOCKS_M)
+2. **Move B tile mvin outside i0 loop**: compute `ncols`, `tiles_J`-equivalent (`tiles = BLK/DIM`), `b_base`, then do `gemmini_config_ld(MATMUL_N * sizeof(elem_t))` and the B mvin loops once per j0
+3. **Move B scale copy + load outside i0 loop**: the `memcpy` for `B_s` and `gemmini_mx_load_scales(..., 1)` move to the j0 level
+4. **Keep A tile mvin and A scale load inside i0**: the `memcpy` for `A_s`, `gemmini_mx_load_scales(..., 0)`, `gemmini_config_ld(MATMUL_K * sizeof(elem_t))`, and A mvin loops stay per-i0
+5. **Keep `gemmini_flush(0)` inside i0** (or move to j0 — one flush per full computation block is sufficient; since flush is a pipeline drain, it can be moved to j0 level to avoid redundant flushes)
+6. **`gemmini_extended3_config_ex`** can be moved to j0 level (format doesn't change), or kept inside; moving it outside both loops avoids repeated config
+7. **`gemmini_mxquant_config_mvout`**: scale_factors pointer depends on both i0 and j0, so it stays inside i0
+8. **`gemmini_mx_read_smem` and `gemmini_fence()`**: smem read stays inside i0; the single `gemmini_fence()` at the end stays after the outermost loop
+
+### Expected benefit
+
+With `BLOCKS_M` i0 iterations per j0, B mvin is reduced from `BLOCKS_M * BLOCKS_N` to `BLOCKS_N` total invocations — a factor of `BLOCKS_M` reduction in B tile DMA traffic. Similarly B scale loads are reduced by the same factor. This directly reduces total mvin instruction count and DRAM bandwidth consumed for B.

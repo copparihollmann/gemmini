@@ -1,0 +1,57 @@
+An elegant and highly effective optimization plan to improve the execution time of your program is to apply **Strategy 6: Coalesce multiple row-by-row `gemmini_mx_read_smem` calls into a single contiguous bulk shared-memory read to minimize host CPU RoCC instruction dispatch overhead.**
+
+---
+
+### Inefficiency Analysis
+
+In the original code, the output results are drained from the MX shared memory (`mx_smem`) back to DRAM row-by-row using a loop of `mrows` iterations:
+```c
+for (int r = 0; r < mrows; r++) {
+  gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                       SPAD_DEST * 16 + r * BLK, ncols);
+}
+```
+When `BLK = 64`, this loop issues **64 individual RoCC commands** (`k_MX_READ_SMEM`) to the Gemmini accelerator. Each instruction dispatch incurs significant control-plane latency on the RISC-V host CPU (instruction decoding, queueing, and RoCC interface handshaking), stalling the processor and severely degrading performance.
+
+### Optimization Plan
+
+We can completely eliminate this loop and its accompanying overhead by coalescing these strided transfers into a **single bulk contiguous transfer** using a temporary staging buffer on the stack. 
+
+1. **Allocate a Contiguous Staging Buffer**: Create a stack-allocated, 32-byte-aligned array `C_staging` large enough to hold one block of BF16-packed outputs (`BLK * BLK / BF16_PER_WORD` words of `uint64_t`).
+2. **Issue One Contiguous Read**: Perform a single bulk `gemmini_mx_read_smem` call to copy all `mrows * ncols` BF16 elements from shared memory into `C_staging` contiguously.
+3. **Synchronize via Fence**: Issue `gemmini_fence()` immediately after the bulk read to guarantee that the Gemmini DMA controller has fully written the results to DRAM before the host CPU accesses them.
+4. **Copy on Host CPU**: Perform a fast, CPU-side row-by-row transfer (e.g., using `memcpy`) to scatter the contiguous rows of `C_staging` into the strided DRAM layout of `C_hw`. CPU-side memory copying is executed via standard assembly loads/stores, bypassing the expensive RoCC coprocessor instruction dispatch pipeline entirely.
+
+---
+
+### Proposed Code Modification
+
+Replace the draining loop in the original `solution` function with the following optimized implementation:
+
+```c
+      // Perform computation utilizing the stationary A tiles and new B tiles
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // --- OPTIMIZED COALESCED DRAIN START ---
+      // Allocate a contiguous staging buffer on the stack
+      uint64_t C_staging[BLK * BLK / BF16_PER_WORD] __attribute__((aligned(32)));
+
+      // Read all rows contiguously in a single bulk RoCC instruction
+      gemmini_mx_read_smem(C_staging, SPAD_DEST * 16, mrows * ncols);
+      
+      // Fence must be issued after smem read and before the host CPU reads the staging buffer
+      gemmini_fence();
+
+      // Copy from the contiguous staging buffer to the strided DRAM destination on CPU
+      int out_cols_per_block = ncols / BF16_PER_WORD;
+      for (int r = 0; r < mrows; r++) {
+        memcpy(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+               &C_staging[r * out_cols_per_block],
+               out_cols_per_block * sizeof(uint64_t));
+      }
+      // --- OPTIMIZED COALESCED DRAIN END ---
+    }
+  }
+}
+```

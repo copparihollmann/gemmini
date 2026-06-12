@@ -1,0 +1,113 @@
+An elegant and effective way to optimize this kernel is by using **Strategy 2: double buffering**.
+
+### Inefficiency in the Baseline Code
+The baseline code loads the entire activation matrix $A$ into the scratchpad in one large, monolithic loop before starting any computation. This has two major drawbacks:
+1. **No Overlap:** The systolic array remains completely idle during the entire duration of the initial $A$ matrix loading.
+2. **Poor Scratchpad and Accumulator Utilization:** It does not take advantage of the independent execution pipelines of Gemmini (DMA loading, systolic compute, and SMEM storing), which can run concurrently if different memory regions (buffers) are used.
+
+### Optimization Plan: Double-Buffered Pipelined Execution
+We will double-buffer the activation matrix $A$ along the $I$ (row) dimension. By splitting the $I$ dimension into two blocks ($ti\_block = 2$), we can keep the weights $B$ stationary in the high scratchpad memory and ping-pong the loading of $A$ and execution of the systolic array.
+
+1. **Stationary Weights ($B$):** We load the entire $B$ matrix once to a fixed high-address region `bb = 7168` and keep it stationary.
+2. **Partitioning $A$ Scratchpad:** We split the lower scratchpad region into two buffers:
+   - `ab0 = 0` (size 512 rows)
+   - `ab1 = 512` (size 512 rows)
+3. **Partitioning Accumulator/SMEM:** We use double-buffered destinations in the accumulator to prevent write hazards:
+   - Block 0 writes to `SDST_0 = 0`.
+   - Block 1 writes to `SDST_1 = 128`.
+4. **Pipelined Execution Loop:**
+   - **Prologue:** Load $A_0$ into `ab0`.
+   - **Step 1:** Issue the load for $A_1$ into `ab1`. Concurrently, trigger the weight-stationary compute for Block 0 using $A_0$ (which resides in `ab0`), and immediately initiate the non-blocking `gemmini_mx_read_smem` for Block 0.
+   - **Epilogue:** Trigger the compute for Block 1 using $A_1$ (which resides in `ab1`), and perform the final `gemmini_mx_read_smem` for Block 1.
+   - **Fence:** Issue a single `gemmini_fence()` at the very end to synchronize all outstanding transfers.
+
+This pipeline achieves maximum hardware concurrency, hiding the latency of loading the next tile of $A$ and draining the previous SMEM results behind the systolic array's compute execution.
+
+### Optimized Code
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+#include "include/matmul_data_mx_lut_hw.h"
+
+// Optimized MX matmul kernel (128x128x256, fp4:e2m1) using double-buffering.
+void solution(void) {
+  int block_i = 2;
+  int ti_block = MATMUL_M / DIM / block_i; // 4 / 2 = 2
+  int tj = MATMUL_N / DIM;                 // 4
+  int tk = MATMUL_K / DIM;                 // 16
+
+  uint32_t ab0 = 0;
+  uint32_t ab1 = ti_block * tk * DIM;                 // 2 * 16 * 16 = 512
+  uint32_t bb = BANK_NUM * BANK_ROWS - tk * tj * DIM; // 8192 - 16 * 4 * 16 = 7168
+
+  int SDST_0 = 0;
+  int SDST_1 = 128;
+
+  // 1. Configure format and execution (FP4 format, WS mode)
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 2, 2, 3, 0);
+
+  // 2. Load scale factors
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // 3. Configure store
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+
+  // 4. Load B (weights) once - stationary across both execution blocks
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2); // FP4 packs 2 elements per byte
+  for (int k = 0; k < tk; k++) {
+    for (int j = 0; j < tj; j += 4) { // Batched by 4
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + k*DIM*(MATMUL_N/2) + j*DIM), 
+                            bb + (k*tj + j)*DIM, 
+                            4 * DIM, 
+                            DIM);
+    }
+  }
+
+  // --- STEP 0 (PROLOGUE) ---
+  // Load Activation Block 0
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < ti_block; i++) {
+    for (int k = 0; k < tk; k += 4) { // Batched by 4
+      gemmini_extended_mvin((void*)(((elem_t*)A_in_hw) + i*DIM*MATMUL_K + k*DIM), 
+                            ab0 + (i*tk + k)*DIM, 
+                            4 * DIM, 
+                            DIM);
+    }
+  }
+
+  // --- STEP 1 (Pipelining Block 0 Compute + Block 1 Load) ---
+  // Load Activation Block 1
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < ti_block; i++) {
+    int global_i = ti_block + i;
+    for (int k = 0; k < tk; k += 4) { // Batched by 4
+      gemmini_extended_mvin((void*)(((elem_t*)A_in_hw) + global_i*DIM*MATMUL_K + k*DIM), 
+                            ab1 + (i*tk + k)*DIM, 
+                            4 * DIM, 
+                            DIM);
+    }
+  }
+
+  // Compute Block 0
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti_block, tj, tk, 0, 0, 1);
+  gemmini_loop_ws_spad(ti_block, tj, tk, 0, 0, 0, ab0, BANK_NUM * BANK_ROWS, 0, SDST_0, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // Read Block 0 results from SMEM
+  gemmini_mx_read_smem(&C_hw[0][0], SDST_0 * 16, ti_block * DIM * MATMUL_N);
+
+  // --- STEP 2 (EPILOGUE - Compute Block 1) ---
+  // Compute Block 1
+  uint64_t sf_offset = ti_block * DIM * (MATMUL_N / 16);
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors + sf_offset, ti_block, tj, tk, 0, 0, 1);
+  gemmini_loop_ws_spad(ti_block, tj, tk, 0, 0, 0, ab1, BANK_NUM * BANK_ROWS, 0, SDST_1, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // Read Block 1 results from SMEM
+  gemmini_mx_read_smem(&C_hw[ti_block * DIM][0], SDST_1 * 16, ti_block * DIM * MATMUL_N);
+
+  // Final synchronization
+  gemmini_fence();
+}
+```

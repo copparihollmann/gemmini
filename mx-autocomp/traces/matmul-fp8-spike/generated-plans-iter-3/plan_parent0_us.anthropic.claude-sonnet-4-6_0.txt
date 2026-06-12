@@ -1,0 +1,56 @@
+## Analysis of the Original Code
+
+Looking at the original code, I notice the MVIN operations for A and B are completely sequential—all A tiles are loaded first, then all B tiles, and only then does the compute begin. There is **zero overlap between data movement and computation**.
+
+However, looking more carefully at the specific structure here, I notice something else: the `gemmini_config_ld` is called **once for A** (with stride `MATMUL_K * sizeof(elem_t)`) and **once for B** (with stride `MATMUL_N * sizeof(elem_t)`), but there are **two separate `gemmini_config_ld` calls** requiring a reconfiguration between loading A and B tiles. Each `gemmini_config_ld` issues a `k_CONFIG` instruction that serializes with the DMA pipeline.
+
+## New Strategy: Eliminate the `gemmini_config_ld` Reconfiguration by Fusing A and B Loads with Interleaved Stride Updates Using `mvin2` for B
+
+**The key insight:** The hardware provides **three independent mvin ports**: `gemmini_extended_mvin` (port 0, for A), `gemmini_extended_mvin2` (port 1, for B), and `gemmini_extended_mvin3` (port 2, for D/bias). Each port maintains its **own independent stride configuration** via the `id` field in `gemmini_extended3_config_ld`.
+
+Currently the code uses only `gemmini_block_mvin` (port 0) for both A and B, requiring a `gemmini_config_ld` reconfiguration between them. By using **port 0 (`mvin`) for A** and **port 1 (`mvin2`) for B** simultaneously, each port can be configured independently with its own stride, and both DMA streams can run concurrently in the hardware.
+
+**Specific change:**
+
+1. Configure port 0 (id=0) with A's stride: `gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), SCALE_IDENTITY, false, 0)`
+2. Configure port 1 (id=1) with B's stride: `gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), SCALE_IDENTITY, false, 1)`
+3. Issue all A tile mvins via `gemmini_extended_mvin` (uses id=0) and all B tile mvins via `gemmini_extended_mvin2` (uses id=1) **interleaved**, so both DMA engines are active simultaneously.
+
+This eliminates the serialization barrier between A and B loading—both DMA ports issue their requests in parallel, hiding memory latency. The single `gemmini_config_ld` reconfiguration (which serializes the pipeline) between A and B is eliminated entirely.
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Configure port 0 (id=0) for A: stride = MATMUL_K bytes (full row width of A)
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), SCALE_IDENTITY, false, 0);
+  // Configure port 1 (id=1) for B: stride = MATMUL_N bytes (full row width of B)
+  gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), SCALE_IDENTITY, false, 1);
+
+  // Interleave mvin (port 0, A) and mvin2 (port 1, B) to overlap both DMA streams.
+  // A tiles: a_base + (i*tiles_K)*DIM, batch tiles_K per row-tile i
+  // B tiles: b_base + (k*tiles_J)*DIM, batch tiles_J per k-tile k
+  // Issue all A and B loads concurrently by interleaving port 0 and port 1 commands.
+  for (int i = 0; i < tiles_I; i++) {
+    elem_t *a_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K;
+    uint32_t a_sp  = a_base + (i * tiles_K) * DIM;
+    gemmini_extended_mvin((void*)a_ptr, a_sp, tiles_K * DIM, DIM);
+  }
+  for (int k = 0; k < tiles_K; k++) {
+    elem_t *b_ptr = ((elem_t*)B_in) + (k * DIM) * MATMUL_N;
+    uint32_t b_sp  = b_base + (k * tiles_J) * DIM;
+    gemmini_extended_mvin2((void*)b_ptr, b_sp, tiles_J * DIM, DIM);
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+**Why this improves performance:** By routing A through mvin port 0 and B through mvin2 port 1 (each pre-configured with their own stride via `id`), the two DMA engines can operate concurrently. The original code forced a full `gemmini_config_ld` serialization point between A and B loads (a config instruction that flushes the LD pipeline). Eliminating that reconfiguration barrier and enabling dual-port concurrent DMA reduces the total mvin latency, which directly reduces the overall kernel latency since mvin is the dominant pre-compute cost.

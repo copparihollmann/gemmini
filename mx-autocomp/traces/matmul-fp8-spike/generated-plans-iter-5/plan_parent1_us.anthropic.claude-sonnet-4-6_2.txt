@@ -1,0 +1,47 @@
+## Analysis
+
+Looking at the code, I need to identify which strategy is most applicable.
+
+The current code uses `gemmini_block_mvin` for both A and B tiles sequentially — first all A tiles, then all B tiles. These load operations go through a **single mvin port**, meaning A and B loads are serialized.
+
+**Strategy 5: use `mvin2`/`mvin3` ports to parallelize A and B tile loads into scratchpad simultaneously**
+
+Looking at the code:
+- A tiles are loaded via `gemmini_block_mvin` (which uses `k_MVIN` / mvin port 0)
+- B tiles are loaded via `gemmini_block_mvin` (also `k_MVIN` / mvin port 0, sequentially after A)
+
+The hardware has three independent mvin ports: `mvin` (port 0), `mvin2` (port 1), `mvin3` (port 2). If we issue A loads via `gemmini_extended_mvin` and B loads via `gemmini_extended_mvin2`, the hardware can overlap these DMA transfers, reducing the total load latency.
+
+## Plan
+
+1. **Keep A loading via `gemmini_extended_mvin`** (port 0 / `k_MVIN`) — use `gemmini_block_mvin` as-is for A tiles since it already works correctly.
+
+2. **Switch B loading to use `gemmini_extended_mvin2`** (port 1 / `k_MVIN2`) — replace `gemmini_block_mvin` calls in the B loop with `gemmini_extended_mvin2` calls. Since `gemmini_block_mvin` is defined as `gemmini_extended_mvin(dram_ptr, sp_addr, (len)*DIM, DIM)`, the equivalent `mvin2` call is `gemmini_extended_mvin2(dram_ptr, sp_addr, tiles_J*DIM, DIM)`.
+
+3. **Issue A and B loads interleaved**: Instead of completing all A loads then all B loads, interleave the issue of A-mvin (port 0) and B-mvin2 (port 1) commands. This lets both DMA engines run concurrently. Specifically, in a single loop over `i` and `k` for A and a loop over `k` for B, issue the corresponding A and B commands together where possible.
+
+4. **Configure strides**: `gemmini_config_ld` configures the stride for port 0. Port 1 (`mvin2`) uses a separately configured stride via `gemmini_extended4_config_ld(..., id=1)`. We need to issue `gemmini_extended3_config_ld(stride, MVIN_SCALE_IDENTITY, false, 1)` for port 1 with B's stride (MATMUL_N bytes), and keep port 0 configured with A's stride (MATMUL_K bytes). Since MATMUL_K == MATMUL_N == 64, a single config covers both — but we still need to explicitly configure port 1 via id=1.
+
+5. The interleaved issue loop: for each `k`, issue the B block load on port 1 (`mvin2`), and inside the `i` loop issue the A tile load on port 0 (`mvin`). Both ports work simultaneously, overlapping the B[k] load with A[i,k] loads.
+
+The resulting structure:
+```c
+gemmini_config_ld(MATMUL_K * sizeof(elem_t));           // port 0: A stride
+gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1); // port 1: B stride
+
+for (int k = 0; k < tiles_K; k++) {
+    // Issue B tile for this k on port 1
+    const void *b_dram = B_ptr + (k * DIM) * MATMUL_N;
+    uint32_t b_sp = b_base + k * tiles_J * DIM;
+    gemmini_extended_mvin2(b_dram, b_sp, tiles_J * DIM, DIM);
+
+    // Issue A tiles for this k (all i) on port 0
+    for (int i = 0; i < tiles_I; i++) {
+        const void *a_dram = A_ptr + (i * DIM) * MATMUL_K + k * DIM;
+        uint32_t a_sp = a_base + (i * tiles_K + k) * DIM;
+        gemmini_extended_mvin(a_dram, a_sp, DIM, DIM);
+    }
+}
+```
+
+This way, for each `k`, the B block-load (4 tiles via single wide mvin2 command) is issued on port 1, while the A tile loads for all `i` values at that `k` are issued on port 0 — both DMA channels can proceed in parallel, effectively halving the load latency.

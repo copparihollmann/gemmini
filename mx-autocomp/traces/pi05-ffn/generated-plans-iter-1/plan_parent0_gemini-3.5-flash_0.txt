@@ -1,0 +1,108 @@
+### Optimization Plan: One-Time Scale Factor Packing & Weight-Stationary Loop Reordering
+
+To dramatically reduce the latency from 427,143 cycles, we target the main bottlenecks in the baseline code: **CPU-side memory copy overhead** and **redundant DRAM-to-Scratchpad memory transfers (mvin)**. 
+
+#### 1. One-Time Scale Factor Packing (Eliminating Inner-Loop CPU Staging)
+In the baseline, the CPU performs `memcpy` on scale factors `A_scales_row` and `B_scales_col` inside the innermost loop for every single block iteration. Since scale factors in DRAM are structured with a stride, they cannot be directly loaded to the Gemmini scale memory without packing. 
+We allocate fast stack-buffers `A_s_packed` and `B_s_packed` and pack all scale factors **exactly once** at the beginning of `solution()`. This completely removes `memcpy` operations from the hot compute path.
+
+#### 2. Loop Reordering for Weight-Stationary Reuse
+The weight matrix $B$ (`B_in`) and its scales only depend on the column-block index `j0`. In the baseline, `i0` is the outer loop and `j0` is the inner loop, forcing the hardware to reload the same weight tiles and weight scales 16 times.
+By **swapping the loop order** (making `j0` the outer loop and `i0` the inner loop), we can load the weight tiles (B) and B-scale factors into the scratchpad/scale-memory **once per column block** and reuse them across all row-block iterations `i0`. This reduces the DRAM bandwidth and load latency for B by $4\times$.
+
+#### 3. Hoisting Invariant Configurations
+The configuration instructions `gemmini_extended3_config_ex`, `gemmini_flush`, and `gemmini_config_st` are completely invariant across all tiles. We hoist them outside of all loops to minimize control-overhead on the host CPU.
+
+---
+
+### Optimized C Code
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+#include "include/matmul_data_mx_lut_hw.h"
+
+void solution(void) {
+  // Hoist global/invariant initializations and flushes
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_config_st(BLK_OUTC * sizeof(out_t));
+
+  // Fast stack buffers for pre-packed scales
+  uint8_t A_s_packed[BLOCKS_M][A_S_BYTES] __attribute__((aligned(64)));
+  uint8_t B_s_packed[BLOCKS_N][B_S_BYTES] __attribute__((aligned(64)));
+
+  // One-time scale factor packing (eliminates inner-loop CPU memcpy)
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int g = 0; g < MATMUL_K / 32; g++) {
+      memcpy(&A_s_packed[i0][g * BLK], &A_scales_row[g][i0 * BLK], BLK);
+    }
+  }
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    for (int g = 0; g < MATMUL_K / 32; g++) {
+      memcpy(&B_s_packed[j0][g * BLK], &B_scales_col[g][j0 * BLK], BLK);
+    }
+  }
+
+  // Reordered loops: j0 (weight columns) is now outer to enable weight-stationary reuse
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    int ncols = REAL_N - j0 * BLK; 
+    if (ncols > BLK) ncols = BLK; 
+    if (ncols <= 0) continue;
+    int pad_j = BLK - ncols;
+
+    int tiles = BLK / DIM;
+    int tiles_K = MATMUL_K / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+    int SPAD_DEST = 128;
+
+    // Load B scales once per outer-loop iteration
+    gemmini_mx_load_scales((uint64_t)B_s_packed[j0], B_S_BYTES, 1);
+
+    // MVIN B tiles into high-address scratchpad region once and reuse across i0
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+    for (int j = 0; j < tiles; j++) {
+      for (int k = 0; k < tiles_K; k++) {
+        gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                              b_base + (k * tiles + j) * DIM, DIM, DIM);
+      }
+    }
+
+    // Inner loop: iterate over row-blocks (A activations and output C)
+    for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+      int mrows = REAL_M - i0 * BLK; 
+      if (mrows > BLK) mrows = BLK; 
+      if (mrows <= 0) continue;
+      int pad_i = BLK - mrows;
+
+      // Load A scales for the current row block
+      gemmini_mx_load_scales((uint64_t)A_s_packed[i0], A_S_BYTES, 0);
+
+      // MVIN A tiles directly from DRAM
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++) {
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+        }
+      }
+
+      // Configure requantizer
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+
+      // Compute weight-stationary tiled gemm using the pre-loaded B from scratchpad
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Read output results from shared memory
+      for (int r = 0; r < mrows; r++) {
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      }
+      gemmini_fence();
+    }
+  }
+}
+```

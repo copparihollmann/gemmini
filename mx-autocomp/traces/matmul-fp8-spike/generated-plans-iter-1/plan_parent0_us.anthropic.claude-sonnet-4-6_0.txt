@@ -1,0 +1,60 @@
+# Optimization Plan: Strategy 11 — Load All B Tiles First, Then All A Tiles
+
+## Analysis of the Current Code
+
+In the baseline, A and B tiles are loaded in separate loops but in an interleaved fashion relative to the overall scratchpad population sequence. More importantly, the current loop order for B is:
+
+```c
+for (int j = 0; j < tiles_J; j++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(...)  // B tile at b_base + (k*tiles_J + j)*DIM
+```
+
+And for A:
+```c
+for (int i = 0; i < tiles_I; i++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(...)  // A tile at a_base + (i*tiles_K + k)*DIM
+```
+
+The A-load loop is issued first, followed by the B-load loop, but the two loads are sequential — neither overlaps with the other, and the `gemmini_loop_ws_spad` is issued only after both complete. This means the hardware sequentially drains A mvins, then B mvins, then starts compute.
+
+## The Strategy
+
+**Strategy 11**: Load all B tiles first (before any A tiles) with a single contiguous pass, then load all A tiles, so the scratchpad is fully populated before `gemmini_loop_ws_spad` issues and the hardware never stalls waiting for tile data.
+
+However, in Gemmini's command queue model, the mvin commands are already queued and the `loop_ws_spad` will not begin until all preceding mvins complete. The real gain here is:
+
+1. **B tiles are stationary** (weight-stationary dataflow): loading B first ensures B is in scratchpad and "warm" before A is loaded. The hardware command queue can overlap B-tile DMA with A-tile DMA initiation since B is loaded first and A follows — reordering to B-first then A maximizes pipeline fill before the compute instruction arrives.
+
+2. **Stride configuration**: Currently `gemmini_config_ld` is issued once for A (stride = `MATMUL_K * sizeof(elem_t)`) and once for B (stride = `MATMUL_N * sizeof(elem_t)`). By loading B first, then A, we reconfigure the stride only twice total — same as now — but the ordering aligns with weight-stationary dataflow semantics where B data should be preloaded first.
+
+3. **The `gemmini_config_ld` call for B** uses full byte-width elements (`MATMUL_N * sizeof(elem_t)`), which is correct for fp8. This matches the reference pattern for fp4 which uses `MATMUL_N * sizeof(elem_t) / 2` — but for fp8 (this kernel), `sizeof(elem_t) = 1` so `MATMUL_N * 1 = 64` bytes per row stride, which is correct.
+
+## Concrete Code Change
+
+**Change the order of the two mvin loops**: move the B-tile loading loop (with its `gemmini_config_ld(MATMUL_N * sizeof(elem_t))`) to execute **before** the A-tile loading loop (with its `gemmini_config_ld(MATMUL_K * sizeof(elem_t))`).
+
+The resulting sequence becomes:
+
+```
+1. gemmini_extended3_config_ex(...)           [unchanged]
+2. gemmini_mx_load_scales(A, ...)             [unchanged]
+3. gemmini_mx_load_scales(B, ...)             [unchanged]
+
+4. gemmini_config_ld(MATMUL_N * sizeof(elem_t))   // B stride — MOVED FIRST
+5. for j in tiles_J: for k in tiles_K:            // B tiles — MOVED FIRST
+     gemmini_extended_mvin(B_tile, b_base + (k*tiles_J+j)*DIM, DIM, DIM)
+
+6. gemmini_config_ld(MATMUL_K * sizeof(elem_t))   // A stride — MOVED SECOND
+7. for i in tiles_I: for k in tiles_K:            // A tiles — MOVED SECOND
+     gemmini_extended_mvin(A_tile, a_base + (i*tiles_K+k)*DIM, DIM, DIM)
+
+8. gemmini_config_st(OUT_COLS * sizeof(out_t))    [unchanged]
+9. gemmini_mxquant_config_mvout(...)              [unchanged]
+10. gemmini_loop_ws_spad(...)                     [unchanged]
+11. gemmini_mx_read_smem(...)                     [unchanged]
+12. gemmini_fence()                               [unchanged]
+```
+
+All tile addresses, strides, scratchpad layout, and correctness constraints remain identical — only the order of the two mvin blocks is swapped. The programming model sequence (config_ex → load_scales → mvin → mxquant_config_mvout → loop_ws_spad → read_smem → fence) is preserved. The scratchpad fit constraint `(tiles_I*tiles_K + tiles_J*tiles_K)*DIM = (4*4 + 4*4)*16 = 128*16 = 128 ≤ 8192` is satisfied.

@@ -1,0 +1,76 @@
+# Optimization Plan: Loop Reordering + Full-Block Fast Path (Peeled Loop Structure)
+
+## Analysis of the Current Code
+
+The current code iterates `(i0, j0)` over `BLOCKS_M × BLOCKS_N` output tiles. For each `(i0, j0)` pair:
+1. It copies scale factors via `memcpy` (CPU staging)
+2. Calls `gemmini_flush(0)` — a full pipeline flush on **every** tile pair
+3. Loads scales, mvins all A and B tiles, runs the matmul, reads results
+
+The critical inefficiencies are:
+1. **`gemmini_flush(0)` is called inside the loop** — this stalls the pipeline every iteration
+2. **A tiles are re-mvin'd for every `j0`** — when iterating `(i0, j0)`, the same A block (row `i0`) is loaded `BLOCKS_N` times
+3. **Boundary handling overhead** — every iteration checks `mrows`/`ncols` even when the vast majority of tiles are full-sized (the problem is 50×256×512 so BLOCKS_M is small and boundary tiles exist only at the last row block)
+4. **CPU memcpy for scales** — scales are copied into staging buffers `A_s`/`B_s` every iteration
+
+## Strategy: Peel Full-Block Iterations + Reorder Loop to Amortize A Loads
+
+### Step 1: Move `gemmini_flush` outside the loop
+
+`gemmini_flush(0)` must be called only once, before the outermost loop. Inside the loop there is no need to flush — the hardware pipeline sequencing of `config_ex → load_scales → mvin → compute → read_smem → fence` already provides the necessary ordering guarantees via the RoCC instruction queue.
+
+### Step 2: Reorder loops to `(i0, j0)` with A-tile reuse across `j0`
+
+The current structure re-loads A tiles for every `(i0, j0)` pair. If we fix `i0` and iterate over all `j0`, the A tiles for row-block `i0` are the same for all `j0` — but the MX hardware requires a fresh mvin+scale+compute sequence per `loop_ws_spad` invocation, so A tiles must still be mvin'd per invocation. However, the **scale load for A** (`A_s[g][...]`) is identical for all `j0` given the same `i0`. We can restructure so that `A_scales` are loaded once per `i0` (outer loop), and only `B_scales` change per `j0`.
+
+### Step 3: Peel the full-block fast path from boundary iterations
+
+For the problem size 50×256×512: `BLK` tiles in N and K fill the scratchpad, and only the **last** `i0` block has `mrows < BLK` (since 50/BLK has a remainder). All `j0` blocks are full (256 is a multiple of BLK). This means the vast majority of iterations have `pad_i==0, pad_j==0`.
+
+**The plan:**
+
+```
+// Before the loop:
+gemmini_flush(0);
+gemmini_extended3_config_ex(...);  // once
+
+// Outer loop structure:
+for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    int mrows = min(REAL_M - i0*BLK, BLK);
+    
+    // Fast path: all j0 for this i0 row-block
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+        int ncols = min(REAL_N - j0*BLK, BLK);
+        
+        if (mrows == BLK && ncols == BLK) {
+            // ── FAST PATH (no padding, no boundary checks) ──
+            // Load scales: A row scales for i0, B col scales for j0
+            // (direct pointer arithmetic into A_scales_row/B_scales_col,
+            //  no memcpy — mvin directly from DRAM source arrays)
+            gemmini_mx_load_scales(...A_scales_row[0][i0*BLK]..., BLK_SCALES, 0);
+            gemmini_mx_load_scales(...B_scales_col[0][j0*BLK]..., BLK_SCALES, 1);
+            // mvin A and B with pad_i=0, pad_j=0
+            // loop_ws_spad with pad_i=0, pad_j=0
+            // read_smem + fence
+        } else {
+            // ── SLOW PATH (boundary tile) ──
+            // Same logic but with correct pad_i, pad_j values
+        }
+    }
+}
+```
+
+### Step 4: Eliminate CPU `memcpy` for scales — load directly from source arrays
+
+The `memcpy` into `A_s`/`B_s` staging buffers exists only to produce a contiguous slice. Instead, we can pass the pointer directly into `A_scales_row[g][i0*BLK]` since these are contiguous along the last dimension (row-major). This eliminates the only two `memcpy` calls, removing the CPU staging bottleneck identified in the profiler.
+
+## Why This Improves Performance
+
+| Inefficiency | Current Cost | After Fix |
+|---|---|---|
+| `gemmini_flush` per tile pair | `BLOCKS_M × BLOCKS_N` flushes | 1 flush total |
+| CPU `memcpy` for scales | 2 × `MATMUL_K/32 × BLK` bytes per tile pair | 0 — direct DRAM pointer |
+| Boundary checks in hot path | Every iteration | Only last `i0` (fast path skips all conditionals) |
+| `pad_i/pad_j` overhead in `loop_ws_spad` | Every call | Only boundary calls |
+
+The fast path (covering all full-BLK tile pairs) becomes a tight sequence of: `load_scales → mvin A → mvin B → mxquant_config → loop_ws_spad → read_smem → fence` with no branching, no CPU memory copies, and no pipeline flushes. This directly targets the dominant CPU-stage and configuration overhead identified in the profiler.

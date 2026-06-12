@@ -1,0 +1,121 @@
+An elegant and highly effective optimization plan is to apply **Strategy 5: consolidate scale factor arrays to minimize `gemmini_mx_load_scales` call count across tiled loop iterations**.
+
+### Optimization Plan
+
+1. **Eliminate Outer CPU Tiling Loops**: 
+   Since the target matrix dimensions are $64 \times 64$, we can compute the entire matrix multiplication using a single `gemmini_loop_ws_spad` call. 
+   - Scratchpad capacity allows holding all $A$ and $B$ tiles simultaneously: $(4 \times 4 + 4 \times 4) \times 16 = 512$ rows, which is well below the $8192$-row limit.
+   - Accumulator capacity fits the output tiles perfectly: $4 \times 4 \times 16 = 256$ rows, matching the maximum limit of $256$ rows.
+
+2. **Consolidate Scale Factor Loads**: 
+   By running the entire computation in a single hardware invocation, we can completely eliminate the CPU-side scale factor pre-formatting staging loops. We will load the entire scale factor matrices directly from DRAM (`A_scales_row` and `B_scales_col`) exactly once at the beginning of the function using `gemmini_mx_load_scales`, avoiding redundant reloading entirely.
+
+3. **Align Scratchpad Layout with Hardware Constraints**:
+   Place $A$ and $B$ tiles into the scratchpad according to Rule 12:
+   - $A$ tiles mapped sequentially to `a_base + (i * tiles_K + k) * DIM`
+   - $B$ tiles mapped sequentially to `b_base + (j * tiles_K + k) * DIM` with `b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM`
+
+4. **Streamline DMA and Computation**:
+   Execute a single set of configuration instructions, load all tiles, configure the output requantizer once, run the fused hardware loop, and drain the results from shared memory to DRAM.
+
+---
+
+### Optimized Code
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+#include "include/matmul_fp8_64x64.h"
+
+#define DIM 16
+#define ADDR_LEN 32
+
+typedef uint8_t  elem_t;   // fp8:e4m3 input elements
+typedef uint8_t  welem_t;  // fp8:e4m3 weight elements
+typedef uint64_t out_t;    // 4x bf16 packed per word
+
+#ifndef SPIKE_SIM
+static inline void load_scale_factors(volatile uint64_t *sf_mem, uint8_t *scale_factors, int n) {
+  for (size_t i = 0; i < n / 8; i++) {
+    sf_mem[i] = 0x7f7f7f7f7f7f7f7f;
+  }
+}
+#endif
+
+void solution(void) {
+  int tiles_I = MATMUL_M / DIM;
+  int tiles_J = MATMUL_N / DIM;
+  int tiles_K = MATMUL_K / DIM;
+
+  uint32_t a_base = 0;
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+  int SPAD_DEST = 128;
+
+  // 1. Configure Gemmini for weight-stationary MX fp8
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // 2. Consolidate scale factor loads: load the entire scale factor matrices once
+#ifdef SPIKE_SIM
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+#else
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, 1024);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, 1024);
+#endif
+
+  // 3. MVIN A tiles to scratchpad
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  // 4. MVIN B tiles to scratchpad
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base + (j * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  // 5. Configure the requantized write-back
+  gemmini_config_st((MATMUL_N / 8) * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // 6. Execute fused weight-stationary matmul loop in hardware
+  gemmini_loop_ws_spad(
+      tiles_I, tiles_J, tiles_K,
+      0, 0, 0,
+      a_base,
+      BANK_NUM * BANK_ROWS,
+      0,
+      SPAD_DEST,
+      false, false,
+      false, false, false,
+      NO_ACTIVATION,
+      0, 0,
+      false,
+      0x38);
+
+  // 7. Drain results to DRAM
+#ifdef SPIKE_SIM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N / 2);
+#else
+  uint64_t* smem_start_addr = ((uint64_t*)SMEM) + SPAD_DEST * 2;
+  for (int i = 0; i < MATMUL_M; i++) {
+    for (int j = 0; j < MATMUL_N / 8; j++) {
+      C_hw[i][j] = *(smem_start_addr + (i * MATMUL_N / 8 + j));
+    }
+  }
+#endif
+
+  gemmini_fence();
+}
+```

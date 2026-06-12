@@ -1,0 +1,63 @@
+An elegant and highly effective optimization plan to improve the execution time of the program is to apply **Strategy 13: Consolidate output SMEM-to-DRAM transfers into a single bulk DMA transaction by padding DRAM allocations, eliminating the latency of the row-by-row `gemmini_mx_read_smem` loop.**
+
+---
+
+### Inefficiency Analysis
+
+In the original code, the output of the tiled matrix multiplication is drained from the shared memory (`mx_smem`) back to the host DRAM using a nested loop:
+
+```c
+for (int r = 0; r < mrows; r++) {
+  gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                       SPAD_DEST * 16 + r * BLK, ncols);
+}
+```
+
+This approach is highly inefficient for the following reasons:
+1. **High DMA Startup Overhead:** It issues `mrows` (up to 64) separate DMA read commands. Each individual call to `gemmini_mx_read_smem` triggers hardware handshake/startup latencies, which dominates the overall transfer time for small widths (e.g., 64 elements = 128 bytes).
+2. **CPU Instruction Overhead:** Issuing dozens of RoCC custom instructions per block inside nested loops creates a significant instruction-issue bottleneck on the RISC-V host CPU.
+3. **Serialized Execution:** Each loop iteration must wait for the command queue to accept the next transfer instruction.
+
+---
+
+### Optimization Plan
+
+We can consolidate these multiple fine-grained transfers into **one single bulk DMA transfer** by utilizing a contiguous, padded temporary buffer in DRAM, and then performing high-speed CPU copies. 
+
+#### 1. Declare a Contiguous Temporary DRAM Buffer
+Introduce a static, 64-byte aligned temporary DRAM buffer of size `[BLK][BLK / BF16_PER_WORD]` elements of type `out_t` (uint64_t):
+```c
+static out_t C_temp[BLK][BLK / BF16_PER_WORD] __attribute__((aligned(64)));
+```
+For `BLK = 64`, this buffer is exactly $64 \times 16 \times 8 = 8192$ bytes (8 KB), which easily fits in memory and avoids dynamic allocation overhead.
+
+#### 2. Perform a Single Bulk DMA Read
+Instead of reading row-by-row, execute a single `gemmini_mx_read_smem` instruction to copy the entire computed output tile ($mrows \times BLK$ elements) from the shared memory into `C_temp` in one transaction:
+```c
+gemmini_mx_read_smem(&C_temp[0][0], SPAD_DEST * 16, mrows * BLK);
+```
+Since the hardware loop outputs tiles contiguously in SMEM, this single command retrieves all rows sequentially, maximizing DMA burst-bandwidth utilization.
+
+#### 3. Issue a Synchronizing Fence
+Place the memory barrier `gemmini_fence()` immediately after the bulk DMA call. This ensures that the hardware accelerator completes the transfer into DRAM before the host CPU attempts to read the data:
+```c
+gemmini_fence();
+```
+
+#### 4. Scatter to Destination via CPU `memcpy`
+With the data safely in the contiguous `C_temp` buffer, the CPU can scatter-copy only the valid `ncols` columns of each row into the final `C_hw` buffer. Because this is a sequential local memory copy, the CPU can perform this extremely fast using standard `memcpy`:
+```c
+for (int r = 0; r < mrows; r++) {
+  memcpy(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+         &C_temp[r][0],
+         ncols * sizeof(uint16_t)); // BF16 elements are 2 bytes each
+}
+```
+
+---
+
+### Key Benefits
+
+- **Amortizes Latency:** Reduces the number of DMA invocations from 64 down to 1 per tile. The startup penalty of the DMA controller is paid only once.
+- **Reduces CPU Stalls:** Replaces slow, serialized RoCC instructions with highly optimized CPU sequential block copies (`memcpy`). 
+- **Maintains Correctness:** Works perfectly with partial tile bounds (`mrows` and `ncols` less than `BLK`) without corrupting adjacent memory.

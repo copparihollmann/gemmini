@@ -1,0 +1,75 @@
+## Analysis of the Current Code
+
+The current code iterates over `(i0, j0)` output blocks. For each block, it:
+1. Flushes and reconfigures
+2. Reloads scale factors
+3. MVINs A tiles for that `i0` block
+4. MVINs B tiles for that `j0` block
+5. Computes and reads results
+
+**Key inefficiency targeted by Strategy 2:** For a fixed `j0` (B column block), the B tiles are identical across all `i0` iterations. Currently, B tiles are re-MVINed for every `(i0, j0)` pair — that's `BLOCKS_M` redundant B loads per `j0`.
+
+The fix: **reorder the loops to `j0` outer, `i0` inner**, load B tiles once per `j0`, and reuse them across all `i0` iterations.
+
+## Plan: Reuse B Tiles Across I-tile Iterations (Strategy 2)
+
+### Step 1: Swap the loop order to `j0` outer, `i0` inner
+
+Change:
+```c
+for (int i0 = 0; i0 < BLOCKS_M; i0++)
+  for (int j0 = 0; j0 < BLOCKS_N; j0++)
+```
+to:
+```c
+for (int j0 = 0; j0 < BLOCKS_N; j0++)
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+```
+
+### Step 2: Hoist B-tile MVIN outside the `i0` loop
+
+`b_base` depends only on `tiles_K` and `tiles` (which are loop-invariant), so `b_base` is constant for all `(i0, j0)` combinations. The B tiles for a given `j0` block are the same regardless of `i0`.
+
+Move the B-tile mvin block (the `gemmini_config_ld(MATMUL_N * ...)` + B mvin loop) to execute **once per `j0`**, before the `i0` loop begins.
+
+### Step 3: Keep A-tile MVIN, scale loading, config, and compute inside `i0`
+
+Scale factors `A_s` depend on `i0`, and `B_s` depends on `j0`. Since we cannot split `gemmini_mx_load_scales` (both A and B must be loaded before compute), we must reload both scales inside `i0`. However, `B_s` for a given `j0` is the same for every `i0`, so we can compute it once before the `i0` loop and just re-issue the load (it's cheap relative to the MVIN DMA).
+
+Actually, re-examining: the rule says scales must be loaded before `gemmini_loop_ws_spad`. We cannot call `gemmini_mx_read_smem` from a previous block without a fence first, but fencing between iterations is acceptable. The key saving is **eliminating `tiles * tiles_K` B-tile mvin instructions per `(i0,j0)` pair** — instead paying that cost only `BLOCKS_N` times total rather than `BLOCKS_M * BLOCKS_N` times.
+
+### Step 4: Also hoist `B_s` memcpy outside `i0`
+
+The B scale memcpy (`memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK)`) only depends on `j0`, so move it outside the `i0` loop. Only `A_s` memcpy stays inside `i0`.
+
+### Step 5: Move `gemmini_flush` and `gemmini_extended3_config_ex` outside both loops
+
+`gemmini_flush` and `gemmini_extended3_config_ex` are format/dataflow configuration that doesn't change per tile — hoist them completely outside both loops (issue once before the `j0` loop). This also eliminates `BLOCKS_M * BLOCKS_N - 1` redundant flush+config pairs.
+
+### Concrete restructuring:
+
+```
+gemmini_flush(0);
+gemmini_extended3_config_ex(...);  // once
+
+for j0 in 0..BLOCKS_N:
+    compute ncols, B_s memcpy (all g)
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+    for j in 0..tiles: for k in 0..tiles_K: mvin B tile  // ONCE per j0
+
+    for i0 in 0..BLOCKS_M:
+        compute mrows, A_s memcpy (all g)
+        gemmini_mx_load_scales(A_s, ..., 0);   // A scales
+        gemmini_mx_load_scales(B_s, ..., 1);   // B scales (same per j0)
+        gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+        for i in 0..tiles: for k in 0..tiles_K: mvin A tile
+        gemmini_config_st(...);
+        gemmini_mxquant_config_mvout(...);
+        gemmini_loop_ws_spad(...);
+        gemmini_mx_read_smem(...);   // read result
+        gemmini_fence();             // fence before next i0 modifies A spad
+
+gemmini_fence();  // final fence (or rely on per-iteration fence)
+```
+
+This reduces B mvin instructions from `BLOCKS_M * BLOCKS_N * tiles * tiles_K` to `BLOCKS_N * tiles * tiles_K`, a factor of `BLOCKS_M` reduction in B-tile DMA overhead. The B tiles remain valid in the scratchpad across all `i0` because `b_base` is fixed and A tiles occupy only `a_base` (beginning of scratchpad), which never overlaps with `b_base` at the top of the scratchpad given the constraint `(tiles_I*tiles_K + tiles_J*tiles_K)*DIM ≤ 8192`.

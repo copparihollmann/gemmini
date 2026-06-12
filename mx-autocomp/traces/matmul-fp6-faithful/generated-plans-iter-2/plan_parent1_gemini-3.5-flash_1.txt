@@ -1,0 +1,68 @@
+### Strategy: Coalesced DMA (Block-based MVIN)
+
+In the baseline implementation, the activation matrix $A$ and weight matrix $B$ are loaded into the scratchpad through highly strided, single-tile `mvin` instructions (64 separate transfers for $A$, and 64 separate transfers for $B$). Each individual `mvin` instruction transfers a single $16 \times 16$ tile, which underutilizes the DMA controller's burst bandwidth and incurs heavy host CPU overhead from instruction dispatch, configuration, and synchronization.
+
+To solve this bottleneck, we can exploit the hardware's row-wrapping capability by configuring the DMA controller with `block_mvin_stride = DIM` (which is configured by default via `gemmini_config_ld`). This allows Gemmini to automatically wrap continuous multi-column DRAM blocks into consecutive tiles in the scratchpad.
+
+1. **Coalesced Activation Loading**: Since the tiles along the K-dimension for any given row-strip of $A$ are stored contiguously in the scratchpad, we can fetch all $tk$ tiles of a row-strip in a **single** `mvin` command of width `tk * DIM = 256` bytes and height `DIM = 16`. This reduces the number of $A$-side loading instructions from 64 to just **4** (one per row-strip of $M$).
+2. **Coalesced Weight Loading**: Similarly, for a given block row $k$ of $B$, the $tj$ column tiles are stored contiguously in the scratchpad. We can fetch all $tj$ tiles in a **single** `mvin` command of width `tj * DIM = 64` bytes and height `DIM = 16`. This reduces the number of $B$-side loading instructions from 64 to **16** (one per row-strip of $K$).
+
+This approach reduces the total number of DMA transfer commands from **128 down to 20**, drastically reducing hardware latency and instruction overhead while maximizing memory bus burst efficiency.
+
+### Optimized Code
+
+```c
+// Optimized high-performance MX matmul kernel (128x128x256, fp6:e3m2).
+void solution(void) {
+  {
+    int ti = MATMUL_M / DIM / 2, tj = MATMUL_N / DIM / 2, tk = MATMUL_K / DIM;
+    uint32_t ab = 0;
+    uint32_t bb = BANK_NUM * BANK_ROWS - tk * tj * DIM;
+    int SDST = 128;
+
+    // 1. Configure execution (WS mode, formats, lut enabled)
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 1, 1, 3, 1);
+
+    // 2. Load scale factors
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+    // 3. Load quantization LUTs
+    gemmini_mx_load_lut((uint64_t)B_lut_p, 1, 0);
+    gemmini_mx_load_lut((uint64_t)A_lut_p, 1, 1);
+
+    // 4. Coalesced MVIN for A (4 transfers instead of 64)
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i = 0; i < ti; i++) {
+      gemmini_extended_mvin(
+        (void*)(((elem_t*)A_in_hw) + i * DIM * MATMUL_K), 
+        ab + i * tk * DIM, 
+        tk * DIM, 
+        DIM
+      );
+    }
+
+    // 5. Coalesced MVIN for B (16 transfers instead of 64)
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2);
+    for (int k = 0; k < tk; k++) {
+      gemmini_extended_mvin(
+        (void*)(((elem_t*)B_in) + k * DIM * (MATMUL_N / 2)), 
+        bb + k * tj * DIM, 
+        tj * DIM, 
+        DIM
+      );
+    }
+
+    // 6. Configure store and MX-quantized mvout
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti, tj, tk, 0, 0, 9);
+
+    // 7. Execute hardware fused weight-stationary compute loop
+    gemmini_loop_ws_spad(ti, tj, tk, 0, 0, 0, ab, BANK_NUM * BANK_ROWS, 0, SDST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+    // 8. Drain BF16 results from shared memory to DRAM
+    gemmini_mx_read_smem(&C_hw[0][0], SDST * 16, MATMUL_M * MATMUL_N);
+    gemmini_fence();
+  }
+}
+```

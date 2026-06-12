@@ -1,0 +1,80 @@
+### Optimization Plan
+
+We will apply **Strategy 1: reduce data movement** (maximizing DMA batching efficiency) to optimize the original tiled MX matmul kernel.
+
+#### Analysis of Inefficiencies
+1. **Under-batched DMA loads for Matrix A**: The original implementation loads Matrix A with a batching factor of 2 (`cols = 2 * DIM`), resulting in $ti \times (tk / 2) = 4 \times 8 = 32$ `mvin` calls. Since Gemmini's scratchpad DMA supports a maximum block length of 4 (`MAX_BLOCK_LEN = 4`), we are not fully utilizing the hardware's capacity to load contiguous memory.
+2. **Unbatched DMA loads for Matrix B**: The original implementation loads Matrix B with a batching factor of 1 (`cols = DIM`), requiring $tk \times tj = 16 \times 4 = 64$ individual `mvin` instructions. Since the $J$ dimension of B is contiguous in DRAM, we can group these loads.
+3. **Host CPU overhead**: The nested loop structures contain expensive multiplications and divisions for address calculations (e.g., `i * DIM * MATMUL_K` and `(i * tk + k) * DIM`) on every iteration. This stalls the host CPU and delays feeding instructions to the Gemmini RoCC queue.
+
+#### Optimization Steps
+1. **Maximize Matrix A batching**: Increase the A-tile loading batch factor to 4 (`cols = 4 * DIM`) along the contiguous $K$ dimension. This reduces A-tile loading instructions from 32 to 16.
+2. **Maximize Matrix B batching**: Since B is stored in row-major layout, the elements along the $J$ dimension are completely contiguous in DRAM. We will batch load the entire row of $tj = 4$ tiles at once with `cols = 4 * DIM`, reducing B-tile loading instructions from 64 to 16.
+3. **Host-side pointer induction**: Eliminate all loop-bound multiplications by maintaining inductive DRAM pointers (`a_row_ptr`, `a_col_ptr`, `b_row_ptr`) and inductive scratchpad addresses (`a_sp_addr`, `b_sp_addr`).
+
+This reduces the total `mvin` instruction count from 96 to 32 (a $3\times$ instruction reduction), dramatically decreasing DMA setup overhead and allowing the host CPU to stay ahead of the systolic array.
+
+---
+
+### Optimized C Code
+
+```c
+#include <stdint.h>
+#include "include/gemmini_testutils.h"
+#include "include/matmul_fp8_64x64.h"
+
+// AUTO-GENERATED optimized MX matmul kernel (128x128x256, fp4:e2m1).
+void solution(void) {
+  {
+    int ti = MATMUL_M / DIM / 2; 
+    int tj = MATMUL_N / DIM / 2; 
+    int tk = MATMUL_K / DIM;
+    uint32_t ab = 0;
+    uint32_t bb = BANK_NUM * BANK_ROWS - tk * tj * DIM;
+    int SDST = 128;
+    
+    // 1. Configure execution with A_stride = 2 (retains physical dual-packed tile stride)
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 2, 0, 0, false, 2, 2, 3, 0);
+    
+    // 2. Load scale factors once
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+    
+    // 3. Configure store stride and requantizer
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti, tj, tk, 0, 0, 1);
+    
+    // 4. MVIN A: Batched by 4 along the K dimension using pointer induction
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    elem_t *a_row_ptr = (elem_t*)A_in_hw;
+    uint32_t a_sp_addr = ab;
+    for (int i = 0; i < ti; i++) {
+      elem_t *a_col_ptr = a_row_ptr;
+      for (int k = 0; k < tk; k += 4) {
+        gemmini_extended_mvin((void*)a_col_ptr, a_sp_addr, 4 * DIM, DIM);
+        a_col_ptr += 4 * DIM;
+        a_sp_addr += 4 * DIM;
+      }
+      a_row_ptr += DIM * MATMUL_K;
+    }
+    
+    // 5. MVIN B: Batched by 4 along the contiguous J dimension (loads whole B row at once)
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2);
+    elem_t *b_row_ptr = (elem_t*)B_in;
+    uint32_t b_sp_addr = bb;
+    int b_stride_dram = DIM * (MATMUL_N / 2);
+    for (int k = 0; k < tk; k++) {
+      gemmini_extended_mvin((void*)b_row_ptr, b_sp_addr, 4 * DIM, DIM);
+      b_row_ptr += b_stride_dram;
+      b_sp_addr += 4 * DIM;
+    }
+    
+    // 6. Execute hardware fused loop
+    gemmini_loop_ws_spad(ti, tj, tk, 0, 0, 0, ab, BANK_NUM * BANK_ROWS, 0, SDST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    
+    // 7. Drain results and sync
+    gemmini_mx_read_smem(&C_hw[0][0], SDST * 16, MATMUL_M * MATMUL_N);
+    gemmini_fence();
+  }
+}
+```

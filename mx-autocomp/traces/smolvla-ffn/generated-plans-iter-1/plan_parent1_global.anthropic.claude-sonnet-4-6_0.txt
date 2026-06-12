@@ -1,0 +1,72 @@
+## Analysis of the Current Code
+
+The current code iterates over `BLOCKS_M × BLOCKS_N` output tiles, and for **each tile** it issues:
+1. `gemmini_flush(0)` — full pipeline flush every tile
+2. `gemmini_extended3_config_ex` — full reconfiguration every tile
+3. Two `gemmini_mx_load_scales` calls — scale reload every tile
+
+The performance feedback confirms:
+- Scratchpad utilization: 0KB/256KB — the BLK×BLK tiling is small
+- Accumulator utilization: 0KB/64KB — same
+- `gemmini_flush` inside the loop is extremely wasteful
+
+The outer `i0/j0` loops process one `BLK×BLK` output block at a time, loading only a fraction of the scratchpad. The strategy that directly addresses the **dominant overhead** here is:
+
+---
+
+## Selected Strategy: **2 — Try New Parameter Values**
+
+### Problem Identification
+
+The code uses `BLK`-sized blocks, where `tiles = BLK/DIM` and `tiles_K = MATMUL_K/DIM`. Each outer-loop iteration loads:
+- A tiles: `tiles × tiles_K × DIM` rows = `(BLK/16) × (MATMUL_K/16) × 16 = BLK × MATMUL_K / 16` rows
+- B tiles: `tiles × tiles_K × DIM` rows = same
+
+With scratchpad capacity of 8192 rows, the constraint is:
+```
+(tiles_I*tiles_K + tiles_J*tiles_K) * DIM ≤ 8192
+tiles_I*tiles_K + tiles_J*tiles_K ≤ 512
+(tiles_I + tiles_J) * tiles_K ≤ 512
+```
+
+And accumulator constraint:
+```
+tiles_I * tiles_J * DIM ≤ 256
+tiles_I * tiles_J ≤ 16
+```
+
+Currently `BLK` is small (given "scratchpad utilization 0KB"), meaning the outer loop runs many iterations — each paying the full `gemmini_flush + config_ex + load_scales` overhead — while leaving almost all of the scratchpad empty.
+
+### Plan
+
+**Increase `BLK` (and therefore `tiles_I`/`tiles_J`) to the maximum values that fit within both the scratchpad and accumulator constraints simultaneously.**
+
+Let `tiles_K = MATMUL_K / 16`. For the scratchpad:
+```
+(tiles_I + tiles_J) × tiles_K ≤ 512
+```
+For the accumulator (this is the binding constraint):
+```
+tiles_I × tiles_J ≤ 16
+```
+
+Setting `tiles_I = tiles_J = 4` (i.e., `BLK = 64`) gives:
+- Accumulator: `4 × 4 × 16 = 256 rows` ✓ (exactly fits)
+- Scratchpad (assuming `tiles_K = MATMUL_K/16`): `(4+4) × tiles_K × 16` rows — verify fits
+
+This maximizes `BLK` within the accumulator limit, reducing the number of outer-loop iterations by `(64/BLK_old)²`, and amortizes the per-tile `gemmini_flush + config_ex + load_scales` overhead over 4× more output elements per call.
+
+### Specific Changes
+
+1. **Set `BLK = 64`** (so `tiles = 64/16 = 4`).
+2. **Remove `gemmini_flush(0)` from inside the loop** — it is only needed once at initialization; calling it every tile stalls the entire pipeline unnecessarily. Move it before the outer loop, or remove it entirely if the hardware is already in a clean state.
+3. **Move `gemmini_extended3_config_ex` outside the `i0/j0` loop** — format and dataflow configuration doesn't change between tiles; re-issuing it every iteration wastes cycles.
+4. **Keep `gemmini_mx_load_scales` inside the loop** (correctly, since A and B scales differ per block), but with `BLK=64` the loop runs `(REAL_M/64) × (REAL_N/64)` times instead of `(REAL_M/BLK_old)²`, reducing total scale-load calls proportionally.
+5. **Verify scratchpad fit**: with `tiles=4`, `tiles_K = MATMUL_K/16`:
+   - A rows: `4 × tiles_K × 16`
+   - B rows: `4 × tiles_K × 16`
+   - Total: `8 × tiles_K × 16 = 128 × tiles_K`
+   - For `MATMUL_K=64`: `128 × 4 = 512 rows` ✓ (well within 8192)
+6. **Accumulator** holds `4 × 4 × 16 = 256 rows` — exactly the maximum; `SPAD_DEST=128` is still valid as the C destination offset.
+
+The result is that each outer iteration now processes a `64×64` output tile instead of a smaller one, the expensive per-invocation overhead (`flush`, `config_ex`) is paid once or far fewer times, and the `gemmini_loop_ws_spad` fused hardware loop covers 16× more output with one invocation.
