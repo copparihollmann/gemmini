@@ -1,0 +1,64 @@
+## Analysis of the Current Code
+
+The current code has this structure:
+
+```
+for i0 in BLOCKS_M:
+  for j0 in BLOCKS_N:
+    gemmini_flush(0)
+    gemmini_extended3_config_ex(...)   // <-- re-issued every (i0,j0) iteration
+    gemmini_mx_load_scales(...)
+    ... mvin A, mvin B ...
+    gemmini_loop_ws_spad(...)
+    gemmini_mx_read_smem(...)
+    gemmini_fence()
+```
+
+`gemmini_extended3_config_ex` is called once per (i0, j0) block pair. For a 41×512×512 problem with `BLK=64` (tiles of 64 rows/cols), that's `BLOCKS_M * BLOCKS_N` calls. Since the MX format never changes (always FP8 E4M3 input, BF16 output, weight-stationary, no transpose), this is pure overhead.
+
+Similarly, `gemmini_flush(0)` is called every iteration — flushing the pipeline every block is wasteful when the format is invariant.
+
+## Selected Strategy: Hoist `gemmini_extended3_config_ex` Outside All Loops
+
+**Strategy 1** directly addresses this waste.
+
+## Plan
+
+### Step 1: Move `gemmini_flush(0)` and `gemmini_extended3_config_ex` before the `i0`/`j0` loop nest
+
+Since:
+- `WEIGHT_STATIONARY` dataflow is constant across all blocks
+- `act_mx_fmt=0`, `wgt_mx_fmt=0`, `out_mx_fmt=3`, `uselut=0` are invariant
+- `A_stride=1`, `C_stride=1`, no transpose — all invariant
+- `ACC_SCALE_IDENTITY` — invariant
+
+These calls can be lifted entirely outside both loops. The hardware state they set (dataflow, MX format encoding, strides) persists until explicitly changed, so issuing them once before the loop nest produces identical hardware behavior on every iteration.
+
+### Step 2: Remove `gemmini_flush(0)` from inside the loop
+
+`gemmini_flush` resets the pipeline. Calling it every block iteration flushes any in-flight state unnecessarily. Since we're reconfiguring correctly before the first block and the format never changes, a single flush before the hoisted config is sufficient.
+
+### Step 3: Keep everything else in place
+
+The `gemmini_mx_load_scales` calls **must** remain inside the loop because A_s and B_s are block-specific (different row/column scale slices for each (i0, j0) block). Similarly, mvin, `gemmini_mxquant_config_mvout`, `gemmini_loop_ws_spad`, `gemmini_mx_read_smem`, and `gemmini_fence` all remain per-block.
+
+### Resulting structure:
+
+```
+gemmini_flush(0);                          // once, before all blocks
+gemmini_extended3_config_ex(...);          // once, hoisted out
+
+for i0 in BLOCKS_M:
+  for j0 in BLOCKS_N:
+    // memcpy scale factors (block-specific)
+    // gemmini_mx_load_scales (block-specific)
+    // mvin A, mvin B
+    // gemmini_mxquant_config_mvout
+    // gemmini_loop_ws_spad
+    // gemmini_mx_read_smem
+    // gemmini_fence()
+```
+
+This eliminates `BLOCKS_M * BLOCKS_N - 1` redundant `gemmini_extended3_config_ex` and `gemmini_flush` calls. For a 41×512×512 problem with BLK=64, `BLOCKS_M = ceil(41/64) = 1`, `BLOCKS_N = ceil(512/64) = 8`, so this saves 7 redundant pairs. The savings scale quadratically with larger M and N dimensions, making this a robust optimization for the general case.
+
+The programming model ordering constraint is preserved: the single hoisted `config_ex` fires before any `mx_load_scales`, which remains before mvin, which remains before `mxquant_config_mvout`, which remains before `loop_ws_spad`, which remains before `mx_read_smem + fence`.

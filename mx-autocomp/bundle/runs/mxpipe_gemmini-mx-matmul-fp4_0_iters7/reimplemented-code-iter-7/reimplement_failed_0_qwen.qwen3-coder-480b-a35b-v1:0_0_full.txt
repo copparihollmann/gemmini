@@ -1,0 +1,91 @@
+Looking at the error message, the issue is that `cols=64` overflows the 6-bit hardware field, which can only handle values up to 63. This happens when batching 4 tiles of DIM=16 (4×16=64), exceeding the maximum of 63.
+
+Let me fix the code by reducing the batch sizes to comply with the hardware limits:
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+#include "include/matmul_data_mx_lut_hw.h"
+
+// Optimized MX matmul kernel (128x128x256, fp4:e2m1) using double-buffering.
+void solution(void) {
+  int block_i = 2;
+  int ti_block = MATMUL_M / DIM / block_i; // 128/16/2 = 4
+  int tj = MATMUL_N / DIM;                 // 128/16 = 8
+  int tk = MATMUL_K / DIM;                 // 256/16 = 16
+
+  uint32_t ab0 = 0;
+  uint32_t ab1 = ti_block * tk * DIM;      // 4 * 16 * 16 = 1024
+  uint32_t bb = BANK_NUM * BANK_ROWS - tk * tj * DIM; // 8192 - 16 * 8 * 16 = 6144
+
+  int SDST_0 = 0;
+  int SDST_1 = ti_block * tj;              // 4 * 8 = 32
+
+  // 1. Configure format and execution (FP4 format, WS mode)
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 2, 2, 3, 0);
+
+  // 2. Load scale factors
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // 3. Configure store
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+
+  // 4. Load B (weights) once - stationary across both execution blocks
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2); // FP4 packs 2 elements per byte
+  for (int k = 0; k < tk; k++) {
+    for (int j = 0; j < tj; j += 2) { // Batched by 2 (max allowed to stay under 64 cols)
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + k*DIM*(MATMUL_N/2) + j*DIM), 
+                            bb + (k*tj + j)*DIM, 
+                            2 * DIM, 
+                            DIM);
+    }
+  }
+
+  // --- STEP 0 (PROLOGUE) ---
+  // Load Activation Block 0
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < ti_block; i++) {
+    for (int k = 0; k < tk; k += 3) { // Batched by 3 (3*16=48 <= 63, max allowed by hardware)
+      int batch_size = (k + 3 > tk) ? (tk - k) : 3;
+      gemmini_extended_mvin((void*)(((elem_t*)A_in_hw) + i*DIM*MATMUL_K + k*DIM), 
+                            ab0 + (i*tk + k)*DIM, 
+                            batch_size * DIM, 
+                            DIM);
+    }
+  }
+
+  // --- STEP 1 (Pipelining Block 0 Compute + Block 1 Load) ---
+  // Load Activation Block 1
+  for (int i = 0; i < ti_block; i++) {
+    int global_i = ti_block + i; // Global i index for second block
+    for (int k = 0; k < tk; k += 3) { // Batched by 3
+      int batch_size = (k + 3 > tk) ? (tk - k) : 3;
+      gemmini_extended_mvin((void*)(((elem_t*)A_in_hw) + global_i*DIM*MATMUL_K + k*DIM), 
+                            ab1 + (i*tk + k)*DIM, 
+                            batch_size * DIM, 
+                            DIM);
+    }
+  }
+
+  // Compute Block 0
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti_block, tj, tk, 0, 0, 1);
+  gemmini_loop_ws_spad(ti_block, tj, tk, 0, 0, 0, ab0, BANK_NUM * BANK_ROWS, 0, SDST_0, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // Read Block 0 results from SMEM (non-blocking)
+  gemmini_mx_read_smem(&C_hw[0][0], SDST_0 * 16, ti_block * DIM * MATMUL_N);
+
+  // --- STEP 2 (EPILOGUE - Compute Block 1) ---
+  // Compute Block 1
+  uint64_t sf_offset = ti_block * tk * sizeof(uint8_t); // Offset in scale_factors array
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors + sf_offset, ti_block, tj, tk, 0, 0, 1);
+  gemmini_loop_ws_spad(ti_block, tj, tk, 0, 0, 0, ab1, BANK_NUM * BANK_ROWS, 0, SDST_1, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // Read Block 1 results from SMEM
+  gemmini_mx_read_smem(&C_hw[ti_block * DIM][0], SDST_1 * 16, ti_block * DIM * MATMUL_N);
+
+  // Final synchronization
+  gemmini_fence();
+}
+```

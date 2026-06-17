@@ -1,0 +1,27 @@
+## Analysis
+
+Looking at the original code, the im2col transformation materializes the full `A_buf` matrix in DRAM before issuing any mvin commands. The A_buf matrix is `MATMUL_M × MATMUL_K` bytes = (CONV_H/CONV_KSZ * PATCHES_X) × (CONV_C * CONV_KSZ * CONV_KSZ) elements. This full materialization wastes memory bandwidth by:
+1. Writing all of `A_buf` to DRAM in the im2col loops
+2. Then reading it all back during the mvin loops
+
+## Selected Strategy: Strategy 5 — Fuse im2col directly into the mvin loop
+
+### Plan
+
+Instead of first filling `A_buf[MATMUL_M][MATMUL_K]` in its entirety and then issuing mvin commands that read from it, we fuse the two steps: for each A tile `(i, k)`, we gather the `DIM × DIM` patch of elements directly from `X_in` into a small temporary buffer of size `DIM × DIM = 256 bytes` (stack-allocated), then immediately mvin that temporary tile into the scratchpad.
+
+**Concrete changes:**
+
+1. **Remove the full im2col loop** that populates `A_buf[pi][pj][...]` over all patches and input channels.
+
+2. **Replace the A mvin loop** with a fused version. For tile `(i, k)`:
+   - `i` maps to a patch index: `pi = (a_row) / PATCHES_X`, `pj = (a_row) % PATCHES_X` where `a_row = i * DIM + row_within_tile`
+   - `k` maps to a column block: `k * DIM` through `(k+1)*DIM - 1` in the im2col column space (i.e., elements `c * CONV_KSZ * CONV_KSZ + dy * CONV_KSZ + dx`)
+   - For each tile `(i, k)`, fill a `uint8_t tmp[DIM][DIM]` by iterating over the 16 rows of the tile (patch indices) and 16 columns (the corresponding `(c, dy, dx)` coordinate decoded from the column index), reading directly from `X_in[c][pi*CONV_KSZ+dy][pj*CONV_KSZ+dx]`.
+   - Issue `gemmini_extended_mvin(tmp, a_base + (i*tiles_K + k)*DIM, DIM, DIM)` immediately.
+
+3. **Keep `A_buf` only as a `DIM × DIM` temporary** (or eliminate it entirely if `A_buf` is only used for the scratchpad load). If `A_buf` is declared as the full `MATMUL_M × MATMUL_K` array globally, reduce it to a local `uint8_t tmp[DIM][DIM]` used per tile.
+
+4. **The B mvin loop, scale loads, config, loop_ws_spad, read_smem, and fence remain unchanged.**
+
+This eliminates the DRAM write of the full `A_buf` (MATMUL_M × MATMUL_K = e.g. 64×32 = 2048 bytes) and the subsequent DRAM re-read during mvin, replacing them with direct reads from `X_in` into a 256-byte stack buffer, halving the DRAM traffic for the A operand and removing the full-matrix intermediate allocation.

@@ -1,0 +1,746 @@
+{'correct': True, 'test_results': {0: True}, 'compiled': True, 'latency': 448}
+Prev latency: 448
+New latency: 448
+Plan: ## Analysis
+
+Looking at the original code, I need to identify which strategy applies most effectively.
+
+The current code uses:
+- `gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, tiles_K)` with `lut_update_granularity = tiles_K`
+
+The `lut_update_granularity` parameter controls how often the requantizer LUT refreshes during the output write-back. Setting it to `tiles_K` means the LUT refreshes once per (i,j) output tile pair across the full K reduction — this is already well-amortized.
+
+Looking more carefully at the B-tile MVIN loop ordering vs. the A-tile MVIN:
+
+- **A mvin**: outer loop over `i`, inner loop over `k` — for a fixed `i`, the DRAM pointer steps by `DIM` along K (stride = `MATMUL_K * sizeof(elem_t)` = contiguous along K rows). Batching 4 consecutive k-tiles is correct.
+- **B mvin**: currently uses outer loop over `k`, inner over `j` — DRAM pointer = `B_in + k*DIM*MATMUL_N + j*DIM`. Consecutive j-tiles at fixed k are contiguous in DRAM (stride = `MATMUL_N`). Batching is correct here too.
+
+**The key issue**: The B mvin loop uses `gemmini_block_mvin` which stores tiles at `b_base + (k*tiles_J + j)*DIM`. But the expected B layout for `gemmini_loop_ws_spad` is `b_base + (j*tiles_K + k)*DIM`. The current code stores B as `(k, j)` indexed but the hardware expects `(j, k)` indexed. **Wait — let me re-read the original code carefully.**
+
+The original code stores B at `b_base + (k * tiles_J + j) * DIM` but the reference pattern uses `b_base + (j * tiles_K + k) * DIM`. This is a layout mismatch — but the problem says the original code runs and produces output (latency 448), so it must be correct. Let me re-examine: `gemmini_loop_ws_spad` uses `B = BANK_NUM * BANK_ROWS` (the **end** address), so the hardware may index B differently. The hardware knows `b_base` is the end, and indexes backward.
+
+Regardless, **strategy 11** — "reorder I/J/K loop nest to maximize weight-stationary B-tile reuse across I iterations" — directly addresses the B mvin loop order, which currently iterates `k` outer, `j` inner for the B load. The compute in weight-stationary mode reuses B tiles across all `i` iterations, so loading B first (all j,k tiles) and then A is correct. This is already the case.
+
+**Strategy 5 (try new parameter values)** — specifically, the `lut_update_granularity`. Currently set to `tiles_K`. The maximum allowed value would reduce refresh overhead even further, but `tiles_K` is already the maximum meaningful value per output tile.
+
+The most impactful untried strategy is **strategy 13**: issue `gemmini_config_ld` once per DMA port with the correct stride before the entire mvin phase. Currently the code issues `gemmini_config_ld(MATMUL_K * sizeof(elem_t))` for A and then `gemmini_config_ld(MATMUL_N * sizeof(elem_t))` for B — that's already one config per loop. This is already optimal.
+
+**Strategy 5 — try new parameter values**: The `SPAD_DEST = 128` is a fixed choice. Looking at the B mvin: the loop order `(k outer, j inner)` with batching along j is fine. But what about `gemmini_config_ld` stride for B? `MATMUL_N * sizeof(elem_t)` is the row stride of B in DRAM (B is K×N row-major, stride = N bytes per row). This is correct.
+
+The most promising untried strategy is **strategy 5**: changing `lut_update_granularity` to an even larger value — specifically `tiles_I * tiles_J * tiles_K` or the maximum possible — to further amortize requantizer overhead. But it's already `tiles_K`.
+
+Let me re-read the B mvin indexing. For the original reference: `b_base + (j * tiles_K + k) * DIM`. The current code does `b_base + (k * tiles_J + j) * DIM`. These are different layouts! This could cause correctness issues, but since the problem states latency=448 (it runs), presumably the hardware loop handles it.
+
+**I'll apply Strategy 5**: increase `lut_update_granularity` from `tiles_K` to `tiles_I * tiles_J` or `tiles_I * tiles_J * tiles_K` to maximize amortization. Actually, the granularity G means "refresh every G output tiles," so setting G = `tiles_I * tiles_J * tiles_K` (the total number of tile operations) minimizes refreshes to just 1 total.
+
+## Plan
+
+**Strategy 5: Try new parameter values** — specifically, increase `lut_update_granularity` from `tiles_K` to `tiles_I * tiles_J * tiles_K`.
+
+Currently: `gemmini_mxquant_config_mvout(..., tiles_K)` refreshes the requantizer LUT once per (i,j) pair (every `tiles_K` K-steps). Since the entire matmul runs as a single `gemmini_loop_ws_spad` invocation, the LUT can be loaded once for the entire computation. Setting `lut_update_granularity = tiles_I * tiles_J * tiles_K` means the hardware refreshes the output quantization LUT only once for the entire fused loop, eliminating `tiles_I * tiles_J - 1` redundant refresh operations. This is safe because the scale factors and format are invariant across all tiles in this single-shot matmul.
+
+## Implementation
+
+```c
+void solution(void) {
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+#ifdef SPIKE_SIM
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+#else
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
+#endif
+
+  // ---- MVIN A: batch up to MAX_BLOCK_LEN=4 consecutive k-tiles per i-row ----
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+      int batch = (tiles_K - k < MAX_BLOCK_LEN) ? (tiles_K - k) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_block_mvin((void*)dram_ptr, sp_addr, batch);
+    }
+  }
+
+  // ---- MVIN B: batch up to MAX_BLOCK_LEN=4 consecutive j-tiles per k-row ----
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+
+  for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j += MAX_BLOCK_LEN) {
+      int batch = (tiles_J - j < MAX_BLOCK_LEN) ? (tiles_J - j) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+      gemmini_block_mvin((void*)dram_ptr, sp_addr, batch);
+    }
+  }
+
+  // SPAD_DEST = 128 avoids aliasing with a_base = 0 region
+  int SPAD_DEST = 128;
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+
+  // lut_update_granularity = tiles_I * tiles_J * tiles_K:
+  // Refresh the requantizer LUT only once for the entire fused hardware loop.
+  // All tiles share the same scale factors and format, so a single refresh
+  // at the start is sufficient. This eliminates (tiles_I * tiles_J - 1)
+  // redundant LUT refresh operations compared to refreshing every tiles_K steps.
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, tiles_I * tiles_J * tiles_K);
+
+  // ---- Compute ----
+  gemmini_loop_ws_spad(
+      tiles_I, tiles_J, tiles_K,
+      0, 0, 0,
+      a_base,
+      BANK_NUM * BANK_ROWS,
+      0,
+      SPAD_DEST,
+      false, false,
+      false, false, false,
+      NO_ACTIVATION,
+      0, 0,
+      false,
+      0x38);
+
+  gemmini_fence();
+
+#ifdef SPIKE_SIM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+#else
+  printf("Moving out:
+");
+  for (int i = 0; i < tiles_J*tiles_I*2; i++) {
+      gemmini_mvout((void*)((uint64_t*) C_hw + i*2*DIM), SPAD_DEST + i*DIM);
+  }
+  gemmini_fence();
+#endif
+
+  gemmini_fence();
+}
+```
+
+CodeCandidate(parent=CodeCandidate(parent=CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED baseline from Rakanic fork kernel matmul_tiled_fp8_128x128x256 (fp8:e4m3).
+void solution(void) {
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+#ifdef SPIKE_SIM
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+#else
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
+#endif
+
+  // ---- MVIN A: tile (i,k) -> a_base + (i*tiles_K + k)*DIM ----
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+
+  // ---- MVIN B: tile (k,j) -> b_base + (j*tiles_K + k)*DIM ----
+  for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j++) {
+      elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+//      printf("j: %d, k: %d, sp_addr: %d \n", j, k, sp_addr);
+//      printf("first elem: %x \n", dram_ptr[0]);
+      gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  int SPAD_DEST = 0;
+
+  gemmini_config_st(DIM * sizeof(elem_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // ---- Compute ----
+  gemmini_loop_ws_spad(
+      tiles_I, tiles_J, tiles_K,
+      0, 0, 0,
+      a_base,
+      BANK_NUM * BANK_ROWS,
+      0,
+      SPAD_DEST,
+      false, false,
+      false, false, false,
+      NO_ACTIVATION,
+      0, 0,
+      false,
+      0x38);
+
+//  for (int i = 0; i < tiles_I; i++) {
+//    for (int j = 0; j < tiles_J; j++) {
+//      uint32_t acc_tile_addr = acc_addr + (i * tiles_J + j) * DIM;
+//      out_t *dram_ptr = &C_hw[i * DIM][j * DIM];
+//      gemmini_mvout((void *) dram_ptr, acc_tile_addr);
+//    }
+//  }
+
+
+//  gemmini_mvout((void*)&C_hw[0][0], 128 )
+
+  gemmini_fence();
+
+//  uint64_t* smem_addr = ((uint64_t*)SMEM) + SPAD_DEST * 2 + 448 / 8;
+//  printf("SMEM at address %x = %lx \n", ((uint64_t*)SMEM), *((uint64_t*)SMEM));
+//  printf("SMEM at address %x = %lx \n", smem_addr, *smem_addr);
+//  printf("SMEM at address %x = %lx \n", smem_addr + 2, *(smem_addr+2));
+
+
+#ifdef SPIKE_SIM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+#else
+  printf("Moving out:\n");
+  for (int i = 0; i < tiles_J*tiles_I*2; i++) {
+      gemmini_mvout((void*)((uint64_t*) C_hw + i*2*DIM), SPAD_DEST + i*DIM);
+  }
+  gemmini_fence();
+#endif
+
+  // ---- Debug print tile (0,0) ----
+//  printf("=== Tile (0,0) - acc_addr=0x%08x ===\n", acc_addr);
+//  for (int i = 0; i < DIM; i++) {
+//    for (int j = 0; j < DIM; j++) {
+//      printf("C_hw[%d][%d] = 0x%016lx\n", i, j, (unsigned long)C_hw[i][j]);
+//    }
+//  }
+
+  // ---- Elementwise check against C_out_bf16 ----
+  }
+''',
+score=1607,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'Accelerator-bound: compute and data-movement look balanced; tune tiling / scratchpad occupancy for more overlap.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''## Analysis
+
+Looking at the original code, the B-tile mvin loop is:
+
+```c
+for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j++) {
+        elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+        uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+        gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+}
+```
+
+For `MATMUL_N=128, MATMUL_K=256`, `tiles_J=8, tiles_K=16`, this issues **128 individual mvin commands**.
+
+## Plan: Strategy 7 — Batch consecutive B-tile mvin calls using `gemmini_block_mvin`
+
+**Observation:** The B scratchpad layout places tile `(k, j)` at `b_base + (k*tiles_J + j)*DIM`. For a fixed `k`, as `j` runs 0..tiles_J-1, the scratchpad addresses are consecutive: `b_base + k*tiles_J*DIM`, `b_base + k*tiles_J*DIM + DIM`, ..., contiguous in both DRAM and scratchpad.
+
+However, looking more carefully at the DRAM layout: `B_in + k*DIM*MATMUL_N + j*DIM` — for fixed `k`, as `j` increases by 1, the DRAM pointer increases by `DIM` bytes. With stride `gemmini_config_ld(MATMUL_N * sizeof(elem_t))` = 128, this means each successive `j` tile starts exactly one DIM-row stride apart in DRAM. And in the scratchpad, they are also DIM rows apart and contiguous. This is exactly the `gemmini_block_mvin` use case.
+
+**`gemmini_block_mvin(dram_addr, spad_addr, len)`** issues a single mvin command that loads `len` consecutive DIM-column tiles, each `stride` bytes apart in DRAM, into consecutive scratchpad rows. With `len = tiles_J` (up to `MAX_BLOCK_LEN = 4`), we can batch tiles_J tiles per k-row into `tiles_J / MAX_BLOCK_LEN` commands.
+
+**Concrete change:**
+
+For each `k`, instead of `tiles_J` individual mvin calls, issue `ceil(tiles_J / MAX_BLOCK_LEN)` block mvin calls, each transferring up to 4 tiles at once. With `tiles_J = 8` and `MAX_BLOCK_LEN = 4`, this reduces from 8 calls to 2 calls per `k`, reducing total B-load instruction count from 128 to 32 — a 4× reduction in B mvin commands.
+
+The inner loop over `j` becomes:
+```c
+for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j += MAX_BLOCK_LEN) {
+        int batch = (tiles_J - j < MAX_BLOCK_LEN) ? (tiles_J - j) : MAX_BLOCK_LEN;
+        elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+        uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+        gemmini_block_mvin((void*)dram_ptr, sp_addr, batch);
+    }
+}
+```
+
+The B spad layout `b_base + (k*tiles_J + j)*DIM` is unchanged — `gemmini_block_mvin` fills exactly those consecutive rows. The A mvin loop is unchanged. All other steps (config_ex, load_scales, config_st, mxquant_config_mvout, loop_ws_spad, mx_read_smem, fence) are unchanged. This is a drop-in reduction of mvin instruction count with no semantic change.''',
+code='''void solution(void) {
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+#ifdef SPIKE_SIM
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+#else
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
+#endif
+
+  // ---- MVIN A: tile (i,k) -> a_base + (i*tiles_K + k)*DIM ----
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+
+  // ---- MVIN B: tile (k,j) -> b_base + (k*tiles_J + j)*DIM ----
+  // Batch up to MAX_BLOCK_LEN=4 consecutive j-tiles per k-row using gemmini_block_mvin
+  for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j += MAX_BLOCK_LEN) {
+      int batch = (tiles_J - j < MAX_BLOCK_LEN) ? (tiles_J - j) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+      gemmini_block_mvin((void*)dram_ptr, sp_addr, batch);
+    }
+  }
+
+  int SPAD_DEST = 0;
+
+  gemmini_config_st(DIM * sizeof(elem_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // ---- Compute ----
+  gemmini_loop_ws_spad(
+      tiles_I, tiles_J, tiles_K,
+      0, 0, 0,
+      a_base,
+      BANK_NUM * BANK_ROWS,
+      0,
+      SPAD_DEST,
+      false, false,
+      false, false, false,
+      NO_ACTIVATION,
+      0, 0,
+      false,
+      0x38);
+
+  gemmini_fence();
+
+#ifdef SPIKE_SIM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+#else
+  printf("Moving out:\n");
+  for (int i = 0; i < tiles_J*tiles_I*2; i++) {
+      gemmini_mvout((void*)((uint64_t*) C_hw + i*2*DIM), SPAD_DEST + i*DIM);
+  }
+  gemmini_fence();
+#endif
+
+}
+''',
+score=900,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'Accelerator-bound: compute and data-movement look balanced; tune tiling / scratchpad occupancy for more overlap.'],
+plan_gen_model='us.anthropic.claude-sonnet-4-6',
+code_gen_model='us.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None),
+plan='''## Analysis of the Current Code
+
+Looking at the current code, I can identify several inefficiencies:
+
+1. **A-tile mvin is not batched**: B-tiles use `gemmini_block_mvin` (up to 4 tiles per command), but A-tiles use individual `gemmini_extended_mvin` calls — one command per tile. This doubles the mvin command overhead for A.
+
+2. **SPAD_DEST = 0** conflicts with `a_base = 0`, creating potential aliasing between A tiles and output accumulation region.
+
+3. **`lut_update_granularity = 1`** causes maximum LUT refresh overhead during the fused loop.
+
+4. **`gemmini_config_st(DIM * sizeof(elem_t))`** sets the output stride to 16 bytes (1 row × 16 uint8), but the correct stride for BF16 output should be `OUT_COLS * sizeof(out_t)` = `(MATMUL_N/4) * 8`.
+
+## Selected Strategy: Batch A-tile mvins using `gemmini_block_mvin` (Strategy 8)
+
+**Core idea:** The inner K-loop for A-tile loading issues `tiles_K` individual `gemmini_extended_mvin` commands per `i`-row. Since `MAX_BLOCK_LEN = 4`, we can batch up to 4 consecutive k-tiles per i-row into a single `gemmini_block_mvin` command, reducing the command count by up to 4×.
+
+**Why this works:** `gemmini_block_mvin(dram_ptr, sp_addr, batch)` expands to `gemmini_extended_mvin(dram_ptr, sp_addr, batch*DIM, DIM)` — it loads `batch` consecutive DIM-column tiles in one shot. For A tiles laid out row-major with stride `MATMUL_K`, consecutive k-tiles for a fixed i are physically contiguous in DRAM (`A_in + i*DIM*MATMUL_K + k*DIM`), so batching is valid.
+
+**Combined with fixes for SPAD_DEST and config_st stride**: Set `SPAD_DEST = 128` to avoid aliasing, and fix `gemmini_config_st` to use the correct BF16 output stride. Also increase `lut_update_granularity` to `tiles_K` for minimum refresh overhead (strategy 9, directly relevant and trivially combined).
+
+## Optimized Code
+
+```c
+void solution(void) {
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+#ifdef SPIKE_SIM
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+#else
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
+#endif
+
+  // ---- MVIN A: batch up to MAX_BLOCK_LEN=4 consecutive k-tiles per i-row ----
+  // Stride = MATMUL_K bytes (full packed row width of A, row-major layout)
+  // Consecutive k-tiles for fixed i are contiguous in DRAM -> batching is valid
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+      int batch = (tiles_K - k < MAX_BLOCK_LEN) ? (tiles_K - k) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_block_mvin((void*)dram_ptr, sp_addr, batch);
+    }
+  }
+
+  // ---- MVIN B: batch up to MAX_BLOCK_LEN=4 consecutive j-tiles per k-row ----
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+
+  for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j += MAX_BLOCK_LEN) {
+      int batch = (tiles_J - j < MAX_BLOCK_LEN) ? (tiles_J - j) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+      gemmini_block_mvin((void*)dram_ptr, sp_addr, batch);
+    }
+  }
+
+  // SPAD_DEST = 128 avoids aliasing with a_base = 0 region
+  int SPAD_DEST = 128;
+
+  // OUT_COLS = MATMUL_N / BF16_PER_WORD; each output row is OUT_COLS uint64_t words
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+
+  // lut_update_granularity = tiles_K: refresh LUT only once per (i,j) pair,
+  // not every tile step, minimizing requantizer overhead during fused loop
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, tiles_K);
+
+  // ---- Compute ----
+  gemmini_loop_ws_spad(
+      tiles_I, tiles_J, tiles_K,
+      0, 0, 0,
+      a_base,
+      BANK_NUM * BANK_ROWS,
+      0,
+      SPAD_DEST,
+      false, false,
+      false, false, false,
+      NO_ACTIVATION,
+      0, 0,
+      false,
+      0x38);
+
+  gemmini_fence();
+
+#ifdef SPIKE_SIM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+#else
+  uint64_t *smem_start_addr = ((uint64_t *)SMEM) + SPAD_DEST * 2;
+  for (int i = 0; i < MATMUL_M; i++) {
+    for (int j = 0; j < OUT_COLS; j++) {
+      C_hw[i][j] = *(smem_start_addr + (i * OUT_COLS + j));
+    }
+  }
+#endif
+
+  gemmini_fence();
+}
+```
+
+## Why This Reduces Latency
+
+1. **A-tile batching (primary improvement):** For `tiles_I × tiles_K` A-tiles, the original code issued `tiles_I * tiles_K` individual mvin commands. With batching of 4, this drops to `tiles_I * ceil(tiles_K/4)` commands — up to 4× fewer instruction dispatches and associated pipeline stalls for A loading, matching the efficiency already achieved for B.
+
+2. **SPAD_DEST = 128:** Eliminates any scratchpad address aliasing between A tiles (starting at row 0) and output accumulation (now starting at row 128), preventing potential memory hazards.
+
+3. **`lut_update_granularity = tiles_K`:** The requantizer previously refreshed the output LUT at every tile step; setting granularity to `tiles_K` means it refreshes only once per `(i,j)` output tile pair, amortizing that overhead across the full K reduction.''',
+code='''void solution(void) {
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+#ifdef SPIKE_SIM
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+#else
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
+#endif
+
+  // ---- MVIN A: batch up to MAX_BLOCK_LEN=4 consecutive k-tiles per i-row ----
+  // Consecutive k-tiles for fixed i are contiguous in DRAM -> batching is valid
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+      int batch = (tiles_K - k < MAX_BLOCK_LEN) ? (tiles_K - k) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_block_mvin((void*)dram_ptr, sp_addr, batch);
+    }
+  }
+
+  // ---- MVIN B: batch up to MAX_BLOCK_LEN=4 consecutive j-tiles per k-row ----
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+
+  for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j += MAX_BLOCK_LEN) {
+      int batch = (tiles_J - j < MAX_BLOCK_LEN) ? (tiles_J - j) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+      gemmini_block_mvin((void*)dram_ptr, sp_addr, batch);
+    }
+  }
+
+  // SPAD_DEST = 128 avoids aliasing with a_base = 0 region
+  int SPAD_DEST = 128;
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+
+  // lut_update_granularity = tiles_K: refresh LUT only once per (i,j) output
+  // tile pair, amortizing requantizer overhead across the full K reduction
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, tiles_K);
+
+  // ---- Compute ----
+  gemmini_loop_ws_spad(
+      tiles_I, tiles_J, tiles_K,
+      0, 0, 0,
+      a_base,
+      BANK_NUM * BANK_ROWS,
+      0,
+      SPAD_DEST,
+      false, false,
+      false, false, false,
+      NO_ACTIVATION,
+      0, 0,
+      false,
+      0x38);
+
+  gemmini_fence();
+
+#ifdef SPIKE_SIM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+#else
+  printf("Moving out:\n");
+  for (int i = 0; i < tiles_J*tiles_I*2; i++) {
+      gemmini_mvout((void*)((uint64_t*) C_hw + i*2*DIM), SPAD_DEST + i*DIM);
+  }
+  gemmini_fence();
+#endif
+
+  gemmini_fence();
+}
+''',
+score=448,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'Accelerator-bound: compute and data-movement look balanced; tune tiling / scratchpad occupancy for more overlap.'],
+plan_gen_model='us.anthropic.claude-sonnet-4-6',
+code_gen_model='us.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None),
+plan='''## Analysis
+
+Looking at the original code, I need to identify which strategy applies most effectively.
+
+The current code uses:
+- `gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, tiles_K)` with `lut_update_granularity = tiles_K`
+
+The `lut_update_granularity` parameter controls how often the requantizer LUT refreshes during the output write-back. Setting it to `tiles_K` means the LUT refreshes once per (i,j) output tile pair across the full K reduction — this is already well-amortized.
+
+Looking more carefully at the B-tile MVIN loop ordering vs. the A-tile MVIN:
+
+- **A mvin**: outer loop over `i`, inner loop over `k` — for a fixed `i`, the DRAM pointer steps by `DIM` along K (stride = `MATMUL_K * sizeof(elem_t)` = contiguous along K rows). Batching 4 consecutive k-tiles is correct.
+- **B mvin**: currently uses outer loop over `k`, inner over `j` — DRAM pointer = `B_in + k*DIM*MATMUL_N + j*DIM`. Consecutive j-tiles at fixed k are contiguous in DRAM (stride = `MATMUL_N`). Batching is correct here too.
+
+**The key issue**: The B mvin loop uses `gemmini_block_mvin` which stores tiles at `b_base + (k*tiles_J + j)*DIM`. But the expected B layout for `gemmini_loop_ws_spad` is `b_base + (j*tiles_K + k)*DIM`. The current code stores B as `(k, j)` indexed but the hardware expects `(j, k)` indexed. **Wait — let me re-read the original code carefully.**
+
+The original code stores B at `b_base + (k * tiles_J + j) * DIM` but the reference pattern uses `b_base + (j * tiles_K + k) * DIM`. This is a layout mismatch — but the problem says the original code runs and produces output (latency 448), so it must be correct. Let me re-examine: `gemmini_loop_ws_spad` uses `B = BANK_NUM * BANK_ROWS` (the **end** address), so the hardware may index B differently. The hardware knows `b_base` is the end, and indexes backward.
+
+Regardless, **strategy 11** — "reorder I/J/K loop nest to maximize weight-stationary B-tile reuse across I iterations" — directly addresses the B mvin loop order, which currently iterates `k` outer, `j` inner for the B load. The compute in weight-stationary mode reuses B tiles across all `i` iterations, so loading B first (all j,k tiles) and then A is correct. This is already the case.
+
+**Strategy 5 (try new parameter values)** — specifically, the `lut_update_granularity`. Currently set to `tiles_K`. The maximum allowed value would reduce refresh overhead even further, but `tiles_K` is already the maximum meaningful value per output tile.
+
+The most impactful untried strategy is **strategy 13**: issue `gemmini_config_ld` once per DMA port with the correct stride before the entire mvin phase. Currently the code issues `gemmini_config_ld(MATMUL_K * sizeof(elem_t))` for A and then `gemmini_config_ld(MATMUL_N * sizeof(elem_t))` for B — that\'s already one config per loop. This is already optimal.
+
+**Strategy 5 — try new parameter values**: The `SPAD_DEST = 128` is a fixed choice. Looking at the B mvin: the loop order `(k outer, j inner)` with batching along j is fine. But what about `gemmini_config_ld` stride for B? `MATMUL_N * sizeof(elem_t)` is the row stride of B in DRAM (B is K×N row-major, stride = N bytes per row). This is correct.
+
+The most promising untried strategy is **strategy 5**: changing `lut_update_granularity` to an even larger value — specifically `tiles_I * tiles_J * tiles_K` or the maximum possible — to further amortize requantizer overhead. But it\'s already `tiles_K`.
+
+Let me re-read the B mvin indexing. For the original reference: `b_base + (j * tiles_K + k) * DIM`. The current code does `b_base + (k * tiles_J + j) * DIM`. These are different layouts! This could cause correctness issues, but since the problem states latency=448 (it runs), presumably the hardware loop handles it.
+
+**I\'ll apply Strategy 5**: increase `lut_update_granularity` from `tiles_K` to `tiles_I * tiles_J` or `tiles_I * tiles_J * tiles_K` to maximize amortization. Actually, the granularity G means "refresh every G output tiles," so setting G = `tiles_I * tiles_J * tiles_K` (the total number of tile operations) minimizes refreshes to just 1 total.
+
+## Plan
+
+**Strategy 5: Try new parameter values** — specifically, increase `lut_update_granularity` from `tiles_K` to `tiles_I * tiles_J * tiles_K`.
+
+Currently: `gemmini_mxquant_config_mvout(..., tiles_K)` refreshes the requantizer LUT once per (i,j) pair (every `tiles_K` K-steps). Since the entire matmul runs as a single `gemmini_loop_ws_spad` invocation, the LUT can be loaded once for the entire computation. Setting `lut_update_granularity = tiles_I * tiles_J * tiles_K` means the hardware refreshes the output quantization LUT only once for the entire fused loop, eliminating `tiles_I * tiles_J - 1` redundant refresh operations. This is safe because the scale factors and format are invariant across all tiles in this single-shot matmul.
+
+## Implementation
+
+```c
+void solution(void) {
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+#ifdef SPIKE_SIM
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+#else
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
+#endif
+
+  // ---- MVIN A: batch up to MAX_BLOCK_LEN=4 consecutive k-tiles per i-row ----
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+      int batch = (tiles_K - k < MAX_BLOCK_LEN) ? (tiles_K - k) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_block_mvin((void*)dram_ptr, sp_addr, batch);
+    }
+  }
+
+  // ---- MVIN B: batch up to MAX_BLOCK_LEN=4 consecutive j-tiles per k-row ----
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+
+  for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j += MAX_BLOCK_LEN) {
+      int batch = (tiles_J - j < MAX_BLOCK_LEN) ? (tiles_J - j) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+      gemmini_block_mvin((void*)dram_ptr, sp_addr, batch);
+    }
+  }
+
+  // SPAD_DEST = 128 avoids aliasing with a_base = 0 region
+  int SPAD_DEST = 128;
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+
+  // lut_update_granularity = tiles_I * tiles_J * tiles_K:
+  // Refresh the requantizer LUT only once for the entire fused hardware loop.
+  // All tiles share the same scale factors and format, so a single refresh
+  // at the start is sufficient. This eliminates (tiles_I * tiles_J - 1)
+  // redundant LUT refresh operations compared to refreshing every tiles_K steps.
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, tiles_I * tiles_J * tiles_K);
+
+  // ---- Compute ----
+  gemmini_loop_ws_spad(
+      tiles_I, tiles_J, tiles_K,
+      0, 0, 0,
+      a_base,
+      BANK_NUM * BANK_ROWS,
+      0,
+      SPAD_DEST,
+      false, false,
+      false, false, false,
+      NO_ACTIVATION,
+      0, 0,
+      false,
+      0x38);
+
+  gemmini_fence();
+
+#ifdef SPIKE_SIM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+#else
+  printf("Moving out:\n");
+  for (int i = 0; i < tiles_J*tiles_I*2; i++) {
+      gemmini_mvout((void*)((uint64_t*) C_hw + i*2*DIM), SPAD_DEST + i*DIM);
+  }
+  gemmini_fence();
+#endif
+
+  gemmini_fence();
+}
+```''',
+code='''void solution(void) {
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+#ifdef SPIKE_SIM
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+#else
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
+#endif
+
+  // ---- MVIN A: batch up to MAX_BLOCK_LEN=4 consecutive k-tiles per i-row ----
+  // Consecutive k-tiles for fixed i are contiguous in DRAM -> batching is valid
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+      int batch = (tiles_K - k < MAX_BLOCK_LEN) ? (tiles_K - k) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_block_mvin((void*)dram_ptr, sp_addr, batch);
+    }
+  }
+
+  // ---- MVIN B: batch up to MAX_BLOCK_LEN=4 consecutive j-tiles per k-row ----
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+
+  for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j += MAX_BLOCK_LEN) {
+      int batch = (tiles_J - j < MAX_BLOCK_LEN) ? (tiles_J - j) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+      gemmini_block_mvin((void*)dram_ptr, sp_addr, batch);
+    }
+  }
+
+  // SPAD_DEST = 128 avoids aliasing with a_base = 0 region
+  int SPAD_DEST = 128;
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+
+  // lut_update_granularity = tiles_I * tiles_J * tiles_K:
+  // Refresh the requantizer LUT only once for the entire fused hardware loop.
+  // All tiles share the same scale factors and format, so a single refresh
+  // at the start is sufficient. This eliminates (tiles_I * tiles_J - 1)
+  // redundant LUT refresh operations compared to refreshing every tiles_K steps.
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, tiles_I * tiles_J * tiles_K);
+
+  // ---- Compute ----
+  gemmini_loop_ws_spad(
+      tiles_I, tiles_J, tiles_K,
+      0, 0, 0,
+      a_base,
+      BANK_NUM * BANK_ROWS,
+      0,
+      SPAD_DEST,
+      false, false,
+      false, false, false,
+      NO_ACTIVATION,
+      0, 0,
+      false,
+      0x38);
+
+  gemmini_fence();
+
+#ifdef SPIKE_SIM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+#else
+  printf("Moving out:\n");
+  for (int i = 0; i < tiles_J*tiles_I*2; i++) {
+      gemmini_mvout((void*)((uint64_t*) C_hw + i*2*DIM), SPAD_DEST + i*DIM);
+  }
+  gemmini_fence();
+#endif
+
+  gemmini_fence();
+}
+''',
+score=None,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='us.anthropic.claude-sonnet-4-6',
+code_gen_model='us.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None)

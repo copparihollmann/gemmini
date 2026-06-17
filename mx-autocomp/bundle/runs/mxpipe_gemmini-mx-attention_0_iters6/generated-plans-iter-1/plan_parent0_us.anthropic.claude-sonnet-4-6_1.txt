@@ -1,0 +1,33 @@
+## Analysis
+
+Looking at the code, I need to identify which strategy is most impactful and applicable.
+
+**Strategy 4** is clearly the most relevant: the softmax loop computes all `ATT_S=128` rows of `P_q[128][128]` (16KB) and `P_scales[4][128]` before mvin, while a blocking approach would compute 16 rows at a time (2KB working set), improving cache utilization. However, the mvin happens in step 3 *after* all of softmax in step 2, so reordering would violate the programming model sequence... but wait — the mvin in step 3 can perfectly interleave with softmax computation row-block by row-block if we restructure step 2 and the mvin loop together. The mvin just needs to happen before `gemmini_loop_ws_spad`, not immediately.
+
+**Strategy 3** is also relevant: `P_q` is written as `P_q[i][j]` where `i` is the row index (S dimension) and `j` is the column index (S dimension), and mvin reads it with stride `ATT_S`. The write order already matches row-major `P_q[i][j]`, so mvin stride `ATT_S * sizeof(elem_t)` is correct. This looks already correct.
+
+**Strategy 4** is the winner: compute softmax row-block (16 rows) → immediately stage those rows into the mvin buffer, so by the time we start the mvin loop, each 16-row block is hot in L1 cache rather than the whole 16KB P_q array.
+
+## Plan for Strategy 4
+
+**Goal:** Reduce cache pressure between the softmax computation (step 2) and the mvin loop (step 3) by computing 16 rows of softmax at a time and immediately writing them into `P_q` (and `P_scales`) while they're hot in cache, rather than writing all 128 rows then reading them back cold during mvin.
+
+**Specific changes:**
+
+1. **Fuse the softmax-write and mvin loops**: Instead of two separate passes (one over all rows for softmax, one over all rows for mvin), restructure as an outer loop over `i` blocks (each block = DIM=16 rows). For each block:
+   - Compute softmax for rows `[i*DIM .. (i+1)*DIM)` → write into a **stack-allocated buffer** `P_q_block[DIM][ATT_S]` and `P_scales_block[GROUPS_S][DIM]` (2KB + small).
+   - Copy block results into the persistent `P_q[i*DIM..(i+1)*DIM][:]` and `P_scales` arrays (needed for the mvin later — or eliminate them entirely).
+   - **Alternatively**, eliminate the persistent arrays entirely: immediately issue the mvin for that block right after computing it, while it's still hot in L1.
+
+2. **Restructure step 3's mvin loop** to be fused into step 2: After computing each DIM-row softmax block, issue `gemmini_extended_mvin` for those DIM rows into the scratchpad. Since all mvin commands can be issued before `gemmini_loop_ws_spad`, this is safe.
+
+3. **Keep the programming model order intact**: The full sequence remains — all mvins complete before `gemmini_loop_ws_spad`. We're just interleaving *when* we compute and issue each mvin, not reordering across the model-sequence barrier. The config_ex, load_scales, config_st, mxquant_config_mvout for step 3 are still issued before loop_ws_spad; only the mvin issuance is fused with softmax computation.
+
+4. **Eliminate the large `P_q[ATT_S][ATT_S]` array** from live state during mvin: by the time mvin for row-block `i` is issued, those rows are still in L1 (just written). The mvin DMA engine reads from DRAM/cache so the data is warm. The full `P_q` array can remain for correctness but its write-then-read distance shrinks from 16KB to 2KB per block.
+
+**Concrete code restructuring for step 2+3:**
+- Move the `gemmini_extended3_config_ex`, `gemmini_mx_load_scales`, `gemmini_config_ld` calls for step 3 to *before* the softmax loop.
+- In the softmax loop, after processing DIM rows, immediately issue `gemmini_extended_mvin` for those rows (with `bb=2` batching where `tiles_K - k_offset` allows).
+- Issue `gemmini_config_st`, `gemmini_mxquant_config_mvout`, `gemmini_loop_ws_spad`, and `gemmini_mx_read_smem` after the fused loop completes.
+
+This reduces the working set touching L1 between write (softmax) and read (mvin DMA) from the full 16KB `P_q` array to 2KB per block, improving data locality and reducing cache misses during the mvin phase.

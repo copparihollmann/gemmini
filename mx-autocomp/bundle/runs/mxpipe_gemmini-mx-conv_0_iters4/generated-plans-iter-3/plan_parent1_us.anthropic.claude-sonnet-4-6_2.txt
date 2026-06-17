@@ -1,0 +1,29 @@
+## Analysis of the Current Code
+
+Looking at the current code, I can identify a significant inefficiency related to **strategy 14**: the im2col operation writes the entire `A_buf` staging buffer to DRAM, then Gemmini reads it back via `gemmini_extended_mvin`. This is a full round-trip through DRAM for the activation data.
+
+However, examining strategy 14 more carefully against the convolution structure: the im2col patches collect `X_in[c][pi*CONV_KSZ + dy][pj*CONV_KSZ + dx]` into contiguous rows. The spatial layout of `X_in` means adjacent kernel elements `dx` are contiguous in memory, but `dy` steps have stride `CONV_W` (or similar), and `c` channels have stride `CONV_H * CONV_W`. This makes a truly stride-based direct DMA non-trivial for arbitrary kernel sizes.
+
+## Selected Strategy: Strategy 14 — Eliminate im2col staging buffer
+
+### Plan
+
+The im2col loop currently:
+1. Writes all patches into `A_buf[PATCHES_Y*PATCHES_X][MATMUL_K]` in DRAM (full write)
+2. Gemmini reads `A_buf` back via `gemmini_extended_mvin` (full read)
+
+This doubles the DRAM bandwidth for A. Instead, we can **DMA directly from `X_in`** into the scratchpad by recognizing that each im2col row for a fixed `(pi, pj)` patch reads `X_in[c][pi*CONV_KSZ + dy][pj*CONV_KSZ + dx]` — which for a fixed `(c, dy)` is a **contiguous run of `CONV_KSZ` bytes** along the `dx` dimension.
+
+The key insight: for tile `(i, k)` in the tiled matmul, the A-tile covers rows `[i*DIM .. (i+1)*DIM)` of the im2col matrix (i.e., patches) and columns `[k*DIM .. (k+1)*DIM)` (i.e., kernel/channel positions). We can decompose each DIM-wide column slice of a single im2col row into a series of small DMA transfers directly from `X_in`, loading each `CONV_KSZ`-wide chunk per `(c, dy)` combination using `gemmini_config_ld` with stride = `CONV_W` (the width of the input feature map) to step between `dy` rows, bypassing `A_buf` entirely.
+
+**Concretely, the change is:**
+
+1. **Remove** the entire im2col loop that writes to `A_buf`.
+2. **Remove** `A_buf` from the computation.
+3. For the MVIN A loop, instead of reading `A_buf + i*DIM*MATMUL_K + k*DIM`, compute the source pointer directly into `X_in` by decoding the column index `k*DIM` back into `(c_start, dy_start, dx_start)` coordinates. Since each im2col column index `col = c*CONV_KSZ*CONV_KSZ + dy*CONV_KSZ + dx`, a column tile starting at `k*DIM` maps to a specific `(c, dy, dx)` triplet. For `DIM=16` columns per tile, since `CONV_KSZ*CONV_KSZ` elements form a contiguous block in the im2col column ordering, a single tile spans at most a few `(c, dy)` groups. Use `gemmini_config_ld` with stride = 1 (row width of the im2col = MATMUL_K) — but the source is now `X_in` not `A_buf`, so the stride must match `X_in`'s row width in the innermost dimension being scanned.
+
+**Simpler realization**: Since the im2col column layout groups `dx` fastest (contiguous in `X_in`), then `dy` (stride = `CONV_W` in `X_in`), then `c` (stride = `CONV_H*CONV_W`), for the specific case where `CONV_KSZ` divides DIM evenly or the tile alignment is clean, we can load a DIM×DIM A-tile directly by setting `gemmini_config_ld` stride = `sizeof(elem_t)` (striding by the spatial width of X_in in the dx direction), using the pointer `&X_in[c_start][pi*CONV_KSZ + dy_start][pj*CONV_KSZ + col_within_row_group]`.
+
+**Practical implementation**: Precompute a lookup from `k*DIM` column offset to `(c, dy, dx)` base, then for each A-tile `(i, k)`, compute the DRAM pointer as `&X_in[c][row][col]` directly and use `gemmini_extended_mvin` with stride set to the step between consecutive columns in `X_in`'s linearization. The mvin reads exactly DIM columns from `X_in` starting at the decoded position, with stride = `CONV_W * CONV_H` (channel stride) handled by using DIM separate 1-element-wide mvins if needed, or by recognizing that within a tile, the DIM columns map to a contiguous patch of `X_in` when `dx` fills the tile.
+
+The result: **zero bytes written to `A_buf`**, eliminating one full DRAM write pass (MATMUL_M × MATMUL_K bytes = e.g., 32×32 = 1024 bytes for small cases, proportionally larger for real sizes) and one full DRAM read pass, replacing them with direct reads from `X_in` which were already being done by the CPU im2col loop. This halves the DRAM traffic for the A operand.

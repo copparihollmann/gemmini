@@ -1,0 +1,125 @@
+Looking at the code and the error message, I can identify several issues that need to be fixed:
+
+1. The scratchpad layout calculation for B placement is incorrect
+2. The `gemmini_mx_read_smem` call has incorrect addressing for the output
+3. The padding logic needs adjustment
+4. The loop bounds checking needs to be more precise
+
+Let me analyze and fix these issues:
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+
+// Assuming external symbols are defined elsewhere as in the baseline:
+// BLK, REAL_M, REAL_N, MATMUL_K, DIM, BANK_NUM, BANK_ROWS, BF16_PER_WORD, BLK_OUTC
+// elem_t, out_t, A_s, B_s, A_scales_row, B_scales_col, A_in, B_in, C_hw, scale_factors
+
+void solution(void) {
+  // Hoist invariant Gemmini configuration outside of all loops to prevent redundant command dispatch
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  int tiles_I = BLK / DIM;
+  int tiles_J = BLK / DIM;
+  int tiles_K = MATMUL_K / DIM;
+  
+  uint32_t a_base = 0;
+  // B must be placed at the top of scratchpad, accounting for actual tile dimensions
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_J * tiles_K * DIM;
+  int SPAD_DEST = 0; // Use bottom of scratchpad for output
+
+  // Outer loop over columns of B (N dimension)
+  for (int j0 = 0; j0 < (REAL_N + BLK - 1) / BLK; j0++) {
+    // Calculate actual number of columns for this block
+    int ncols = REAL_N - j0 * BLK;
+    if (ncols > BLK) ncols = BLK;
+    if (ncols <= 0) continue;
+
+    int actual_tiles_J = (ncols + DIM - 1) / DIM; // Ceiling division
+    b_base = BANK_NUM * BANK_ROWS - actual_tiles_J * tiles_K * DIM;
+
+    // Stage weight scale factors for the current column block once
+    for (int g = 0; g < (MATMUL_K + 31) / 32; g++) { // Ceiling division
+      int scale_copy_len = (ncols > BLK) ? BLK : ncols;
+      memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], scale_copy_len);
+    }
+
+    gemmini_flush(0);
+    // Load weight scale factors to Gemmini hardware scale memory (sel=1)
+    gemmini_mx_load_scales((uint64_t)B_s, ((MATMUL_K + 31) / 32) * BLK, 1);
+
+    // Load B tiles into the scratchpad high-address region once per column block
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t)); // B rows: stride N
+    for (int j = 0; j < actual_tiles_J; j++) {
+      for (int k = 0; k < tiles_K; k++) {
+        int b_addr_offset = (k * actual_tiles_J + j) * DIM;
+        int dram_offset = (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM);
+        
+        gemmini_extended_mvin2(
+            (void *)(((elem_t *)B_in) + dram_offset),
+            b_base + b_addr_offset, 
+            (j == actual_tiles_J - 1 && (ncols % DIM != 0)) ? (ncols % DIM) : DIM, 
+            DIM);
+      }
+    }
+
+    // Inner loop over rows of A (M dimension)
+    for (int i0 = 0; i0 < (REAL_M + BLK - 1) / BLK; i0++) {
+      // Calculate actual number of rows for this block
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+
+      int actual_tiles_I = (mrows + DIM - 1) / DIM; // Ceiling division
+
+      // Stage activation scale factors once per row block
+      for (int g = 0; g < (MATMUL_K + 31) / 32; g++) { // Ceiling division
+        int scale_copy_len = (mrows > BLK) ? BLK : mrows;
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], scale_copy_len);
+      }
+
+      // Load activation scale factors to Gemmini hardware scale memory (sel=0)
+      gemmini_mx_load_scales((uint64_t)A_s, ((MATMUL_K + 31) / 32) * BLK, 0);
+
+      // Load A tiles into the low-address region of the scratchpad
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t)); // A rows: stride K
+      for (int i = 0; i < actual_tiles_I; i++) {
+        for (int k = 0; k < tiles_K; k++) {
+          int a_addr_offset = (i * tiles_K + k) * DIM;
+          int dram_offset = (i0 * BLK + i * DIM) * MATMUL_K + k * DIM;
+          
+          gemmini_extended_mvin(
+              (void *)(((elem_t *)A_in) + dram_offset),
+              a_base + a_addr_offset,
+              DIM, DIM);
+        }
+      }
+
+      int pad_i = actual_tiles_I * DIM - mrows;
+      int pad_j = actual_tiles_J * DIM - ncols;
+
+      // Configure requantizer and execute tiled weight-stationary compute loop
+      gemmini_config_st(REAL_N * sizeof(uint16_t)); // BF16 output stride
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, 
+                                   actual_tiles_I, actual_tiles_J, tiles_K, 
+                                   0, 0, 1);
+      
+      gemmini_loop_ws_spad(actual_tiles_I, actual_tiles_J, tiles_K, 
+                           pad_i, pad_j, 0, 
+                           a_base, b_base, 0, SPAD_DEST, 
+                           false, false, false, false,
+                           false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Read results back to DRAM - each word contains 4 BF16 values
+      int bf16_cols = (ncols + 3) / 4; // Ceiling division for packed BF16
+      for (int r = 0; r < mrows; r++) {
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][j0 * BLK / 4],
+                             SPAD_DEST * 16 + r * BLK, 
+                             ncols);
+      }
+      gemmini_fence();
+    }
+  }
+}
+```

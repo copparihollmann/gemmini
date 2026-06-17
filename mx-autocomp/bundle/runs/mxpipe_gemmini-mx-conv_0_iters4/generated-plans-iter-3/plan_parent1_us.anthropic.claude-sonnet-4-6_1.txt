@@ -1,0 +1,138 @@
+## Analysis of the Current Code
+
+Looking at the hot mvin loop, the inner body repeatedly computes tile addresses:
+
+```c
+// A tiles:
+i * DIM * MATMUL_K + k * DIM   // DRAM pointer arithmetic
+a_base + (i * tiles_K + k) * DIM  // spad address arithmetic
+
+// B tiles:
+j * DIM * MATMUL_K + k * DIM
+b_base + (j * tiles_K + k) * DIM
+```
+
+Each iteration performs multiple multiplications and additions to compute both the DRAM pointer and the scratchpad address. With `total_a = tiles_I * tiles_K` and `total_b = tiles_J * tiles_K` iterations, these redundant address calculations accumulate significant overhead in the instruction stream dispatched to the coprocessor.
+
+## Selected Strategy: Pre-compute All Scratchpad Tile Addresses and DRAM Pointers (Strategy 8)
+
+### Plan
+
+Before the mvin issuing loop, allocate two flat arrays:
+- `a_dram_ptrs[tiles_I * tiles_K]` and `a_spad_addrs[tiles_I * tiles_K]`
+- `b_dram_ptrs[tiles_J * tiles_K]` and `b_spad_addrs[tiles_J * tiles_K]`
+
+Fill these with a single pre-pass that iterates over `(i,k)` and `(j,k)` index pairs, computing the multiply-add expressions once and storing the results. Then the hot issuing loop becomes a straight-line array lookup with no arithmetic — just load two pointers and two addresses per iteration and issue the RoCC instructions.
+
+Concretely:
+
+```c
+// Pre-compute A tile DRAM and spad addresses
+elem_t *a_dram[tiles_I * tiles_K];
+uint32_t a_spad[tiles_I * tiles_K];
+for (int i = 0; i < tiles_I; i++)
+  for (int k = 0; k < tiles_K; k++) {
+    int idx = i * tiles_K + k;
+    a_dram[idx] = (elem_t*)A_buf + (i * DIM) * MATMUL_K + k * DIM;
+    a_spad[idx] = a_base + idx * DIM;
+  }
+
+// Pre-compute B tile DRAM and spad addresses
+elem_t *b_dram[tiles_J * tiles_K];
+uint32_t b_spad[tiles_J * tiles_K];
+for (int j = 0; j < tiles_J; j++)
+  for (int k = 0; k < tiles_K; k++) {
+    int idx = j * tiles_K + k;
+    b_dram[idx] = (elem_t*)B_in + (j * DIM) * MATMUL_K + k * DIM;
+    b_spad[idx] = b_base + idx * DIM;
+  }
+```
+
+The issuing loop then becomes:
+
+```c
+for (int idx = 0; idx < max_total; idx++) {
+  if (idx < total_a)
+    gemmini_extended_mvin(a_dram[idx], a_spad[idx], DIM, DIM);
+  if (idx < total_b)
+    gemmini_extended_mvin2(b_dram[idx], b_spad[idx], DIM, DIM);
+}
+```
+
+This eliminates all multiplications and additions from the hot path. The compiler can further optimize the pre-computation loop (using strength reduction / induction variable optimization) and the issuing loop becomes a pure sequential scan of pre-computed arrays, reducing per-tile instruction overhead and improving instruction throughput to the RoCC coprocessor.
+
+## Rewritten Code
+
+```c
+void solution(void) {
+  // im2col: patch (pi,pj) -> row pi*PATCHES_X+pj; column c*k*k + dy*k + dx
+  for (int pi = 0; pi < CONV_H / CONV_KSZ; pi++)
+    for (int pj = 0; pj < PATCHES_X; pj++)
+      for (int c = 0; c < CONV_C; c++)
+        for (int dy = 0; dy < CONV_KSZ; dy++)
+          for (int dx = 0; dx < CONV_KSZ; dx++)
+            A_buf[pi * PATCHES_X + pj][c * CONV_KSZ * CONV_KSZ + dy * CONV_KSZ + dx] =
+                X_in[c][pi * CONV_KSZ + dy][pj * CONV_KSZ + dx];
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Configure port 0 (mvin) for A: stride = MATMUL_K columns of elem_t
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+  // Configure port 1 (mvin2) for B: stride = MATMUL_K columns of elem_t
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+  int total_a = tiles_I * tiles_K;
+  int total_b = tiles_J * tiles_K;
+  int max_total = (total_a > total_b) ? total_a : total_b;
+
+  // Pre-compute all A tile DRAM pointers and scratchpad addresses
+  const elem_t *a_dram_ptrs[total_a];
+  uint32_t      a_spad_addrs[total_a];
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      int idx = i * tiles_K + k;
+      a_dram_ptrs[idx] = (const elem_t*)A_buf + i * DIM * MATMUL_K + k * DIM;
+      a_spad_addrs[idx] = a_base + idx * DIM;
+    }
+  }
+
+  // Pre-compute all B tile DRAM pointers and scratchpad addresses
+  const elem_t *b_dram_ptrs[total_b];
+  uint32_t      b_spad_addrs[total_b];
+  for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k++) {
+      int idx = j * tiles_K + k;
+      b_dram_ptrs[idx] = (const elem_t*)B_in + j * DIM * MATMUL_K + k * DIM;
+      b_spad_addrs[idx] = b_base + idx * DIM;
+    }
+  }
+
+  // Issue mvin commands using pre-computed addresses — no arithmetic in the hot loop
+  for (int idx = 0; idx < max_total; idx++) {
+    if (idx < total_a) {
+      gemmini_extended_mvin(
+          a_dram_ptrs[idx],
+          a_spad_addrs[idx],
+          DIM, DIM);
+    }
+    if (idx < total_b) {
+      gemmini_extended_mvin2(
+          b_dram_ptrs[idx],
+          b_spad_addrs[idx],
+          DIM, DIM);
+    }
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+      tiles_I, tiles_J, tiles_K, 0, 0, tiles_K);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+      a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+      false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```

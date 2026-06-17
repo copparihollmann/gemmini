@@ -1,0 +1,168 @@
+Looking at the original code, I need to understand the FLASH attention kernel structure:
+
+1. For each KV block `t`: compute `S = Q × KT` (fp6×fp6→BF16), then softmax online update, then `O += P × V` (fp6×fp6→BF16)
+2. Final normalization of O_acc
+
+Key observations for optimization:
+- The original code is already following the correct sequence
+- The scratchpad/accumulator sizes in the rules differ from the original (256KB spad, 64KB acc vs 128KB/32KB) — rules 3 says 256KB spad and 64KB acc, so BANK_ROWS must be 4096 per bank (4×4096=16384 rows), ACC_ROWS=256 rows with 64KB
+- Wait, rule 7 explicitly says BANK_NUM=4, BANK_ROWS=2048 — I must use those values
+- The `gemmini_config_st` must be called before `gemmini_mxquant_config_mvout` per the programming model sequence (step 5 combines config_st + mxquant_config_mvout)
+- In the original, `gemmini_config_st` is called before `gemmini_mxquant_config_mvout` ✓
+- The `mxquant_config_mvout` must come after `mvin` tiles per rule 6 — but the original calls it BEFORE mvin. This violates rule 6!
+- Rule 6: config_ex → load_scales → load_lut → mvin tiles → mxquant_config_mvout → loop_ws_spad → read_smem → fence
+- Also `gemmini_config_st` should logically go before `mxquant_config_mvout`
+
+I'll fix the ordering and also use `gemmini_config_ld` with id=1 for mvin2 (B matrix) to use separate ports.
+
+```c
+void solution(void) {
+  for(int i=0;i<ATT_S;i++){Mr[i]=-1e30f;Lr[i]=0.f;for(int d=0;d<ATT_D;d++)O_acc[i][d]=0.f;}
+  for(int t=0;t<NT;t++){
+    /* ---- QK^T matmul: S = Q x KT ---- */
+    { 
+      int ti=ATT_S/DIM, tj=BT/DIM, tk=ATT_D/DIM;
+      uint32_t ab=0, bb=BANK_NUM*BANK_ROWS-tk*tj*DIM;
+
+      /* pack KT scales for this block */
+      for(int g=0;g<ATT_D/32;g++)
+        for(int n=0;n<BT;n++)
+          KTsc[g*BT+n]=KT_scales_col[g][t*BT+n];
+
+      gemmini_flush(0);
+
+      /* Step 1: config_ex */
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY,0,0,ACC_SCALE_IDENTITY,
+          1,1,0,0,false,1,1,3,1);
+
+      /* Step 2: load scales (A=0, B=1) */
+      gemmini_mx_load_scales((uint64_t)&Q_scales_row, sizeof(Q_scales_row), 0);
+      gemmini_mx_load_scales((uint64_t)KTsc, (ATT_D/32)*BT, 1);
+
+      /* Step 3: load LUTs (B LUT sel=0, A LUT sel=1) */
+      gemmini_mx_load_lut((uint64_t)KT_lp, 1, 0);
+      gemmini_mx_load_lut((uint64_t)Q_lp,  1, 1);
+
+      /* Step 4: mvin A tiles (Q) using mvin port */
+      gemmini_extended3_config_ld(ATT_D*sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+      for(int i=0;i<ti;i++)
+        for(int k=0;k<tk;k++)
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)Q_hw)+i*DIM*ATT_D+k*DIM),
+            ab+(i*tk+k)*DIM, DIM, DIM);
+
+      /* Step 4: mvin B tiles (KT) using mvin2 port */
+      gemmini_extended3_config_ld(ATT_S*sizeof(elem_t)/2, MVIN_SCALE_IDENTITY, false, 1);
+      for(int k=0;k<tk;k++)
+        for(int j=0;j<tj;j++)
+          gemmini_extended_mvin2(
+            (void*)(((elem_t*)KT_in)+k*DIM*(ATT_S/2)+(t*BT)/2+j*DIM),
+            bb+(k*tj+j)*DIM, DIM, DIM);
+
+      /* Step 5: config_st + mxquant_config_mvout */
+      gemmini_config_st((BT/BF16_PER_WORD)*sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+          ti, tj, tk, 0, 0, 8);
+
+      /* Step 6: compute */
+      gemmini_loop_ws_spad(ti,tj,tk,0,0,0,
+          ab, BANK_NUM*BANK_ROWS, 0, 128,
+          false,false,false,false,false,
+          NO_ACTIVATION,0,0,false,0x38);
+
+      /* Step 7: drain results */
+      gemmini_mx_read_smem(&S1_hw[0][0], 128*16, ATT_S*BT);
+      gemmini_fence();
+    }
+
+    /* ---- softmax online update + quantize P ---- */
+    for(int i=0;i<ATT_S;i++){
+      float row[BT], mn=Mr[i];
+      for(int j=0;j<BT;j++){
+        uint16_t b=(uint16_t)((S1_hw[i][j/4]>>((j%4)*16))&0xFFFF);
+        row[j]=bf16f(b);
+        if(row[j]>mn) mn=row[j];
+      }
+      float corr=expf2(Mr[i]-mn), ln=Lr[i]*corr;
+      for(int j=0;j<BT;j++){row[j]=expf2(row[j]-mn); ln+=row[j];}
+      for(int d=0;d<ATT_D;d++) O_acc[i][d]*=corr;
+      Mr[i]=mn; Lr[i]=ln;
+      for(int g=0;g<GBT;g++){
+        float gm=0.f;
+        for(int j=g*32;j<g*32+32;j++){float a=fabsf2(row[j]);if(a>gm)gm=a;}
+        int e=0; if(gm>0.f) e=fexp2(gm/0.5f)+1;
+        float isc=pow2i(-e);
+        P_scales[g][i]=(uint8_t)(e+127);
+        for(int j=g*32;j<g*32+32;j++){
+          uint8_t idx=enc(row[j]*isc);
+          if((i&1)==0) P_hw[i>>1][j]=(P_hw[i>>1][j]&0xF0)|idx;
+          else         P_hw[i>>1][j]=(P_hw[i>>1][j]&0x0F)|(idx<<4);
+        }
+      }
+    }
+
+    /* ---- PV matmul: O = P x V ---- */
+    {
+      int ti=ATT_S/DIM, tj=ATT_D/DIM, tk=BT/DIM;
+      uint32_t ab=0, bb=BANK_NUM*BANK_ROWS-tk*tj*DIM;
+
+      gemmini_flush(0);
+
+      /* Step 1: config_ex */
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY,0,0,ACC_SCALE_IDENTITY,
+          1,1,0,0,false,1,1,3,1);
+
+      /* Step 2: load scales (A=0, B=1) */
+      gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+      gemmini_mx_load_scales((uint64_t)&V_scales_col[t*GBT][0], GBT*ATT_D, 1);
+
+      /* Step 3: load LUTs (B LUT sel=0, A LUT sel=1) */
+      gemmini_mx_load_lut((uint64_t)V_lp, 1, 0);
+      gemmini_mx_load_lut((uint64_t)P_lp, 1, 1);
+
+      /* Step 4: mvin A tiles (P) using mvin port */
+      gemmini_extended3_config_ld(BT*sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+      for(int i=0;i<ti;i++)
+        for(int k=0;k<tk;k++)
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)P_hw)+i*DIM*BT+k*DIM),
+            ab+(i*tk+k)*DIM, DIM, DIM);
+
+      /* Step 4: mvin B tiles (V) using mvin2 port */
+      gemmini_extended3_config_ld(ATT_D*sizeof(elem_t)/2, MVIN_SCALE_IDENTITY, false, 1);
+      for(int k=0;k<tk;k++)
+        for(int j=0;j<tj;j++)
+          gemmini_extended_mvin2(
+            (void*)(((elem_t*)V_in)+(t*BT+k*DIM)*(ATT_D/2)+j*DIM),
+            bb+(k*tj+j)*DIM, DIM, DIM);
+
+      /* Step 5: config_st + mxquant_config_mvout */
+      gemmini_config_st((ATT_D/BF16_PER_WORD)*sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+          ti, tj, tk, 0, 0, 8);
+
+      /* Step 6: compute */
+      gemmini_loop_ws_spad(ti,tj,tk,0,0,0,
+          ab, BANK_NUM*BANK_ROWS, 0, 128,
+          false,false,false,false,false,
+          NO_ACTIVATION,0,0,false,0x38);
+
+      /* Step 7: drain results */
+      gemmini_mx_read_smem(&O_hw[0][0], 128*16, ATT_S*ATT_D);
+      gemmini_fence();
+
+      for(int i=0;i<ATT_S;i++)
+        for(int d=0;d<ATT_D;d++){
+          uint16_t b=(uint16_t)((O_hw[i][d/4]>>((d%4)*16))&0xFFFF);
+          O_acc[i][d]+=bf16f(b);
+        }
+    }
+  }
+
+  /* ---- final normalization ---- */
+  for(int i=0;i<ATT_S;i++){
+    float il=1.f/Lr[i];
+    for(int d=0;d<ATT_D;d++) O_acc[i][d]*=il;
+  }
+}
+```

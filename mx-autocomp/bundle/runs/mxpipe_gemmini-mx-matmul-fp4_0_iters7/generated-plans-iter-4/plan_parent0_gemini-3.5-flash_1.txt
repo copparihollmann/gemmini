@@ -1,0 +1,69 @@
+### Optimization Plan
+
+Our goal is to reduce the execution latency of the MX-Gemmini kernel by applying **Strategy 10 (Other methods: Maximize DMA batching of scratchpad loads to the hardware limit)**. 
+
+#### Analysis of the baseline:
+* The scratchpad memory allows loading consecutive tiles in a single DMA transfer up to `MAX_BLOCK_LEN = 4` blocks (`4 * DIM` columns).
+* The baseline program batches A and B loads with a length of `2 * DIM` columns, incrementing the loops by 2. This requires $4 \times (16/2) = 32$ `mvin` instructions for $A$, and $16 \times (4/2) = 32$ `mvin` instructions for $B$, totaling 64 memory transfers.
+* Since $tk = 16$ and $tj = 4$ are both multiples of 4, we can double our transfer block size to the hardware limit of `4 * DIM` (64 bytes) without violating any alignment or boundary conditions.
+
+#### Proposed changes:
+1. **Increase A-matrix load batching**: Change the inner loop step of the $A$-matrix loader to `k += 4` and pass `4 * DIM` as the column width to `gemmini_extended_mvin`. This cuts down $A$-matrix transfers from 32 to 16.
+2. **Increase B-matrix load batching**: Change the inner loop step of the $B$-matrix loader to `j += 4` and pass `4 * DIM` as the column width to `gemmini_extended_mvin`. This cuts down $B$-matrix transfers from 32 to 16.
+3. This optimization reduces the total number of RoCC memory transfer commands by 50% (from 64 to 32 instructions), significantly decreasing both host CPU instruction-issue overhead and Gemmini DMA latency.
+
+---
+
+### Optimized Code
+
+```c
+// Optimized MX matmul kernel (128x128x256, fp4:e2m1) using fully-batched MVIN strategy.
+void solution(void) {
+  {
+    int ti = MATMUL_M / DIM / 2, tj = MATMUL_N / DIM / 2, tk = MATMUL_K / DIM;
+    uint32_t ab = 0;
+    uint32_t bb = BANK_NUM * BANK_ROWS - tk * tj * DIM;
+    int SDST = 128;
+    
+    // Configure format and execution
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 2, 2, 3, 0);
+    
+    // Load scale factors
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+    
+    // Configure store and requantizer
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti, tj, tk, 0, 0, 1);
+    
+    // Batched MVIN for A: Load 4 K-tiles of size DIMxDIM at once along the contiguous K-dimension (64 bytes per transfer)
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i = 0; i < ti; i++) {
+      for (int k = 0; k < tk; k += 4) {
+        gemmini_extended_mvin((void*)(((elem_t*)A_in_hw) + i*DIM*MATMUL_K + k*DIM), 
+                              ab + (i*tk + k)*DIM, 
+                              4 * DIM, 
+                              DIM);
+      }
+    }
+    
+    // Batched MVIN for B: Load 4 J-tiles of size DIMxDIM at once along the contiguous J-dimension (64 bytes per transfer)
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2);
+    for (int k = 0; k < tk; k++) {
+      for (int j = 0; j < tj; j += 4) {
+        gemmini_extended_mvin((void*)(((elem_t*)B_in) + k*DIM*(MATMUL_N/2) + j*DIM), 
+                              bb + (k*tj + j)*DIM, 
+                              4 * DIM, 
+                              DIM);
+      }
+    }
+    
+    // Compute weight-stationary loop in hardware
+    gemmini_loop_ws_spad(ti, tj, tk, 0, 0, 0, ab, BANK_NUM * BANK_ROWS, 0, SDST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    
+    // Read BF16 results from SMEM and sync
+    gemmini_mx_read_smem(&C_hw[0][0], SDST * 16, MATMUL_M * MATMUL_N);
+    gemmini_fence();
+  }
+}
+```

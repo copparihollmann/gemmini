@@ -1,0 +1,40 @@
+## Analysis of the Current Code
+
+Looking at the current code, I can identify the key inefficiency targeted by strategy 3:
+
+**Current behavior:** After `gemmini_loop_ws_spad`, the code reads results from shared memory using a **per-row loop**:
+```c
+for (int r = 0; r < mrows; r++)
+    gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                         SPAD_DEST * 16 + r * BLK, ncols);
+gemmini_fence();
+```
+This dispatches `mrows` separate RoCC instructions (up to `BLK/DIM` = many instructions), each with separate address calculation overhead.
+
+**The inefficiency:** Each `gemmini_mx_read_smem` is a separate RoCC instruction dispatch. With `mrows` up to `BLK` rows, this is a significant instruction dispatch overhead multiplied across all `BLOCKS_M * BLOCKS_N` outer loop iterations.
+
+## Plan: Consolidate `gemmini_mx_read_smem` into a Single Call (Strategy 3)
+
+**Key observation:** The shared memory (`mx_smem`) stores the output block in row-major order with a stride of `BLK` BF16 elements per row. If the destination DRAM buffer `C_hw` is also laid out contiguously with stride `BLK` (i.e., `BLK_OUTC` columns), then the entire `mrows × BLK` block occupies a contiguous region in `mx_smem` starting at offset `SPAD_DEST * 16`.
+
+**The fix:** Replace the per-row loop with a single `gemmini_mx_read_smem` call that transfers all `mrows * BLK` BF16 elements at once:
+
+```c
+// Instead of:
+for (int r = 0; r < mrows; r++)
+    gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                         SPAD_DEST * 16 + r * BLK, ncols);
+
+// Use:
+gemmini_mx_read_smem(&C_hw[i0 * BLK + 0][(j0 * BLK) / BF16_PER_WORD],
+                     SPAD_DEST * 16, mrows * BLK);
+```
+
+**Why this is correct and safe:**
+- The `mx_smem` layout from `gemmini_loop_ws_spad` stores the full `BLK × BLK` output tile row-major with `BLK` elements per row, so elements at smem offsets `[SPAD_DEST*16, SPAD_DEST*16 + mrows*BLK)` correspond exactly to rows `0..mrows-1` of the output block.
+- `C_hw[i0*BLK + 0][(j0*BLK)/BF16_PER_WORD]` is the same starting DRAM address as the first row of the per-row version.
+- Using `mrows * BLK` elements (full rows including potentially padded columns up to `BLK`) is acceptable because the hardware already pads to tile boundaries and padded regions are defined (they don't affect the `mrows × ncols` real output).
+- This reduces instruction dispatch from `mrows` calls (up to `BLK/DIM` = many) down to **1 call** per outer block iteration, amortizing the RoCC dispatch overhead by up to `mrows`×.
+- The single `gemmini_fence()` after it remains correct and unchanged.
+
+This change requires no modification to tiling, scratchpad layout, scale loading, or the compute sequence — it is a pure readout optimization.

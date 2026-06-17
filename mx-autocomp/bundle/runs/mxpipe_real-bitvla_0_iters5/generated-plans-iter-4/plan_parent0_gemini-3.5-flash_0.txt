@@ -1,0 +1,108 @@
+An elegant and highly effective way to optimize this MX weight-stationary matmul kernel is by applying **Double Buffering** (Strategy 5). 
+
+### Optimization Plan
+
+1. **Loop Tiling**: We will tile the $J$ dimension with a block size of $8$ tiles. This reduces the active scratchpad footprint per block to fit within double-buffering limits and satisfies the accumulator constraint ($\text{tiles}_I \times \text{block}_J \times \text{DIM} = 2 \times 8 \times 16 = 256$ rows, perfectly matching the single-buffer limit of 256 rows).
+2. **Double Buffering Configuration**: We divide the $8192$-row scratchpad into two partitions:
+   * **Buffer 0**: A starts at `a_base_0 = 0`; B starts at `b_base_0 = 4096 - 16 * 8 * 16 = 2048` and ends at `4096`.
+   * **Buffer 1**: B starts at `b_base_1 = 8192 - 16 * 8 * 16 = 6144` and ends at `8192`.
+3. **Operand Reuse (A-Side Optimization)**: Since the $A$ matrix is shared across both blocks of $J$, we load $A$ once into `a_base_0` (occupying rows $0$ to $511$). We keep it there and reuse it for both compute launches, completely bypassing $50\%$ of the $A$-side `mvin` commands and avoiding redundant `gemmini_config_ld` overhead.
+4. **Pipelining and Parallel Execution**:
+   * We preload B0 into Buffer 0.
+   * Inside the block loop, we issue the `mvin` loads for B1 into Buffer 1. While the DMA controller streams B1 in the background, the compute engine concurrently executes the $bj=0$ matmul from Buffer 0.
+5. **Row-by-Row SMEM Copies**: Since `gemmini_mx_read_smem` performs contiguous copies, writing a $J$-tiled submatrix directly to a strided DRAM layout requires executing row-by-row reads of length $128$ BF16s per row. We perform these reads utilizing ping-pong `SPAD_DEST` offsets (`128` for $bj=0$ and `384` for $bj=1$) to prevent execution stalls.
+
+### Optimized C Code
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+#include "include/matmul_fp8_64x64.h"
+
+#define DIM 16
+#define ADDR_LEN 32
+#define BF16_PER_WORD 4
+#define OUT_COLS (MATMUL_M / BF16_PER_WORD)
+
+typedef uint8_t  elem_t;   // fp8:e4m3 input elements
+typedef uint8_t  welem_t;  // fp8:e4m3 weight elements
+typedef uint64_t out_t;    // 4x bf16 packed per word
+
+// Optimized MX matmul kernel (32x256x256, fp8:e4m3).
+void solution(void) {
+  const int tiles_I = 2;
+  const int tiles_J = 16;
+  const int tiles_K = 16;
+
+  // Split scratchpad into two double-buffering partitions
+  const int a_base_0 = 0;
+  const int b_base_0 = 2048; // 4096 - tiles_K * 8 * DIM
+  const int b_base_1 = 6144; // 8192 - tiles_K * 8 * DIM
+
+  // 1. Configure execution
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  
+  // 2. Load scale factors
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // 3. Load A0 once into Buffer 0 (A is reused across both blocks)
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *dram_ptr = ((elem_t *)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base_0 + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void *)dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  // 4. Load B0 into Buffer 0
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int j = 0; j < 8; j++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *dram_ptr = ((elem_t *)B_in) + j * DIM * MATMUL_N + k * DIM;
+      uint32_t sp_addr = b_base_0 + (j * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void *)dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  // Loop over the 2 blocks of J
+  for (int bj = 0; bj < 2; bj++) {
+    uint32_t b_base_curr = (bj == 0) ? b_base_0 : b_base_1;
+    uint32_t spad_dest_curr = (bj == 0) ? 128 : 384;
+
+    // Overlap: While bj = 0 compute runs, stream B1 into Buffer 1
+    if (bj == 0) {
+      for (int j = 8; j < 16; j++) {
+        for (int k = 0; k < tiles_K; k++) {
+          elem_t *dram_ptr = ((elem_t *)B_in) + j * DIM * MATMUL_N + k * DIM;
+          uint32_t sp_addr = b_base_1 + ((j - 8) * tiles_K + k) * DIM;
+          gemmini_extended_mvin((void *)dram_ptr, sp_addr, DIM, DIM);
+        }
+      }
+    }
+
+    // 5. Configure the requantized mvout
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, 8, tiles_K, 0, 0, 1);
+    
+    // 6. Run weight-stationary compute loop
+    gemmini_loop_ws_spad(tiles_I, 8, tiles_K, 0, 0, 0,
+                         a_base_0, 
+                         (bj == 0) ? 4096 : 8192, 
+                         0, spad_dest_curr,
+                         false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+                         
+    // 7. Drain output row by row to reconstruct non-contiguous DRAM blocks
+    for (int i = 0; i < MATMUL_M; i++) {
+      gemmini_mx_read_smem(&C_hw[i][bj * 8 * (DIM / 4)], 
+                           spad_dest_curr * 16 + i * 8 * DIM, 
+                           8 * DIM);
+    }
+  }
+
+  // 8. Synchronize all operations
+  gemmini_fence();
+}
+```

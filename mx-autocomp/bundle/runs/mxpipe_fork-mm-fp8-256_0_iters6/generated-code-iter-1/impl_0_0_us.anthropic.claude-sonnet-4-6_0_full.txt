@@ -1,0 +1,98 @@
+```c
+void solution(void) {
+
+  gemmini_flush(0);
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+
+#ifdef SPIKE_SIM
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+#else
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A,
+                     (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B,
+                     (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
+#endif
+
+  // Tiling constants
+  // tiles_I = 128/16 = 8, tiles_J = 128/16 = 8, tiles_K = 256/16 = 16
+  // b_base = BANK_NUM*BANK_ROWS - tiles_K*tiles_J*DIM = 8192 - 16*8*16 = 6144
+  // B occupies rows [6144, 8192): 2048 rows
+  // Accumulator constraint: band_I * tiles_J * DIM <= ACC_ROWS=256
+  //   => band_I <= 256 / (8*16) = 2  => band_I = 2
+  // Per-band A footprint: band_I * tiles_K * DIM = 2*16*16 = 512 rows
+  // a_base = 0, A occupies rows [0, 512) per band
+  // Scratchpad check: 512 + 2048 = 2560 <= 8192 ✓
+  // Accumulator check: 2 * 8 * 16 = 256 <= 256 ✓
+
+  const int band_I   = 2;
+  const int num_bands = tiles_I / band_I;  // 8/2 = 4
+
+  // ---- MVIN B once via mvin2 port (reused across all I-bands) ----
+  gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+  for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j++) {
+      elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+      gemmini_extended_mvin2((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  // Configure A-load stride (stays constant across all bands)
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+
+  int SPAD_DEST = 0;
+  gemmini_config_st(DIM * sizeof(elem_t));
+
+  // ---- Process each I-band ----
+  for (int band = 0; band < num_bands; band++) {
+    int i_start = band * band_I;
+
+    // MVIN A tiles for this band (band_I * tiles_K tiles) via mvin port
+    for (int i = 0; i < band_I; i++) {
+      int gi = i_start + i;
+      for (int k = 0; k < tiles_K; k++) {
+        elem_t *dram_ptr = ((elem_t*)A_in)
+                           + gi * DIM * MATMUL_K
+                           + k * DIM;
+        uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+        gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
+      }
+    }
+
+    // Configure requantizer for this band
+    // scale_factors layout: scale_dram + m*N_blocks + bi
+    // Each output row band starts at i_start * tiles_J entries into scale_factors
+    uint8_t *band_scale_ptr = (uint8_t*)scale_factors
+                              + (size_t)i_start * tiles_J * sizeof(uint8_t);
+    gemmini_mxquant_config_mvout((uint64_t)band_scale_ptr,
+        band_I, tiles_J, tiles_K,
+        /*scale_act_sel*/0, /*scale_w_sel*/0,
+        /*lut_update_granularity*/1);
+
+    // Compute this I-band (one-shot marker re-issued inside gemmini_loop_ws_spad)
+    gemmini_loop_ws_spad(
+        band_I, tiles_J, tiles_K,
+        0, 0, 0,
+        a_base,
+        BANK_NUM * BANK_ROWS,  // B end-address sentinel (top of scratchpad)
+        0,                     // D/bias = 0 (no bias)
+        SPAD_DEST,
+        false, false,          // A_transpose, B_transpose
+        false, false, false,   // full_C, low_D, ex_accumulate
+        NO_ACTIVATION,
+        0, 0,                  // a_spad_id, b_spad_id
+        false,                 // is_resadd
+        0x38);                 // skips bitmask
+
+    // Drain BF16 results for this band to the correct DRAM output rows
+    gemmini_mx_read_smem((uint64_t)(&C_hw[i_start][0]),
+                         SPAD_DEST * 16,
+                         band_I * DIM * MATMUL_N);
+
+    gemmini_fence();
+  }
+}
+```

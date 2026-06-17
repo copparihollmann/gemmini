@@ -1,0 +1,83 @@
+## Analysis
+
+Looking at the original code, the loop order is **j0 outer, i0 inner**. This already hoists B tiles per j0, which is good. However, the key inefficiency is:
+
+- For each **(j0, i0)** pair, `gemmini_loop_ws_spad` is called with `tiles = BLK/DIM` tiles in each of I, J, K dimensions.
+- The current tile sizes are fixed at `BLK` for both M and N dimensions.
+- **The scratchpad utilization is reported as 0KB** — meaning `BLK` is small and we're not filling the scratchpad.
+
+The strategy to apply is **strategy 3: reorder the I/J/K loop nest to maximize weight-stationary B-tile reuse across I iterations**.
+
+The current structure is correct (j0 outer, i0 inner), but the problem is that the tiling granularity (`BLK`) is too small relative to scratchpad capacity. We can **increase the tile size** (i.e., process more I-rows and J-columns per call) to amortize B loads and scale loads across more computation.
+
+## Plan
+
+**Strategy 3: Reorder I/J/K loop nest to maximize weight-stationary B-tile reuse across I iterations.**
+
+### What changes
+
+Currently the loop iterates over `(j0 outer, i0 inner)` with fixed block size `BLK`. For each j0, B is loaded once into the scratchpad and reused across all i0. This is correct, **but `BLK` is small**, so we waste per-invocation overhead.
+
+The plan is to **increase the blocking factor** so that a single `gemmini_loop_ws_spad` call processes as many I rows as possible while keeping the same B-block fixed — i.e., pack more i-rows into each hardware matmul call, subject to scratchpad and accumulator constraints.
+
+### Concrete changes
+
+1. **Compute max tiles_I per block**: Given fixed `tiles_J = BLK/DIM` and `tiles_K = MATMUL_K/DIM`, the scratchpad constraint is:
+   ```
+   (tiles_I * tiles_K + tiles_J * tiles_K) * DIM ≤ 8192
+   tiles_I ≤ (8192/DIM - tiles_J*tiles_K) / tiles_K
+            = (512 - tiles_J*tiles_K) / tiles_K
+   ```
+   And the accumulator constraint:
+   ```
+   tiles_I * tiles_J * DIM ≤ 256
+   tiles_I ≤ 256 / (tiles_J * DIM)
+   ```
+   Take the minimum of both bounds.
+
+2. **Outer loop over j0** (B-column blocks, unchanged): Load B tiles and B scales once per j0 block.
+
+3. **Inner loop over i0 in steps of `i_block_rows`** (the new larger A-block): For each i0 step, load all A tiles for `tiles_I_block` rows at once, then issue a single `gemmini_loop_ws_spad(tiles_I_block, tiles_J, tiles_K, ...)` — one hardware matmul covering all those I-rows against the already-resident B block.
+
+4. **Drain results**: Emit `gemmini_mx_read_smem` for all `mrows` rows of the larger block before moving on.
+
+### Why this helps
+
+- The B-tile mvin cost and B-scale load are amortized over `tiles_I_block` instead of 1 original tile worth of I rows — reducing the ratio of setup overhead to compute.
+- Fewer total `gemmini_loop_ws_spad` invocations → fewer one-shot marker re-issues, fewer `config_ex` + scale-load sequences.
+- Better systolic array utilization: larger I×J matmul per call keeps the array busy longer per invocation.
+- The scale staging `memcpy` for A is done once per larger i-block instead of once per small BLK-row strip.
+
+### Scratchpad/accumulator check
+
+With `MATMUL_K=256`, `BLK=256` (guessing from context), `DIM=16`:
+- `tiles_K = 256/16 = 16`
+- `tiles_J = BLK/DIM` (say 16 if BLK=256)
+- Scratchpad for B: `tiles_J * tiles_K * DIM = 16*16*16 = 4096` rows
+- Remaining for A: `8192 - 4096 = 4096` rows → `tiles_I_max = 4096 / (tiles_K * DIM) = 4096/256 = 16`
+- Accumulator: `16 * 16 * 16 = 4096 > 256` — so accumulator is the binding constraint: `tiles_I_max = 256 / (tiles_J * DIM) = 256/(16*16) = 1`
+
+This means accumulator is tight. The fix is also to **reduce tiles_J** (the J-blocking) so that more I tiles fit. Specifically, split j0 into smaller j-blocks of size `tiles_J_inner` such that `tiles_I_max * tiles_J_inner * DIM ≤ 256`, then sweep i0 with the larger i-block for each j-inner block. This gives a **(j0_outer → j_inner → i0)** three-level nest where B is partially reused.
+
+The concrete implementation:
+
+```c
+// Compute blocking factors to maximize scratchpad/accumulator use
+// tiles_K is fixed = MATMUL_K/DIM
+// Choose tiles_J_blk and tiles_I_blk to fill scratchpad and accumulator
+// Constraint: (tiles_I_blk*tiles_K + tiles_J_blk*tiles_K)*DIM <= 8192
+//             tiles_I_blk * tiles_J_blk * DIM <= 256
+// Set tiles_J_blk = 1 (minimum J block), tiles_I_blk = min(256/(1*DIM), (8192/DIM - tiles_K)/tiles_K)
+// = min(16, (512 - tiles_K)/tiles_K)
+// For tiles_K=16: min(16, (512-16)/16) = min(16, 31) = 16
+// tiles_I_blk=16, tiles_J_blk=1: spad = (16+1)*16*16=4352 ≤ 8192 ✓, acc=16*1*16=256 ≤ 256 ✓
+```
+
+So: **tiles_J_blk = 1, tiles_I_blk = 16** for the case `tiles_K=16`. The loop order becomes:
+
+- **j0** (outer J block over BLOCKS_N) — load B-col scales once
+- **j** (inner J tile within B-col block, stride 1 tile = DIM columns) — load B tiles for this J tile
+- **i0_blk** (outer I super-block, stride `tiles_I_blk * DIM` rows) — load A-row scales + A tiles for this super-block
+- Single `gemmini_loop_ws_spad(tiles_I_blk, 1, tiles_K, ...)` — fully fused
+
+This maximizes I-reuse of A tiles loaded, and B tiles are reused across all `tiles_I_blk` rows. The net effect: ~16× fewer `gemmini_loop_ws_spad` invocations for the same total work.

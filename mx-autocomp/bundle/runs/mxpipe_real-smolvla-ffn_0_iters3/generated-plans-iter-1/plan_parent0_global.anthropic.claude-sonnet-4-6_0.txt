@@ -1,0 +1,32 @@
+## Analysis of the Code
+
+Looking at the original code, I need to identify which strategy applies:
+
+**Strategy 1 (hoist redundant operations):** Inside the `i0`/`j0` loop, `gemmini_flush(0)` and `gemmini_extended3_config_ex(...)` are called every iteration. These configure the accelerator's execution mode (dataflow, MX format fields), which doesn't change between blocks — it's the same format (FP8→BF16) for every tile. This is a clear case of redundant operations inside the loop that can be hoisted out.
+
+**Strategy 2 (tune skips bitmask):** Already set to `0x38` which matches the reference pattern — no obvious gain here without deeper hardware knowledge.
+
+**Strategy 3 (raise lut_update_granularity):** This is `uselut=0` (FP8 path, no LUT), so strategy 3 is irrelevant.
+
+**Strategy 4 (attention P-encode target):** Not applicable — this is a general matmul, not attention.
+
+## Plan: Hoist `gemmini_flush` and `gemmini_extended3_config_ex` Out of the Loop
+
+### What to change
+
+The `gemmini_flush(0)` and `gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0)` calls are inside the `i0`/`j0` double loop and execute on every block iteration. Since:
+
+1. The MX format (FP8→BF16), dataflow (weight-stationary), transposes, and strides are **identical for every block**, these configurations are entirely redundant after the first call.
+2. `gemmini_flush(0)` drains the pipeline — calling it on every iteration adds unnecessary synchronization overhead.
+
+Both calls should be moved to **before the `i0`/`j0` loop**, so they execute exactly once. The per-iteration cost of these two instructions multiplies by `BLOCKS_M * BLOCKS_N` iterations, which for a 50×256 problem with BLK-sized blocks represents significant overhead.
+
+The `gemmini_config_ld` calls inside the loop (for A stride and B stride) should remain inside the loop only if the strides could vary — but here MATMUL_K and MATMUL_N are global constants, so **those can also be hoisted** out of the loop since they don't change between blocks.
+
+Specifically:
+- Move `gemmini_flush(0)` to before the `i0` loop
+- Move `gemmini_extended3_config_ex(...)` to before the `i0` loop  
+- Move `gemmini_config_ld(MATMUL_K * sizeof(elem_t))` to before the `i0` loop (stride is constant: always `MATMUL_K * 1` bytes)
+- Move `gemmini_config_ld(MATMUL_N * sizeof(elem_t))` — however, this resets the ld config and is needed before B mvins. Since A mvins come first and B mvins second within each block iteration, and the strides are constant, **both `config_ld` calls can be hoisted**, but the B `config_ld` must still appear before the first B mvin. The cleanest approach: hoist the A `config_ld` before the loop, and hoist the B `config_ld` before the loop as well, placing it after the A `config_ld`. Since the A mvins always precede the B mvins within the loop body, issuing B's `config_ld` last before the loop means it would be active when the A mvin runs — **incorrect**. Therefore: hoist only the flush and config_ex; leave both `config_ld` calls inside the loop but deduplicate them across iterations by noting that the stride values never change — they can stay inside but we confirm only config_ex and flush are truly loop-invariant and safe to hoist without reordering mvin port configurations.
+
+**Final plan:** Hoist `gemmini_flush(0)` and `gemmini_extended3_config_ex(...)` to before the outer `i0` loop. Leave `gemmini_config_ld` calls in place to preserve correct port configuration ordering relative to the mvin calls they govern.

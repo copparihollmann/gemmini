@@ -1,0 +1,82 @@
+Looking at the failing code, I need to identify the bugs:
+
+1. **Scale memory layout mismatch**: `gemmini_mx_load_scales` expects scales in DRAM at `scale_dram + m*N_blocks + bi` indexing. The staged `A_s`/`B_s` buffers must have the right layout and size. The scale groups along K (`GK = K/32`) need to match what the hardware expects. The hardware expects one scale per MX block of 32 elements along K, so `tiles_K = K/DIM = K/16` but scale blocks are 32 wide, meaning `GK = K/32 = tiles_K/2`.
+
+2. **Scale buffer dimensions**: `A_s[GK][BLK_NEW]` and `B_s[GK][BLK_NEW]` - these need to be properly declared as static/global arrays accessible by the hardware DMA.
+
+3. **`gemmini_mx_load_scales` sel convention**: sel=0 for A (activations), sel=1 for B (weights) - this appears correct.
+
+4. **B mvin hoisted outside i0 loop but scales reloaded per i0** - B scales also need reloading per i0 since scale_act_sel/scale_w_sel reference the loaded buffers which get overwritten.
+
+5. **`gemmini_mxquant_config_mvout` `scale_dram` parameter**: This should point to the actual scale data used by the requantizer for output quantization. For BF16 output (`out_mx_fmt=3`), no output quantization scale is needed, but the address must be valid.
+
+6. **The `scale_factors` pointer** - unclear what this is; for BF16 output it may not matter but must be a valid address.
+
+7. **`gemmini_flush(0)` inside the loop** - this is unnecessary overhead and may cause issues.
+
+8. **B scales must be reloaded per i0** since `gemmini_mx_load_scales` overwrites the buffer.
+
+```c
+void solution(void) {
+  const int tiles_I   = MATMUL_M / DIM;
+  const int tiles_J   = MATMUL_N / DIM;
+  const int tiles_K   = MATMUL_K / DIM;
+  const int GK        = MATMUL_K / 32;  // scale groups along K (one scale per 32 elements)
+
+  // b_base at top of scratchpad
+  const uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_J * tiles_K * DIM;
+  const uint32_t a_base = 0;
+  const int SPAD_DEST   = 0;  // output word offset in mx_smem
+
+  // Step 1: Configure execution once
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                              1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // Step 2: Load A and B scales (all at once, full matrices)
+  gemmini_mx_load_scales((uint64_t)A_scales_row, GK * MATMUL_M, 0);
+  gemmini_mx_load_scales((uint64_t)B_scales_col, GK * MATMUL_N, 1);
+
+  // Step 3: Mvin ALL B tiles into scratchpad (weight-stationary: B fixed)
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin2(
+        (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j * DIM)),
+        b_base + (j * tiles_K + k) * DIM,
+        DIM, DIM);
+    }
+  }
+
+  // Step 4: Mvin ALL A tiles into scratchpad
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin(
+        (void*)(((elem_t*)A_in) + (i * DIM) * MATMUL_K + k * DIM),
+        a_base + (i * tiles_K + k) * DIM,
+        DIM, DIM);
+    }
+  }
+
+  // Step 5: Configure requantized mvout
+  gemmini_config_st(MATMUL_N * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)A_scales_row,
+                               tiles_I, tiles_J, tiles_K,
+                               0, 0, 1);
+
+  // Step 6: Execute fused hardware matmul
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+                       a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                       false, false, false, false, false,
+                       NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // Step 7: Drain BF16 results from mx_smem to DRAM
+  gemmini_mx_read_smem(
+    &C_hw[0][0],
+    SPAD_DEST * 16,
+    MATMUL_M * MATMUL_N);
+
+  // Step 8: Fence
+  gemmini_fence();
+}
+```

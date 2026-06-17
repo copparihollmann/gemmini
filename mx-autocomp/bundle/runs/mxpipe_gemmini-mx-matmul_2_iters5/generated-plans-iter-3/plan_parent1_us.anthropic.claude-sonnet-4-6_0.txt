@@ -1,0 +1,150 @@
+# Strategy: Block-DMA Multi-Tile MVIN with `gemmini_extended4_config_ld` (Strategy 10)
+
+## Analysis of the Current Code
+
+The original code issues one `gemmini_extended_mvin` / `gemmini_extended_mvin2` call **per DIM×DIM tile**:
+
+```c
+for (int i = 0; i < tiles_I; i++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(..., a_base + (i*tiles_K + k)*DIM, DIM, DIM);  // 1 tile per call
+
+for (int j = 0; j < tiles_J; j++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin2(..., b_base + (k*tiles_J + j)*DIM, DIM, DIM); // 1 tile per call
+```
+
+For a 64×64×64 matmul (`tiles_I = tiles_J = tiles_K = 4`), this is 4×4 = 16 mvin calls for A and 16 for B — **32 RoCC instructions** just for data movement. Each instruction carries its own dispatch overhead through the RoCC channel.
+
+## The Root Cause of Inefficiency
+
+`MAX_BLOCK_LEN = 4` means the DMA engine can transfer **up to 4 consecutive DIM-row tiles in a single mvin command**. The hardware supports this via the `block_mvin_stride` parameter in `gemmini_extended4_config_ld`: instead of the default `DIM` (which steps one tile-row at a time in scratchpad terms but corresponds to exactly one matrix row in DRAM), setting `block_mvin_stride` to the actual **row pitch in bytes of the source matrix** tells the DMA to advance by a full source-matrix row between successive elements of the block — enabling correct multi-tile loading without re-issuing the config.
+
+When loading A with DRAM row-stride = `MATMUL_K * sizeof(elem_t)` bytes, consecutive rows of a tile in DRAM are already contiguous (row-major). A column of `DIM` rows from tile `(i, k)` starts at `A_in + i*DIM*MATMUL_K + k*DIM`. Crucially, **along the K dimension for a fixed i**, tiles `(i,0), (i,1), ..., (i,tiles_K-1)` are NOT contiguous in DRAM (they are separated by `DIM` bytes within each row), so they cannot be block-mvin'd together without careful striding.
+
+However, **along the I dimension for a fixed k**, tiles `(0,k), (1,k), ..., (tiles_I-1,k)` have their starting rows spaced `DIM * MATMUL_K` bytes apart in DRAM — exactly `MATMUL_K * sizeof(elem_t) * DIM` bytes. These are also laid consecutively in the scratchpad at `a_base + (0*tiles_K+k)*DIM`, `a_base + (1*tiles_K+k)*DIM`, ... which are **not** consecutive scratchpad addresses (they differ by `tiles_K * DIM` rows apart in spad). So a naive block-mvin cannot chain them.
+
+The most natural blocking opportunity: **within a single tile row (fixed i), the K-tiles are contiguous in the scratchpad** at `a_base + i*tiles_K*DIM` through `a_base + (i*tiles_K + tiles_K - 1)*DIM`. In DRAM, however, tile `(i, k)` starts at column offset `k*DIM` within row `i*DIM` — so successive k-tiles differ by `DIM * sizeof(elem_t)` = 16 bytes in column start but share the same row stride. These DRAM tiles are **not** contiguous either.
+
+## The Correct Opportunity: Block-Mvin Along Consecutive Scratchpad Rows
+
+The correct application of `gemmini_extended4_config_ld` with `block_mvin_stride` is: **when the DRAM source tiles ARE contiguous (i.e., each successive tile in the block immediately follows the previous one in memory)**, setting `cols = DIM * block_count` and `rows = DIM` in `gemmini_extended_mvin` loads `block_count` tiles at once. But that requires `cols ≤ MAX_BLOCK_LEN * DIM = 64`.
+
+The B matrix is stored **column-major by tile**: tile `(k, j)` in DRAM is at `B_in + k*DIM*MATMUL_N + j*DIM`. For fixed `k`, tiles `(k, 0), (k, 1), ..., (k, tiles_J-1)` are at column offsets `0, DIM, 2*DIM, ...` — contiguous if `MATMUL_N = tiles_J * DIM`, which it is. So for fixed k, **all j-tiles in that row of B are contiguous in DRAM**, spaced `DIM` bytes apart in each DRAM row. This means we can issue one `gemmini_extended_mvin2` with `cols = tiles_J * DIM` (up to 64 = 4 tiles) and `rows = DIM` to load all j-tiles for a fixed k at once, **if** the corresponding scratchpad addresses are also consecutive.
+
+For B, scratchpad address for tile `(k, j)` is `b_base + (k*tiles_J + j)*DIM`. For fixed `k`, as `j` goes 0→tiles_J-1, addresses are `b_base + k*tiles_J*DIM, b_base + k*tiles_J*DIM + DIM, ...` — **consecutive**. ✓
+
+So for fixed `k`, we can load all `tiles_J` B-tiles with one `mvin2`:
+- DRAM source: `B_in + k*DIM*MATMUL_N` (start of k-th block row)
+- Spad dest: `b_base + k*tiles_J*DIM`
+- cols: `tiles_J * DIM` (= 64 for tiles_J=4, ≤ MAX_BLOCK_LEN*DIM=64 ✓)
+- rows: `DIM`
+
+This reduces B mvin calls from `tiles_J * tiles_K` down to `tiles_K` — a **4× reduction** for tiles_J=4.
+
+Similarly for A: for fixed `i`, all k-tiles span columns `k*DIM` to `(k+1)*DIM-1` — **not** contiguous across k in DRAM (each row has `MATMUL_K` bytes, so column `k*DIM` to `k*DIM+DIM-1` of row `i*DIM+r` is at byte `(i*DIM+r)*MATMUL_K + k*DIM`). Along i for fixed k: each i-tile starts at `(i*DIM)*MATMUL_K + k*DIM`, so successive i-tiles are `DIM*MATMUL_K` bytes apart — not contiguous.
+
+The contiguous case for A is: for fixed `i`, if we set `block_mvin_stride = MATMUL_K` (the row width in elements), then **within a single tile (fixed i, fixed k)**, the DIM rows of the tile are already `MATMUL_K` bytes apart — which is the normal per-row stride. But we can also load multiple consecutive columns: for fixed `i`, tiles across K are at column offsets `0, DIM, 2*DIM, ...` and in the scratchpad at `a_base + i*tiles_K*DIM + 0`, `a_base + i*tiles_K*DIM + DIM`, ... — consecutive. In DRAM, the rows of tile `(i, k)` and `(i, k+1)` for fixed `k`-adjacent interleave because the matrix is row-major: row `r` of tile `(i,k)` is `A_in + (i*DIM+r)*MATMUL_K + k*DIM`, row `r` of tile `(i,k+1)` is `A_in + (i*DIM+r)*MATMUL_K + (k+1)*DIM`. So within each row of the tile, columns `k*DIM` through `(k + tiles_K - 1)*DIM + DIM - 1` are all contiguous — these are `tiles_K * DIM` = 64 contiguous bytes per row. With `block_mvin_stride = MATMUL_K * sizeof(elem_t)` as the row pitch, each successive DIM-element group is a new tile in the scratchpad, and setting `cols = tiles_K * DIM` loads all k-tiles for fixed i in one shot.
+
+- DRAM source: `A_in + i*DIM*MATMUL_K`
+- Spad dest: `a_base + i*tiles_K*DIM`
+- cols: `tiles_K * DIM` (= 64 for tiles_K=4 ≤ 64 ✓)
+- rows: `DIM`
+
+This reduces A mvin calls from `tiles_I * tiles_K` down to `tiles_I` — **4× reduction** for tiles_K=4.
+
+## Concrete Plan
+
+1. **Replace `gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), ...)` for port 0** with `gemmini_extended4_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, MATMUL_K * sizeof(elem_t), 0)`. The `block_mvin_stride` = `MATMUL_K * sizeof(elem_t)` matches the DRAM row stride for A, allowing the DMA to correctly advance by one full A-matrix row per block element.
+
+2. **Collapse the A mvin loop** from a double loop over `(i, k)` to a single loop over `i`, issuing one `gemmini_extended_mvin` with `cols = tiles_K * DIM, rows = DIM` per `i`.
+
+3. **Replace `gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), ...)` for port 1** with `gemmini_extended4_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, MATMUL_N * sizeof(elem_t), 1)`. The `block_mvin_stride` = `MATMUL_N * sizeof(elem_t)` matches the B matrix row stride.
+
+4. **Collapse the B mvin loop** from a double loop over `(j, k)` to a single loop over `k`, issuing one `gemmini_extended_mvin2` with `cols = tiles_J * DIM, rows = DIM` per `k`.
+
+This reduces total mvin RoCC instructions from `tiles_I*tiles_K + tiles_J*tiles_K` to `tiles_I + tiles_K` — for a 64×64×64 matmul, from 32 down to 8, a **4× instruction-count reduction** on the DMA path, directly reducing RoCC dispatch overhead and enabling earlier compute start.
+
+## Rewritten Code
+
+```c
+void solution(void) {
+  // Step 1: Configure execution
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // Step 2: Load scale factors (both A and B)
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Step 3: Configure mvin ports with block_mvin_stride matching actual DRAM row pitch.
+  // Port 0 (A): row stride = MATMUL_K bytes; block_mvin_stride = MATMUL_K bytes
+  // so the DMA advances MATMUL_K bytes per row across the tiles_K-wide block.
+  gemmini_extended4_config_ld(
+      MATMUL_K * sizeof(elem_t),      // DRAM row stride (bytes between successive rows)
+      MVIN_SCALE_IDENTITY,
+      false,
+      MATMUL_K * sizeof(elem_t),      // block_mvin_stride: same as row stride for A
+      0);                             // port 0
+
+  // Port 1 (B): row stride = MATMUL_N bytes; block_mvin_stride = MATMUL_N bytes
+  gemmini_extended4_config_ld(
+      MATMUL_N * sizeof(elem_t),      // DRAM row stride for B
+      MVIN_SCALE_IDENTITY,
+      false,
+      MATMUL_N * sizeof(elem_t),      // block_mvin_stride: same as row stride for B
+      1);                             // port 1
+
+  // Step 4: MVIN A — one block-mvin per i-tile, covering all k-tiles in one shot.
+  // cols = tiles_K * DIM loads all k-tiles for row i contiguously.
+  // DRAM layout: A_in[i*DIM][k*DIM .. (tiles_K*DIM)-1] are contiguous per row.
+  // Spad layout: a_base + i*tiles_K*DIM, then +DIM for each successive k-tile.
+  for (int i = 0; i < tiles_I; i++) {
+    gemmini_extended_mvin(
+        (void*)(((elem_t*)A_in) + i * DIM * MATMUL_K),  // start of row-block i
+        a_base + i * tiles_K * DIM,                      // spad: all k-tiles contiguous
+        tiles_K * DIM,                                   // cols: tiles_K tiles wide
+        DIM);                                            // rows: DIM rows tall
+  }
+
+  // MVIN B — one block-mvin per k-tile, covering all j-tiles in one shot.
+  // cols = tiles_J * DIM loads all j-tiles for row k contiguously.
+  // DRAM layout: B_in[k*DIM][0 .. tiles_J*DIM-1] are contiguous per row.
+  // Spad layout: b_base + k*tiles_J*DIM, then +DIM for each successive j-tile.
+  for (int k = 0; k < tiles_K; k++) {
+    gemmini_extended_mvin2(
+        (void*)(((elem_t*)B_in) + k * DIM * MATMUL_N),  // start of row-block k
+        b_base + k * tiles_J * DIM,                      // spad: all j-tiles contiguous
+        tiles_J * DIM,                                   // cols: tiles_J tiles wide
+        DIM);                                            // rows: DIM rows tall
+  }
+
+  // Step 5: Configure output stride and requantizer
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+      tiles_I, tiles_J, tiles_K,
+      /*scale_act_sel*/0, /*scale_w_sel*/0,
+      /*lut_update_granularity*/1);
+
+  // Step 6: Execute fused weight-stationary matmul
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+      a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+      false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // Step 7: Drain BF16 results from mx_smem to DRAM, then fence
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+## Why This Improves Performance
+
+| Metric | Original | Optimized |
+|--------|----------|-----------|
+| A mvin instructions | `tiles_I × tiles_K = 16` | `tiles_I = 4` |
+| B mvin instructions | `tiles_J × tiles_K = 16` | `tiles_K = 4` |
+| Total mvin instructions | 32 | 8 |
+| RoCC dispatch overhead | 32 × (instruction issue + queue wait) | 8 × same |
+| DMA setup overhead | 32 transactions | 8 transactions |
+
+Each `gemmini_extended4_config_ld` issues once (hoisted outside all loops, unchanged from the original intent). The inner loops collapse from 2D to 1D. The hardware DMA engine itself processes the block transfer more efficiently than 4 separate single-tile transfers because it amortizes its startup cost across 4 tiles and keeps the DRAM bus busy with a longer burst. The systolic array can begin computing sooner because the scratchpad is fully populated after fewer instruction dispatches.

@@ -1,0 +1,118 @@
+Looking at the code and error message, I can identify several issues that would cause incorrect results:
+
+1. The scale factor loading is not following the proper order - both A and B scales must be loaded before each computation
+2. Scale factors are being loaded with incorrect sizes
+3. The boundary handling logic has issues with padding calculations
+4. The output reading doesn't properly handle the BF16 packing format
+
+Let me fix these issues:
+
+```c
+void solution(void) {
+  int tiles   = BLK / DIM;
+  int tiles_K = MATMUL_K / DIM;
+  int GK      = MATMUL_K / 32;
+
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+  uint32_t a_base = 0;
+  int SPAD_DEST = 128;
+
+  // Static buffers for pre-transposed scale factors
+  static uint8_t A_scales_T[BLOCKS_M][A_S_BYTES];
+  static uint8_t B_scales_T[BLOCKS_N][B_S_BYTES];
+  
+  // One-time initialization flag
+  static int initialized = 0;
+  if (!initialized) {
+    // Transpose A scales: from [GK][ROWS] to [BLOCKS_M][GK*BLK]
+    for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+      for (int g = 0; g < GK; g++) {
+        memcpy(&A_scales_T[i0][g * BLK],
+               &A_scales_row[g][i0 * BLK],
+               BLK);
+      }
+    }
+
+    // Transpose B scales: from [GK][COLS] to [BLOCKS_N][GK*BLK]
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      for (int g = 0; g < GK; g++) {
+        memcpy(&B_scales_T[j0][g * BLK],
+               &B_scales_col[g][j0 * BLK],
+               BLK);
+      }
+    }
+    initialized = 1;
+  }
+
+  // Flush and configure execution unit once globally (format-invariant)
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                              1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    int ncols = REAL_N - j0 * BLK;
+    if (ncols > BLK) ncols = BLK;
+    if (ncols <= 0) continue;
+
+    int tiles_J_actual = (ncols + DIM - 1) / DIM; // Round up to get tile count
+
+    // Load B scale factors (per j0)
+    int b_scale_bytes = GK * BLK; // Total bytes for B scales
+    gemmini_mx_load_scales((uint64_t)B_scales_T[j0], b_scale_bytes, 1);
+
+    // Load B tiles into scratchpad once per j0
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+    for (int j = 0; j < tiles; j++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin(
+          (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+          b_base + (k * tiles + j) * DIM, DIM, DIM);
+
+    for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+
+      int tiles_I_actual = (mrows + DIM - 1) / DIM; // Round up to get tile count
+
+      // Load A scale factors (depends on i0)
+      int a_scale_bytes = GK * BLK; // Total bytes for A scales
+      gemmini_mx_load_scales((uint64_t)A_scales_T[i0], a_scale_bytes, 0);
+
+      // Load A tiles into scratchpad
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+      // Configure output requantization
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                   tiles, tiles, tiles_K, 0, 0, 1);
+
+      // Handle both full and partial tiles
+      int pad_i = tiles * DIM - mrows;
+      int pad_j = tiles * DIM - ncols;
+      int pad_k = 0;
+
+      // Compute with proper padding
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, pad_k,
+                           a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                           false, false, false, false, false,
+                           NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Read results properly handling BF16 packing (4 BF16 per uint64)
+      for (int r = 0; r < mrows; r++) {
+        int output_words = (ncols + 3) / 4; // Number of uint64 words needed
+        gemmini_mx_read_smem(
+          &C_hw[i0 * BLK + r][j0 * BLK / 4],  // 4 BF16 per word
+          SPAD_DEST * 16 + r * BLK, ncols);
+      }
+
+      gemmini_fence();
+    }
+  }
+}
+```

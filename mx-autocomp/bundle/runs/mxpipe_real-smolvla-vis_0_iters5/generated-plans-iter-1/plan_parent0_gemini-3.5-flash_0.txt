@@ -1,0 +1,85 @@
+### Optimization Plan: Loop-Invariant Configuration and Activation-Scale Factor Hoisting
+
+#### Analysis of Inefficiencies in the Baseline
+1. **Redundant Hardware Reconfigurations**: The configuration instruction `gemmini_extended3_config_ex` is issued inside the inner loop (`j0`). Because the data formats, strides, and execution mode (weight-stationary) are invariant across the entire matrix multiplication, executing this configuration command on every inner-loop iteration introduces unnecessary instruction overhead.
+2. **Redundant Host-Side Scale Copying & Loading**: The activation scale factors (`A_scales_row`) depend only on the outer row-block index `i0` and are completely independent of the inner column-block index `j0`. In the baseline, both the host CPU `memcpy` to stage `A_s` and the accelerator load `gemmini_mx_load_scales` (for A, `sel=0`) are executed inside the inner `j0` loop. This results in $BLOCKS\_N$ times more host overhead and DMA scale loads than necessary for matrix $A$.
+
+#### Optimization Strategy
+We will hoist the loop-invariant `gemmini_extended3_config_ex` completely outside of both loops. Additionally, we will hoist the staging and loading of the activation scale factors (`A_s` staging and `gemmini_mx_load_scales(..., 0)`) out of the inner `j0` loop and into the outer `i0` loop. This maintains correct programming sequence order while avoiding redundant CPU staging memory copies and accelerator DMA operations.
+
+---
+
+### Optimized Code
+
+```c
+// AUTO-GENERATED outer-tiled MX matmul optimized (113x256x256).
+void solution(void) {
+  // Hoist loop-invariant execution configuration outside all loops
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    // Partial last M block check
+    int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+
+    // Hoist activation scale-factor staging to the outer loop (invariant to j0)
+    for (int g = 0; g < MATMUL_K / 32; g++) {
+      memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+    }
+    // Load activation scale factors into mx_scale_a_mem (sel=0)
+    gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      // Stage weight scale factors (still dependent on j0)
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      gemmini_flush(0);
+      
+      // Load weight scale factors into mx_scale_b_mem (sel=1)
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      // MVIN A tiles directly from DRAM
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++) {
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+        }
+      }
+
+      // MVIN B tiles directly from DRAM
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int j = 0; j < tiles; j++) {
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+        }
+      }
+
+      // Configure requantizer write-back bounds and scales
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+
+      // Perform tiled hardware compute over scratchpad
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Read BF16 results from mx_smem directly to DRAM
+      for (int r = 0; r < mrows; r++) {
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      }
+      gemmini_fence();
+    }
+  }
+}
+```

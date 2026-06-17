@@ -1,0 +1,210 @@
+void solution(void) {
+  // Initialize accumulators
+  for(int i=0;i<ATT_S;i++){
+    Mr[i]=-1e30f;
+    Lr[i]=0.f;
+    for(int d=0;d<ATT_D;d++) O_acc[i][d]=0.f;
+  }
+
+  // Single flush at startup
+  gemmini_flush(0);
+
+  for(int t=0;t<NT;t++){
+    // ---- QK^T matmul: S = Q * KT ----
+    {
+      int ti = ATT_S/DIM/2;   // tiles_I for Q  (ATT_S/2 rows / DIM)
+      int tj = BT/DIM/2;      // tiles_J for KT (BT/2 cols / DIM) -- FP6 packed half-width
+      int tk = ATT_D/DIM;     // tiles_K
+      uint32_t ab = 0;
+      uint32_t bb = BANK_NUM*BANK_ROWS - tk*tj*DIM;
+
+      // Pack KT scales for this block
+      for(int g=0;g<ATT_D/32;g++)
+        for(int n=0;n<BT;n++)
+          KTsc[g*BT+n] = KT_scales_col[g][t*BT+n];
+
+      // 1. Configure execution (fp6 e3m2 act, fp6 e3m2 wgt, bf16 out, uselut=1)
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY,0,0,ACC_SCALE_IDENTITY,
+          1,1,0,0,false,
+          /*act_mx_fmt*/1,/*wgt_mx_fmt*/1,/*out_mx_fmt*/3,/*uselut*/1);
+
+      // 2. Load scales: A=Q_scales (sel=0), B=KT_scales (sel=1)
+      gemmini_mx_load_scales((uint64_t)&Q_scales_row, sizeof(Q_scales_row), 0);
+      gemmini_mx_load_scales((uint64_t)KTsc, (ATT_D/32)*BT, 1);
+
+      // 3. Load LUTs: B LUT (sel=0), A LUT (sel=1)
+      gemmini_mx_load_lut((uint64_t)KT_lp, 1, 0);
+      gemmini_mx_load_lut((uint64_t)Q_lp,  1, 1);
+
+      // 4a. MVIN A (Q) tiles via mvin port 0
+      gemmini_extended3_config_ld(ATT_D*sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+      for(int i=0;i<ti;i++){
+        int k=0;
+        while(k<tk){
+          int batch = tk-k;
+          if(batch>MAX_BLOCK_LEN) batch=MAX_BLOCK_LEN;
+          // Check contiguous: cols=batch*DIM, rows=DIM
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)Q_hw)+i*DIM*ATT_D+k*DIM),
+            ab+(i*tk+k)*DIM,
+            batch*DIM, DIM);
+          k+=batch;
+        }
+      }
+
+      // 4b. MVIN B (KT) tiles via mvin2 port 1
+      gemmini_extended3_config_ld(ATT_S*sizeof(elem_t)/2, MVIN_SCALE_IDENTITY, false, 1);
+      for(int k=0;k<tk;k++){
+        int j=0;
+        while(j<tj){
+          int batch = tj-j;
+          if(batch>MAX_BLOCK_LEN) batch=MAX_BLOCK_LEN;
+          gemmini_extended_mvin2(
+            (void*)(((elem_t*)KT_in)+k*DIM*(ATT_S/2)+(t*BT)/2+j*DIM),
+            bb+(k*tj+j)*DIM,
+            batch*DIM, DIM);
+          j+=batch;
+        }
+      }
+
+      // 5. Configure requantized mvout
+      gemmini_config_st((BT/BF16_PER_WORD)*sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+          ti, tj, tk,
+          /*scale_act_sel*/0,/*scale_w_sel*/0,
+          /*lut_update_granularity*/8);
+
+      // 6. Fused hardware matmul
+      gemmini_loop_ws_spad(ti,tj,tk, 0,0,0,
+          ab, BANK_NUM*BANK_ROWS, 0, 128,
+          false,false, false,false,false,
+          NO_ACTIVATION, 0,0, false, 0x38);
+
+      // 7. Drain results
+      gemmini_mx_read_smem(&S1_hw[0][0], 128*16, ATT_S*BT);
+      gemmini_fence();
+    }
+
+    // ---- Softmax on CPU ----
+    for(int i=0;i<ATT_S;i++){
+      float row[BT];
+      float mn = Mr[i];
+      for(int j=0;j<BT;j++){
+        uint16_t b = (uint16_t)((S1_hw[i][j/4]>>((j%4)*16))&0xFFFF);
+        row[j] = bf16f(b);
+        if(row[j]>mn) mn=row[j];
+      }
+      float corr = expf2(Mr[i]-mn);
+      float ln   = Lr[i]*corr;
+      for(int j=0;j<BT;j++){
+        row[j] = expf2(row[j]-mn);
+        ln += row[j];
+      }
+      for(int d=0;d<ATT_D;d++) O_acc[i][d]*=corr;
+      Mr[i]=mn;
+      Lr[i]=ln;
+
+      // Quantize row to FP6 packed in P_hw
+      for(int g=0;g<GBT;g++){
+        float gm=0.f;
+        for(int j=g*32;j<g*32+32;j++){
+          float a=fabsf2(row[j]);
+          if(a>gm) gm=a;
+        }
+        int e=0;
+        if(gm>0.f) e=fexp2(gm/0.5f)+1;
+        float isc=pow2i(-e);
+        P_scales[g][i]=(uint8_t)(e+127);
+        for(int j=g*32;j<g*32+32;j++){
+          uint8_t idx=enc(row[j]*isc);
+          if((i&1)==0)
+            P_hw[i>>1][j]=(P_hw[i>>1][j]&0xF0)|idx;
+          else
+            P_hw[i>>1][j]=(P_hw[i>>1][j]&0x0F)|(idx<<4);
+        }
+      }
+    }
+
+    // ---- PV matmul: O_block = P * V ----
+    {
+      int ti = ATT_S/DIM/2;   // tiles_I
+      int tj = ATT_D/DIM/2;   // tiles_J (FP6 half-width packing)
+      int tk = BT/DIM;         // tiles_K
+      uint32_t ab = 0;
+      uint32_t bb = BANK_NUM*BANK_ROWS - tk*tj*DIM;
+
+      // 1. Configure execution (fp6 act, fp6 wgt, bf16 out, uselut=1)
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY,0,0,ACC_SCALE_IDENTITY,
+          1,1,0,0,false,
+          /*act_mx_fmt*/1,/*wgt_mx_fmt*/1,/*out_mx_fmt*/3,/*uselut*/1);
+
+      // 2. Load scales: A=P_scales (sel=0), B=V_scales (sel=1)
+      gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+      gemmini_mx_load_scales((uint64_t)&V_scales_col[t*GBT][0], GBT*ATT_D, 1);
+
+      // 3. Load LUTs: B LUT (sel=0), A LUT (sel=1)
+      gemmini_mx_load_lut((uint64_t)V_lp, 1, 0);
+      gemmini_mx_load_lut((uint64_t)P_lp, 1, 1);
+
+      // 4a. MVIN A (P) tiles via mvin port 0
+      gemmini_extended3_config_ld(BT*sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+      for(int i=0;i<ti;i++){
+        int k=0;
+        while(k<tk){
+          int batch = tk-k;
+          if(batch>MAX_BLOCK_LEN) batch=MAX_BLOCK_LEN;
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)P_hw)+i*DIM*BT+k*DIM),
+            ab+(i*tk+k)*DIM,
+            batch*DIM, DIM);
+          k+=batch;
+        }
+      }
+
+      // 4b. MVIN B (V) tiles via mvin2 port 1
+      gemmini_extended3_config_ld(ATT_D*sizeof(elem_t)/2, MVIN_SCALE_IDENTITY, false, 1);
+      for(int k=0;k<tk;k++){
+        int j=0;
+        while(j<tj){
+          int batch = tj-j;
+          if(batch>MAX_BLOCK_LEN) batch=MAX_BLOCK_LEN;
+          gemmini_extended_mvin2(
+            (void*)(((elem_t*)V_in)+(t*BT+k*DIM)*(ATT_D/2)+j*DIM),
+            bb+(k*tj+j)*DIM,
+            batch*DIM, DIM);
+          j+=batch;
+        }
+      }
+
+      // 5. Configure requantized mvout
+      gemmini_config_st((ATT_D/BF16_PER_WORD)*sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+          ti, tj, tk,
+          /*scale_act_sel*/0,/*scale_w_sel*/0,
+          /*lut_update_granularity*/8);
+
+      // 6. Fused hardware matmul
+      gemmini_loop_ws_spad(ti,tj,tk, 0,0,0,
+          ab, BANK_NUM*BANK_ROWS, 0, 128,
+          false,false, false,false,false,
+          NO_ACTIVATION, 0,0, false, 0x38);
+
+      // 7. Drain results
+      gemmini_mx_read_smem(&O_hw[0][0], 128*16, ATT_S*ATT_D);
+      gemmini_fence();
+
+      // Accumulate into O_acc
+      for(int i=0;i<ATT_S;i++)
+        for(int d=0;d<ATT_D;d++){
+          uint16_t b=(uint16_t)((O_hw[i][d/4]>>((d%4)*16))&0xFFFF);
+          O_acc[i][d]+=bf16f(b);
+        }
+    }
+  } // end NT loop
+
+  // Final normalization
+  for(int i=0;i<ATT_S;i++){
+    float il=1.f/Lr[i];
+    for(int d=0;d<ATT_D;d++) O_acc[i][d]*=il;
+  }
+}

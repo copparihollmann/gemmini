@@ -1,0 +1,99 @@
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+
+// Assuming global definitions from the original context
+extern elem_t A_in[];
+extern elem_t B_in[];
+extern out_t C_hw[][/*MATMUL_N rounded up*/];
+extern uint8_t A_scales_row[][/*MATMUL_M rounded up*/];
+extern uint8_t B_scales_col[][/*MATMUL_N rounded up*/];
+
+void solution(void) {
+  const int BLK_M = 16;     // Optimize for actual M=1, pad to 16
+  const int BLK_N = 112;    // 7 tiles of 16 columns each
+  const int tiles_K = 192;  // 3072/16 = 192
+  
+  // Local storage for B scale factors for current column block
+  uint8_t local_B_s[192][112]; // 192 groups of 112 scale factors
+  uint32_t scale_factors_buf[512] = {0}; // For requantization output
+
+  int mrows = 1; // REAL_M = 1 for this problem
+  int pad_i = BLK_M - mrows; // 16 - 1 = 15
+  
+  // Calculate number of blocks needed for N dimension
+  int blocks_N = (3072 + BLK_N - 1) / BLK_N; // Ceiling division
+  
+  for (int j0 = 0; j0 < blocks_N; j0++) {
+    // Calculate actual columns for this block
+    int ncols = 3072 - j0 * BLK_N;
+    if (ncols > BLK_N) ncols = BLK_N;
+    if (ncols <= 0) continue;
+    
+    int pad_j = BLK_N - ncols;
+    
+    // Number of tiles for current block
+    int tiles_J = (ncols + 15) / 16; // Ceiling division for tiles
+    
+    // Stage B scale factors for current column block
+    for (int g = 0; g < 192; g++) { // 3072/16 = 192 scale groups
+      for (int col = 0; col < ncols; col++) {
+        local_B_s[g][col] = B_scales_col[g][j0 * BLK_N + col];
+      }
+      // Pad remaining positions with zeros if needed
+      for (int col = ncols; col < BLK_N; col++) {
+        local_B_s[g][col] = 0;
+      }
+    }
+    
+    // Scratchpad layout calculations
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM; // Place B at top
+    int SPAD_DEST = 128; // Output location in shared memory
+    
+    // Flush pipeline
+    gemmini_flush(0);
+    
+    // 1. Configure execution with FP8 inputs and BF16 output
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                               1, 1, 0, 0, false, 0, 0, 3, 0);
+    
+    // 2. Load scale factors directly from DRAM (optimized)
+    gemmini_mx_load_scales((uint64_t)A_scales_row, 192 * BLK_M, 0);  // A scales: 192 groups × 16 rows
+    gemmini_mx_load_scales((uint64_t)local_B_s, 192 * BLK_N, 1);     // B scales: 192 groups × BLK_N cols
+    
+    // 3. Load A tiles into scratchpad
+    gemmini_config_ld(3072 * sizeof(elem_t)); // A stride is full K dimension
+    for (int i = 0; i < 1; i++) {             // Only 1 tile needed for M dimension
+      for (int k = 0; k < tiles_K; k++) {
+        gemmini_extended_mvin((uint64_t)((elem_t*)A_in + (i * DIM) * 3072 + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      }
+    }
+    
+    // 4. Load B tiles into scratchpad
+    gemmini_config_ld(3072 * sizeof(elem_t)); // B stride in its layout
+    for (int j = 0; j < tiles_J; j++) {
+      for (int k = 0; k < tiles_K; k++) {
+        gemmini_extended_mvin((uint64_t)((elem_t*)B_in + (k * DIM) * 3072 + (j0 * BLK_N + j * DIM)),
+                              b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+      }
+    }
+    
+    // 5. Configure store and requantizer
+    gemmini_config_st(BLK_N * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors_buf, 1, tiles_J, tiles_K, 0, 0, 1);
+    
+    // 6. Execute weight-stationary tiled matmul
+    gemmini_loop_ws_spad(1, tiles_J, tiles_K, pad_i, pad_j, 0,
+                         a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                         false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    
+    // 7. Read results from shared memory
+    for (int r = 0; r < mrows; r++) {
+      gemmini_mx_read_smem((uint64_t)&C_hw[r][j0 * BLK_N],
+                           SPAD_DEST * 16 + r * BLK_N, ncols);
+    }
+    gemmini_fence();
+  }
+}

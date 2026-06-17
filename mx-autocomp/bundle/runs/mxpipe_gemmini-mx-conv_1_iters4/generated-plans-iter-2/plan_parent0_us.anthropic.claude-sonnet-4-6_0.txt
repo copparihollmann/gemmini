@@ -1,0 +1,84 @@
+## Strategy: Eliminate the Intermediate `A_buf` by Writing Im2col Tiles Directly into a Reusable DIM×DIM Staging Buffer
+
+### Analysis of the Current Code
+
+The baseline performs two passes over the input data:
+
+1. **Im2col pass**: materializes the entire `A_buf[MATMUL_M][MATMUL_K]` matrix in DRAM (64×32 = 2048 bytes for this problem), iterating over all patches and channels with 5 nested loops.
+2. **MVIN pass**: reads `A_buf` back from DRAM (or cache) tile by tile into the scratchpad.
+
+The problem is that `A_buf` acts as a DRAM-resident intermediate. Even if it fits in L1/L2 cache, the 5-level im2col loop writes every element once, then the mvin loop reads every element again. This doubles the memory traffic for the A operand and adds CPU overhead from the loop structure.
+
+### Proposed Strategy: Tile-at-a-Time Im2col Directly into the Scratchpad
+
+Instead of materializing `A_buf` fully and then issuing mvin commands to load it, **fill exactly one DIM×DIM (16×16) tile at a time into a stack-allocated staging buffer, then immediately issue a single `gemmini_extended_mvin` for that tile**. The staging buffer is reused for each tile, so its working set is only 16×16 = 256 bytes — it stays in registers or L1 cache. There is no need to allocate `A_buf` at all.
+
+### How It Works
+
+For each tile `(i, k)`:
+- The tile covers rows `[i*DIM, (i+1)*DIM)` of the im2col matrix and columns `[k*DIM, (k+1)*DIM)`.
+- Each row `r` in `[i*DIM, (i+1)*DIM)` corresponds to patch `r = pi*PATCHES_X + pj`.
+- Each column `c` in `[k*DIM, (k+1)*DIM)` corresponds to `(channel, dy, dx)` via `c = ch*CONV_KSZ*CONV_KSZ + dy*CONV_KSZ + dx`.
+- Fill the 16×16 staging buffer by unpacking these indices and reading from `X_in[ch][pi*CONV_KSZ+dy][pj*CONV_KSZ+dx]`.
+- Issue `gemmini_extended_mvin` with stride `DIM * sizeof(elem_t) = 16` (the staging buffer row stride).
+
+This eliminates the full `A_buf` allocation (saving DRAM/cache pressure), reduces total memory traffic by half for the A operand, and allows the CPU loop and DMA issuance to be fused into a single pass.
+
+### Implementation
+
+```c
+void solution(void) {
+  // Stack-allocated DIM×DIM staging tile; reused for every A tile (256 bytes, stays in L1)
+  elem_t tile_buf[DIM][DIM] __attribute__((aligned(64)));
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // MVIN A: fill each DIM×DIM tile via im2col directly into tile_buf, then DMA it
+  gemmini_config_ld(DIM * sizeof(elem_t));  // stride = 16 bytes (one tile row)
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      // Fill tile (i,k): rows [i*DIM..(i+1)*DIM), cols [k*DIM..(k+1)*DIM)
+      for (int tr = 0; tr < DIM; tr++) {
+        int row = i * DIM + tr;              // im2col row = patch index
+        int pi = row / PATCHES_X;
+        int pj = row % PATCHES_X;
+        for (int tc = 0; tc < DIM; tc++) {
+          int col = k * DIM + tc;            // im2col col = c*k*k + dy*k + dx
+          int ch = col / (CONV_KSZ * CONV_KSZ);
+          int rem = col % (CONV_KSZ * CONV_KSZ);
+          int dy = rem / CONV_KSZ;
+          int dx = rem % CONV_KSZ;
+          tile_buf[tr][tc] = X_in[ch][pi * CONV_KSZ + dy][pj * CONV_KSZ + dx];
+        }
+      }
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void*)tile_buf, sp_addr, DIM, DIM);
+    }
+  }
+
+  // MVIN B: unchanged (B_in is already in im2col / weight-matrix layout)
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int j = 0; j < tiles_J; j++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+                            b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+      a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+      false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+### Why This Improves Performance
+
+- **Eliminates one full DRAM read of A**: the baseline reads `X_in` once to write `A_buf`, then reads `A_buf` again for mvin. The new code reads `X_in` once and DMA-issues directly, halving A-side memory traffic.
+- **`tile_buf` is 256 bytes and stack-allocated**: it fits entirely in L1 cache (or even registers after optimization), so cache pressure from the im2col fill is negligible.
+- **Single-pass over input data**: the CPU's im2col work and the DMA issuance are fused, eliminating the separate loop passes and reducing instruction count.
+- **`gemmini_config_ld(DIM * sizeof(elem_t))`**: setting stride to 16 (the tile buffer row width) is correct and matches how `gemmini_extended_mvin` interprets the DRAM source layout.

@@ -1,0 +1,78 @@
+An elegant and highly effective optimization strategy to reduce the execution latency is **Complete Scratchpad/Accumulator Resident Matmul via Global Scale Preloading and Blocking Elimination**.
+
+### Optimization Strategy: Blocking Elimination & Direct Scale Factor Preloading
+
+1. **Elimination of CPU Staging (`memcpy`)**: 
+   The original program stages scale factors by copying small slices of `A_scales_row` and `B_scales_col` into local buffers (`A_s` and `B_s`) using `memcpy` inside nested loops. Since scale factors persist in the hardware's scale memories (`mx_scale_a_mem` and `mx_scale_b_mem`), we can load the **entire** scale matrices directly from DRAM in one shot using `gemmini_mx_load_scales` at the beginning of the function. This completely eliminates CPU staging overhead.
+
+2. **Blocking Elimination (Single-Tile Execution)**: 
+   The original code blocks the computation into smaller blocks (`BLK` size) and uses outer loops `i0` and `j0`. However, a 64x64 matrix requires only:
+   - $4 \times 4$ tiles of $16 \times 16$ elements.
+   - Scratchpad rows: $(4 \times 4 + 4 \times 4) \times 16 = 512$ rows, which is well within the 8,192 row capacity.
+   - Accumulator rows: $4 \times 4 \times 16 = 256$ rows, which fits exactly within the 256-row accumulator.
+
+   By eliminating the outer blocking loops entirely, we can run the entire 64x64x64 matrix multiplication in a single `gemmini_loop_ws_spad` call. This maximizes scratchpad and accumulator utilization and drastically reduces loop overhead.
+
+3. **Single-Shot SMEM Readout**: 
+   Instead of reading the results row-by-row in a loop, we perform a single, contiguous shared-memory-to-DRAM transfer using `gemmini_mx_read_smem` for all $64 \times 64$ output elements.
+
+### Optimized C Code
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+#include "include/matmul_fp8_64x64.h"
+
+// AUTO-GENERATED fully-resident high-performance MX matmul solution.
+void solution(void) {
+  // 1. Hoist invariant global configurations completely outside all loops
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // 2. Load entire scale factors directly from DRAM, eliminating CPU memcpy staging
+  gemmini_mx_load_scales((uint64_t)A_scales_row, (MATMUL_K / 32) * MATMUL_M, 0);
+  gemmini_mx_load_scales((uint64_t)B_scales_col, (MATMUL_K / 32) * MATMUL_N, 1);
+
+  int tiles_I = MATMUL_M / DIM;
+  int tiles_J = MATMUL_N / DIM;
+  int tiles_K = MATMUL_K / DIM;
+
+  uint32_t a_base = 0;
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+  int SPAD_DEST = 128;
+
+  gemmini_flush(0);
+
+  // 3. MVIN A tiles directly from strided DRAM
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i * DIM) * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    }
+  }
+
+  // 4. MVIN B tiles directly from strided DRAM using the mandated layout index
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j * DIM)),
+                            b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+    }
+  }
+
+  // 5. Configure output store stride
+  gemmini_config_st((MATMUL_N / BF16_PER_WORD) * sizeof(out_t));
+  
+  // 6. Configure requantizer bounds for the entire matrix
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // 7. Single-shot fused hardware loop computation
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // 8. Single-shot readout of results from shared memory
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```

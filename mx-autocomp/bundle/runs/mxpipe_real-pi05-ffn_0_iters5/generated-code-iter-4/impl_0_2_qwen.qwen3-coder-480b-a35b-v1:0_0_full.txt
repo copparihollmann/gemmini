@@ -1,0 +1,122 @@
+Looking at the optimized code, I can see there's an issue with the double-buffering implementation. The main problem is that the fence synchronization is not properly handling the overlap between computation and memory transfer. Let me provide a corrected version that maintains proper sequential consistency while achieving the double-buffering optimization.
+
+```c
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+
+// Assuming external symbols are defined elsewhere as in the baseline:
+// BLK, REAL_M, REAL_N, MATMUL_K, DIM, BANK_NUM, BANK_ROWS, BF16_PER_WORD, BLK_OUTC
+// elem_t, out_t, A_s, B_s, A_scales_row, B_scales_col, A_in, B_in, C_hw, scale_factors
+
+void solution(void) {
+  // Hoist invariant Gemmini configuration outside of all loops to prevent redundant command dispatch
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // Setup double-buffering for mx_smem
+  // Buffer 0 is at row 0, Buffer 1 is at row 256 (64 * 64 / 16 = 256 rows per tile)
+  int spad_dests[2] = {0, 256};
+  int buf_idx = 0;
+
+  bool has_prev = false;
+  int prev_i0 = 0, prev_j0 = 0, prev_mrows = 0, prev_ncols = 0, prev_spad_dest = 0;
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    // Partial last M block: compute only the real rows, pad the rest.
+    int mrows = REAL_M - i0 * BLK;
+    if (mrows > BLK) mrows = BLK;
+    if (mrows <= 0) continue;
+
+    int tiles = BLK / DIM;
+    int tiles_K = MATMUL_K / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+
+    // Stage activation scale factors once per row block
+    for (int g = 0; g < MATMUL_K / 32; g++) {
+      memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+    }
+
+    // Load activation scale factors to Gemmini hardware scale memory
+    gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+
+    // Load A tiles into the scratchpad once per row block
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t)); // A rows: stride K (full block-aligned tiles)
+    for (int i = 0; i < tiles; i++) {
+      for (int k = 0; k < tiles_K; k++) {
+        gemmini_extended_mvin(
+            (void *)(((elem_t *)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      }
+    }
+
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Partial last N block: compute only the real cols, pad the rest.
+      int ncols = REAL_N - j0 * BLK;
+      if (ncols > BLK) ncols = BLK;
+      if (ncols <= 0) continue;
+
+      // Stage weight scale factors for the current column block
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+
+      int pad_i = BLK - mrows;
+      int pad_j = BLK - ncols;
+
+      // Accelerator operations for each j0 block
+      gemmini_flush(0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t)); // B rows: stride N
+      for (int j = 0; j < tiles; j++) {              // B[k][j0*BLK+j] -> slot (k*tiles + j)
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin(
+              (void *)(((elem_t *)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+              b_base + (k * tiles + j) * DIM, DIM, DIM);
+        }
+      }
+
+      int curr_spad_dest = spad_dests[buf_idx];
+
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base,
+                           BANK_NUM * BANK_ROWS, 0, curr_spad_dest, false, false, false, false,
+                           false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Overlap: Issue the read out of SMEM to DRAM for the PREVIOUS block
+      if (has_prev) {
+        for (int r = 0; r < prev_mrows; r++) {
+          gemmini_mx_read_smem(&C_hw[prev_i0 * BLK + r][(prev_j0 * BLK) / BF16_PER_WORD],
+                               prev_spad_dest * 16 + r * BLK, prev_ncols);
+        }
+        // Fence only the previous read transfer
+        gemmini_fence();
+      }
+
+      // Record current block parameters as the previous block for the next iteration
+      prev_i0 = i0;
+      prev_j0 = j0;
+      prev_mrows = mrows;
+      prev_ncols = ncols;
+      prev_spad_dest = curr_spad_dest;
+      has_prev = true;
+
+      // Toggle active buffer
+      buf_idx = 1 - buf_idx;
+    }
+  }
+
+  // Drain the final block out of SMEM to DRAM
+  if (has_prev) {
+    for (int r = 0; r < prev_mrows; r++) {
+      gemmini_mx_read_smem(&C_hw[prev_i0 * BLK + r][(prev_j0 * BLK) / BF16_PER_WORD],
+                           prev_spad_dest * 16 + r * BLK, prev_ncols);
+    }
+    gemmini_fence();
+  }
+}
+```

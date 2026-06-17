@@ -1,0 +1,32 @@
+## Analysis of the Current Code
+
+Looking at the baseline code, I can identify a key inefficiency: the im2col transformation **materializes the full `A_buf` intermediate matrix in DRAM** before the mvin loops. This means:
+
+1. The CPU writes every element of `A_buf` (a `MATMUL_M × MATMUL_K` = 64×32 = 2048 byte buffer) to memory
+2. Then the mvin loops **re-read** all those same bytes from DRAM into the scratchpad
+
+This is a redundant DRAM round-trip. The data is written to `A_buf` only to be immediately read back by the DMA engine.
+
+## Selected Strategy
+
+**Strategy 7: Fuse the im2col transformation directly into the mvin loop**, writing A tiles row-by-row into the scratchpad DMA buffer without materializing the full `A_buf` intermediate matrix.
+
+## Plan
+
+Instead of computing the entire `A_buf` upfront and then DMAs-ing from it tile-by-tile, we restructure the mvin of A tiles to operate on a **small per-tile staging buffer** (`tile_buf[DIM][DIM]`) that is filled on-the-fly with the im2col-gathered data for exactly one tile, then immediately mvin'd into the scratchpad.
+
+**Concrete changes:**
+
+1. **Remove the full im2col pre-pass** (the 5-nested-loop block that fills `A_buf`).
+
+2. **Replace the A mvin loop** with a fused loop: for each tile `(i, k)`:
+   - Compute which rows `[i*DIM, (i+1)*DIM)` and which columns `[k*DIM, (k+1)*DIM)` of the im2col matrix this tile covers
+   - For each of the `DIM` rows in the tile, decode the row index `row = i*DIM + r` as patch `(pi, pj) = (row / PATCHES_X, row % PATCHES_X)` and for each of the `DIM` columns decode `col = k*DIM + c` as `(chan, dy, dx) = (col / (CONV_KSZ*CONV_KSZ), (col % (CONV_KSZ*CONV_KSZ)) / CONV_KSZ, col % CONV_KSZ)` and fill `tile_buf[r][c] = X_in[chan][pi*CONV_KSZ + dy][pj*CONV_KSZ + dx]`
+   - Set `gemmini_config_ld(DIM * sizeof(elem_t))` (stride = DIM, the width of the tile buffer row)
+   - Issue `gemmini_extended_mvin((void*)tile_buf, sp_addr, DIM, DIM)`
+
+3. **Keep the B mvin loop unchanged** but ensure its `gemmini_config_ld` is set correctly for `MATMUL_K` stride (it uses `B_in` which is already in correct layout).
+
+4. **Declare `tile_buf` as a small stack-allocated buffer** `elem_t tile_buf[DIM][DIM]` inside the fused loop body (or just outside the inner loop), so it occupies only 256 bytes of stack and never creates a full `MATMUL_M × MATMUL_K` footprint.
+
+This eliminates the entire `A_buf` write-back to DRAM (~2 KB of cache-line evictions) and replaces the two-pass (im2col write + DMA read of `A_buf`) with a single-pass (CPU gather → DMA read of `tile_buf`). The `tile_buf` is only 256 bytes and will remain in L1 cache throughout its use, making the gather cheap. The mvin of each tile still goes directly to the correct scratchpad address, so the scratchpad layout is identical to before and correctness is preserved.

@@ -1,0 +1,74 @@
+## Analysis of the Original Code
+
+The original code has this loop structure:
+```
+for i0 in BLOCKS_M:
+  for j0 in BLOCKS_N:
+    memcpy A_blk, B_blk, A_s, B_s
+    gemmini_flush
+    gemmini_extended3_config_ex
+    gemmini_mx_load_scales (A and B)
+    mvin A tiles
+    mvin B tiles  ← B is re-loaded for every (i0, j0) pair
+    gemmini_mxquant_config_mvout
+    gemmini_loop_ws_spad
+    gemmini_mx_read_smem + gemmini_fence
+    unpack C_blk → C_acc
+```
+
+**Key inefficiency**: For a fixed `j0`, the B block is identical across all `i0` iterations. Yet B is re-staged (`memcpy B_blk`), B scales are re-loaded (`gemmini_mx_load_scales` for B), and B tiles are re-mvin'd into the scratchpad on every single `(i0, j0)` iteration. With `BLOCKS_M` iterations of i0, each B block is loaded `BLOCKS_M` times unnecessarily.
+
+## Selected Strategy
+
+**Strategy 7**: Hoist B-block staging and `gemmini_mx_load_scales` for B outside the i0 loop, restructuring to j0-outer / i0-inner so each B block is loaded once per j0 and reused across all M-block rows.
+
+## Plan
+
+### Loop Restructuring
+
+Swap the loop order to **j0-outer, i0-inner**:
+
+```
+for j0 in BLOCKS_N:          ← outer
+  [hoist B work here]
+  for i0 in BLOCKS_M:        ← inner
+    [A work and compute here]
+```
+
+### Hoisted Work (per j0, done once)
+
+1. **`memcpy B_blk`** — stage the B block from `B_in` into `B_blk` once per j0.
+2. **`memcpy B_s`** — stage B scale factors into `B_s` once per j0.
+3. **`gemmini_extended3_config_ex`** — can be issued once before both loops (format is constant), but to follow the mandated ordering sequence it must precede `gemmini_mx_load_scales`. Since A scales change per i0, we must reload A scales each inner iteration. However, B scales do not change per i0 — we can hoist loading B scales outside the i0 loop. The ordering rule requires A scales to also be loaded before `gemmini_loop_ws_spad`, which is satisfied per i0 inner iteration.
+
+   **However**, the programming model sequence requires: `config_ex → load_scales_A → load_scales_B → mvin → mxquant_config → loop_ws_spad`. Since `gemmini_mx_load_scales` for B is stateful (it writes into `mx_scale_b_mem` which persists until overwritten), loading B scales once in the j0 loop body before the i0 loop is valid — the value persists in hardware and each inner i0 iteration only needs to reload A scales, then proceed with mvin/compute/readout, without reissuing B scale loading.
+
+4. **`gemmini_extended_mvin` for B tiles** — mvin all B tiles (`tiles × tiles_K` tiles) into the scratchpad once per j0. Since B tiles stay at `b_base` (which is fixed at `BANK_NUM*BANK_ROWS - tiles*tiles_K*DIM`), and the A tiles for different i0 values all use `a_base = 0`, A and B do not overlap (provided the constraint holds). B tiles remain valid in the scratchpad across all i0 iterations.
+
+### Per i0 (inner loop) — reduced work
+
+Each i0 iteration only needs to:
+1. `memcpy A_blk` and `memcpy A_s`
+2. `gemmini_mx_load_scales` for A only (B already loaded and persists)
+3. `gemmini_config_ld` + mvin A tiles only
+4. `gemmini_mxquant_config_mvout`
+5. `gemmini_loop_ws_spad`
+6. `gemmini_mx_read_smem` + `gemmini_fence`
+7. Unpack C_blk → C_acc
+
+### Ordering Compliance
+
+The hardware ordering requirement is:
+`config_ex → load_scales(A) → load_scales(B) → mvin → mxquant_config → loop_ws → read_smem → fence`
+
+In the restructured code:
+- **j0 prologue**: `config_ex` → `load_scales(B)` → `mvin B tiles` (with appropriate `config_ld`)
+- **i0 inner**: `load_scales(A)` → `mvin A tiles` → `mxquant_config` → `loop_ws_spad` → `read_smem` → `fence`
+
+`config_ex` is issued once before the j0 loop (or once at the top of the j0 body before B loading). B scales are loaded in j0 prologue and persist. A scales are loaded per i0 before compute. This satisfies the ordering: by the time `loop_ws_spad` runs, both A and B scales have been loaded (A just now, B earlier but still valid in `mx_scale_b_mem`).
+
+`gemmini_flush` should remain — move it to once per j0 (or once total before the outer loop) rather than once per `(i0,j0)` pair, since it's a pipeline flush that doesn't need to repeat for every inner iteration.
+
+### Expected Speedup
+
+With `BLOCKS_M` M-blocks and `BLOCKS_N` N-blocks, the original code performs `BLOCKS_M × BLOCKS_N` B-block memcpys, B-scale memcpys, B-scale loads, and B mvin sequences. The optimized code performs only `BLOCKS_N` of each. For a 256×256×512 problem with typical BLK=64, `BLOCKS_M=BLOCKS_N=4`, this eliminates 75% of all B-side data movement work, replacing `16` B loads with `4`.

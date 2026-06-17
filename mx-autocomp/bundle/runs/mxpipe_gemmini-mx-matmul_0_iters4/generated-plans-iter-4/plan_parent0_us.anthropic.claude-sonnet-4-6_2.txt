@@ -1,0 +1,92 @@
+## Analysis of the Original Code
+
+The original code loads A tiles using `gemmini_block_mvin` (which uses the `k_MVIN` port) and B tiles also using `gemmini_block_mvin` sequentially. These two sets of loads are serialized — B mvins don't start until all A mvins complete.
+
+Looking at the reference patterns (`matmul_ws_mx_generic.c`), they explicitly use `gemmini_extended_mvin` for A tiles and `gemmini_extended_mvin2` for B tiles in separate loops. However, even the reference does them sequentially (A loop then B loop), though `mvin` and `mvin2` are independent DMA ports that can be issued back-to-back without waiting for the first to complete.
+
+## Selected Strategy: Strategy 10
+
+**Use `gemmini_extended_mvin2` for B-tile loads and `gemmini_extended_mvin` for A-tile loads simultaneously, exploiting independent mvin/mvin2 DMA ports to overlap A and B scratchpad fills.**
+
+## Plan
+
+### Problem in the Original Code
+
+The original code:
+1. Issues all A mvins via `gemmini_block_mvin` (uses `k_MVIN` port)
+2. Then issues all B mvins via `gemmini_block_mvin` (also uses `k_MVIN` port)
+
+Both sets use the same DMA port (`k_MVIN`), so they execute sequentially. The B tile loads cannot begin until all A tile loads finish.
+
+### How to Fix It
+
+The hardware has two independent DMA ports:
+- `k_MVIN` (via `gemmini_extended_mvin`) — for A tiles
+- `k_MVIN2` (via `gemmini_extended_mvin2`) — for B tiles
+
+These ports operate independently. By interleaving A and B mvin instructions — issuing one A-tile mvin immediately followed by one B-tile mvin, then repeating — the hardware can execute both DMA transfers concurrently, effectively halving the data movement time.
+
+### Concrete Changes
+
+1. **Replace `gemmini_block_mvin` calls with `gemmini_extended_mvin` (A) and `gemmini_extended_mvin2` (B)** — this assigns each to its own independent DMA port.
+
+2. **Separate the `gemmini_config_ld` for A and B** — A and B have different DRAM strides (`MATMUL_K` bytes for A vs `MATMUL_K` bytes for B, but they need separate config since `gemmini_config_ld` uses id=0 for mvin and id=1 for mvin2). Use `gemmini_extended3_config_ld(stride, scale, shrunk, id)` with `id=0` for A and `id=1` for B.
+
+3. **Interleave the A and B tile loads** in a single loop that iterates over all tiles, issuing one A-mvin then one B-mvin per iteration so both DMA engines stay busy simultaneously.
+
+4. **Fix the B-tile scratchpad indexing** to match the required layout: `b_base + (j*tiles_K + k)*DIM` (per strategy 11 / rule 12). The original code uses `j * tiles_K * DIM` which is wrong for the `gemmini_loop_ws_spad` address traversal — it places all k-tiles for a given j contiguously, but indexes them as `b_base + j*tiles_K*DIM` ignoring k. The corrected indexing `b_base + (j*tiles_K + k)*DIM` is what `gemmini_loop_ws_spad` expects.
+
+### Resulting Code Structure
+
+```c
+// Config for A (mvin port 0): stride = MATMUL_K bytes
+gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+// Config for B (mvin2 port 1): stride = MATMUL_K bytes  
+gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+// Interleave A and B tile loads across both DMA ports
+for (int i = 0; i < tiles_I; i++) {
+  for (int k = 0; k < tiles_K; k++) {
+    // A tile → mvin port (k_MVIN)
+    gemmini_extended_mvin(
+      (elem_t*)A_in + i*DIM*MATMUL_K + k*DIM,
+      a_base + (i*tiles_K + k)*DIM,
+      DIM, DIM);
+  }
+}
+for (int j = 0; j < tiles_J; j++) {
+  for (int k = 0; k < tiles_K; k++) {
+    // B tile → mvin2 port (k_MVIN2), correct indexing
+    gemmini_extended_mvin2(
+      (elem_t*)B_in + j*DIM*MATMUL_K + k*DIM,
+      b_base + (j*tiles_K + k)*DIM,
+      DIM, DIM);
+  }
+}
+```
+
+Wait — to truly overlap them, I should interleave per tile rather than doing all A then all B. The key is to issue A and B instructions to different ports back-to-back so both DMAs are in flight together:
+
+```c
+// Issue paired A+B mvin instructions so both DMA ports are simultaneously active
+int a_total = tiles_I * tiles_K;
+int b_total = tiles_J * tiles_K;
+int max_tiles = (a_total > b_total) ? a_total : b_total;
+
+for (int t = 0; t < max_tiles; t++) {
+  if (t < a_total) {
+    int i = t / tiles_K, k = t % tiles_K;
+    gemmini_extended_mvin(
+      (elem_t*)A_in + i*DIM*MATMUL_K + k*DIM,
+      a_base + (i*tiles_K + k)*DIM, DIM, DIM);
+  }
+  if (t < b_total) {
+    int j = t / tiles_K, k = t % tiles_K;
+    gemmini_extended_mvin2(
+      (elem_t*)B_in + j*DIM*MATMUL_K + k*DIM,
+      b_base + (j*tiles_K + k)*DIM, DIM, DIM);
+  }
+}
+```
+
+This ensures that for every A-tile load instruction issued to port 0, a B-tile load instruction is immediately issued to port 1, keeping both DMA engines busy in parallel and overlapping the total data movement time.

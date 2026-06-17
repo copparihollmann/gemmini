@@ -1,0 +1,84 @@
+## Analysis of Current Code
+
+The current code loads A tiles with a single `gemmini_extended_mvin` call per tile and B tiles with `gemmini_extended_mvin2` per tile. For each (k, i) or (k, j) iteration, it issues one mvin command per DIM×DIM tile. This means:
+- For A: `tiles_K × tiles_I` individual mvin commands
+- For B: `tiles_K × tiles_J` individual mvin commands
+
+**Strategy 8: Batch consecutive same-direction mvin tiles using `gemmini_block_mvin`** (up to MAX_BLOCK_LEN=4 tiles per command) to reduce instruction count and amortize DMA setup overhead.
+
+## Plan
+
+### Identifying the Opportunity
+
+Looking at the inner loop for A tiles:
+```c
+for (int k = 0; k < tiles_K; k++) {
+  for (int i = 0; i < tiles_I; i++) {
+    gemmini_extended_mvin(..., a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+  }
+}
+```
+
+For a fixed `k`, the A tiles for consecutive `i` values are at scratchpad addresses `a_base + (i*tiles_K + k)*DIM`. These are **not** consecutive in scratchpad (stride = `tiles_K * DIM` rows apart), so they cannot be batched directly along `i`.
+
+However, for a fixed `i`, consecutive `k` tiles land at `a_base + (i*tiles_K + k)*DIM` — these **are** consecutive in scratchpad (stride = DIM rows). Similarly in DRAM, consecutive k-tiles for fixed i are at `A_in + i*DIM*MATMUL_K + k*DIM` — stride = DIM bytes. If we reorder the loop to iterate `i` in the outer loop and `k` in the inner loop, consecutive `k` tiles are scratchpad-consecutive AND DRAM-consecutive (given stride = `MATMUL_K * sizeof(elem_t)` is set correctly as the row stride). We can then batch up to `MAX_BLOCK_LEN=4` consecutive k-tiles into a single `gemmini_extended_mvin(..., cols=DIM*batch, rows=DIM)` call using `gemmini_block_mvin`.
+
+Wait — `gemmini_block_mvin(dram_addr, spad_addr, len)` expands to `gemmini_extended_mvin(dram_addr, spad_addr, (len)*DIM, DIM)`, loading `len` consecutive DIM-column tiles in one command.
+
+For B tiles at fixed `k`, consecutive `j` tiles: scratchpad address `b_base + (k*tiles_J + j)*DIM` — consecutive in scratchpad. DRAM address `B_in + k*DIM*MATMUL_N + j*DIM` — consecutive in DRAM (stride = `MATMUL_N * sizeof(elem_t)`). These can be batched along `j` for fixed `k`.
+
+### Concrete Changes
+
+**For A tiles** (reorder to `i` outer, `k` inner; batch consecutive `k` tiles):
+- For each `i`, iterate `k` from 0 to `tiles_K` in steps of up to 4
+- Each batch of `batch = min(4, tiles_K - k)` tiles: scratchpad addresses are consecutive (`a_base + (i*tiles_K + k)*DIM` through `a_base + (i*tiles_K + k + batch - 1)*DIM`), DRAM addresses are consecutive (`A_in + i*DIM*MATMUL_K + k*DIM` through `+ (k+batch-1)*DIM`)
+- Use `gemmini_extended_mvin(dram_ptr, sp_addr, DIM*batch, DIM)` — equivalent to `gemmini_block_mvin(..., batch)`
+
+**For B tiles** (batch consecutive `j` tiles for fixed `k`):
+- For each `k`, iterate `j` from 0 to `tiles_J` in steps of up to 4
+- Each batch of `batch = min(4, tiles_J - j)` tiles: scratchpad addresses consecutive, DRAM consecutive
+- Use `gemmini_extended_mvin2(dram_ptr, sp_addr, DIM*batch, DIM)`
+
+This reduces the number of mvin commands by up to 4×, lowering instruction dispatch overhead and DMA setup cost.
+
+## Rewritten Code
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Configure mvin port 0 (A) with stride = K cols
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+  // Configure mvin port 1 (B) with stride = N cols
+  gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+  // Batch A tile loads: for each i, load consecutive k-tiles in groups of up to MAX_BLOCK_LEN=4
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+      int batch = tiles_K - k < MAX_BLOCK_LEN ? tiles_K - k : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void*)dram_ptr, sp_addr, DIM * batch, DIM);
+    }
+  }
+
+  // Batch B tile loads: for each k, load consecutive j-tiles in groups of up to MAX_BLOCK_LEN=4
+  for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j += MAX_BLOCK_LEN) {
+      int batch = tiles_J - j < MAX_BLOCK_LEN ? tiles_J - j : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+      gemmini_extended_mvin2((void*)dram_ptr, sp_addr, DIM * batch, DIM);
+    }
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, tiles_K);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```

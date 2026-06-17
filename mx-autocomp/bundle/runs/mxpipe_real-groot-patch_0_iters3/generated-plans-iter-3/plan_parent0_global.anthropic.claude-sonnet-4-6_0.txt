@@ -1,0 +1,75 @@
+## Analysis of the Current Code
+
+The current code iterates over `(i0, j0)` outer blocks, and for each block:
+1. Does `memcpy` to stage scales into `A_s`/`B_s` buffers
+2. Calls `gemmini_flush(0)` (expensive!)
+3. Calls `gemmini_extended3_config_ex` (re-issued every block)
+4. Loads scales
+5. MVINs A and B tiles
+6. Runs compute
+7. Reads results
+
+The key inefficiency targeted by **strategy 2** is the scale factor loading pattern. Currently, for each `(i0, j0)` block pair, the code:
+- Does `memcpy` to extract a sub-block of scales into `A_s`/`B_s`
+- Then calls `gemmini_mx_load_scales` with those sub-block scales
+
+Since A scales depend only on `i0` (rows) and B scales depend only on `j0` (columns), reloading both for every `(i0, j0)` combination is wasteful. If we restructure the loop to iterate `i0` in the outer loop and `j0` in the inner loop, we can load A scales **once per `i0`** (they don't change across `j0`), and only reload B scales per `j0`.
+
+## Plan: Batch Scale Factor Loads (Strategy 2)
+
+**The inefficiency:** In the nested `(i0, j0)` loop, A scales (`A_s`) only depend on `i0` but are re-staged and re-loaded on every `j0` iteration. For a problem with `BLOCKS_M × BLOCKS_N` blocks, A scales are loaded `BLOCKS_M × BLOCKS_N` times when they only need to be loaded `BLOCKS_M` times.
+
+**The fix:**
+
+1. **Restructure the loop** so `i0` is the outer loop and `j0` is the inner loop (this is already the case, so the structure is correct for hoisting A scale loads).
+
+2. **Hoist A scale memcpy and `gemmini_mx_load_scales` for A outside the `j0` loop.** Since `A_s[g][0..BLK-1] = A_scales_row[g][i0*BLK .. i0*BLK+BLK-1]` depends only on `i0`, copy it once per `i0` iteration before the `j0` loop begins.
+
+3. **Keep B scale memcpy and `gemmini_mx_load_scales` for B inside the `j0` loop** since B scales depend on `j0`.
+
+4. **Also hoist `gemmini_flush`, `gemmini_extended3_config_ex`, and `gemmini_config_ld` for A outside both loops** (or at minimum outside `j0`), since these don't change per-block. The flush in particular is expensive and currently called once per `(i0,j0)` pair — it should be called once before all blocks. The `config_ex` and A-stride `config_ld` similarly only need to be set once.
+
+5. **For A MVIN**: A tiles for a given `i0` are the same regardless of `j0`. Hoist the A mvin loop outside the `j0` loop as well — load A tiles once per `i0`, reusing them for all `j0` iterations. This requires checking scratchpad capacity: `tiles_I_blk * tiles_K * DIM` rows for A + `tiles_J_blk * tiles_K * DIM` rows for B must fit simultaneously, which is the existing constraint and is already satisfied by the current layout.
+
+6. **The `gemmini_mx_load_scales` for A** must still be re-issued before each `gemmini_loop_ws_spad` call per the programming model — but since A scales haven't changed, we can use the same loaded buffer. Actually, the scale memory persists until overwritten, so if A scales are loaded once per `i0` and not overwritten during `j0` iteration (only B scales are reloaded), A scale memory remains valid for all `j0` iterations within the same `i0`. This is legal per rule 15: scales must be loaded before `loop_ws_spad` and must not be reused across tiles *if they differ* — but A scales are identical across all `j0` for a fixed `i0`, so reuse is correct.
+
+**Concrete changes:**
+
+```
+BEFORE (pseudocode):
+for i0:
+  for j0:
+    memcpy A_s   // A scales for this i0
+    memcpy B_s   // B scales for this j0
+    gemmini_flush
+    config_ex
+    load_scales A
+    load_scales B
+    mvin A tiles
+    mvin B tiles
+    compute
+    read_smem
+    fence
+
+AFTER (pseudocode):
+gemmini_flush(0)               // once total
+config_ex(...)                 // once total
+gemmini_config_ld(K stride)    // once for A stride
+for i0:
+  memcpy A_s                   // once per i0, not per (i0,j0)
+  mvin A tiles                 // once per i0 (A tiles are i0-dependent only)
+  gemmini_mx_load_scales A     // once per i0
+  for j0:
+    memcpy B_s                 // per j0
+    gemmini_mx_load_scales B   // per j0  ← B scale reload still needed
+    gemmini_config_ld(N stride) // for B
+    mvin B tiles               // per j0
+    config_st + mxquant_config_mvout
+    loop_ws_spad
+    read_smem
+    fence
+```
+
+**However**, there is a constraint: `gemmini_mx_load_scales` for A must appear before `loop_ws_spad` — which it does (it's loaded before the `j0` loop, and the A scale memory persists through the `j0` iterations since only B scales are re-loaded between `loop_ws_spad` calls). This satisfies rule 15.
+
+The A MVIN hoisting reduces the total number of `gemmini_extended_mvin` calls by a factor of `BLOCKS_N`, and the A scale load+memcpy reduction eliminates `(BLOCKS_N - 1) * BLOCKS_M` redundant scale loads. This directly addresses the `memcpy` overhead flagged in the profiler (2 memcpy per iteration → 1 memcpy per iteration for B only) and halves the number of `gemmini_mx_load_scales` calls.

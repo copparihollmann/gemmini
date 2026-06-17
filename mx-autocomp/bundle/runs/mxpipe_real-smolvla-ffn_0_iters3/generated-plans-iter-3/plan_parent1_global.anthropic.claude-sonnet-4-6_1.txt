@@ -1,0 +1,55 @@
+## Analysis of the Current Code
+
+The current code has this structure:
+```
+for i0 in BLOCKS_M:
+  for j0 in BLOCKS_N:
+    // memcpy scales (CPU staging)
+    // gemmini_flush
+    // config_ex
+    // load_scales (A and B)
+    // mvin A tiles
+    // mvin B tiles
+    // config_st + mxquant_config_mvout
+    // loop_ws_spad
+    // mx_read_smem (per row)
+    // fence
+```
+
+The key inefficiency is that each outer block iteration follows a strict sequential pattern: **all mvins complete → compute → all readouts complete → fence → next iteration**. There is no overlap between the DMA loads of the *next* block and the compute/readout of the *current* block.
+
+## Selected Strategy: Software Pipelining
+
+### Plan
+
+Software pipelining (strategy 1) will overlap the mvin of block `(i0+1, j0+1)` with the compute and readout of block `(i0, j0)`. This hides the DMA latency behind compute.
+
+**Concretely:**
+
+1. **Split the loop body into three phases**: LOAD (config + load_scales + mvin A/B), COMPUTE (config_st + mxquant_config_mvout + loop_ws_spad), and DRAIN (mx_read_smem + fence).
+
+2. **Use double-buffering in the scratchpad** to hold tiles for two consecutive blocks simultaneously. With `BLK=32` (tiles=2), `tiles_K = 512/16 = 32`:
+   - Buffer 0: `a_base0 = 0`, `b_base0 = BANK_NUM*BANK_ROWS - tiles_K*tiles*DIM` (standard)
+   - Buffer 1: `a_base1 = tiles*tiles_K*DIM`, `b_base1 = b_base0 - tiles*tiles_K*DIM`
+   
+   Verify they fit: Each buffer needs `(tiles*tiles_K + tiles*tiles_K)*DIM = 2*2*32*16 = 2048` rows. Two buffers = 4096 rows ≤ 8192 rows. ✓
+
+3. **Pipeline structure** (prologue → steady state → epilogue):
+   - **Prologue**: Issue LOAD for block 0 only (no compute yet).
+   - **Steady-state loop** (`idx` from 0 to BLOCKS_M*BLOCKS_N - 1):
+     - Issue COMPUTE for block `idx` (using the buffer that was loaded for `idx`)
+     - Issue LOAD for block `idx+1` into the *other* buffer (if it exists), **without a fence** — the hardware queues both compute and the next mvin
+     - Issue DRAIN (mx_read_smem + fence) for block `idx` — the fence here ensures compute finishes before we read, but the mvin for block `idx+1` is already in flight
+   - **Epilogue**: Issue COMPUTE + DRAIN for the last block.
+
+4. **Remove `gemmini_flush`** from the inner loop body. The flush is expensive and unnecessary after the first call — config_ex is sufficient to re-arm the state. Issue `gemmini_flush(0)` only once before the prologue.
+
+5. **Precompute all loop-invariant values** (`tiles`, `tiles_K`, `b_base0`, `b_base1`, `a_base0`, `a_base1`, `SPAD_DEST`) as `const` before the loop, eliminating redundant arithmetic per iteration.
+
+6. **Linearize the 2D block index** into a flat index `idx = i0 * BLOCKS_N + j0` and derive `i0 = idx / BLOCKS_N`, `j0 = idx % BLOCKS_N` inside the pipeline to simplify double-buffer selection via `buf = idx & 1`.
+
+7. **Scale memcpy staging**: The `memcpy` for block `idx+1`'s scales into `A_s`/`B_s` must happen on the CPU before the `gemmini_mx_load_scales` for that block. Since we're issuing the next block's LOAD phase while the current block is computing (accelerator is busy), the CPU can do the scale memcpy during that window — the memcpy and the accelerator compute are naturally parallel, hiding the scale-copy cost.
+
+8. **Use two scale staging buffers** (`A_s0`/`B_s0` and `A_s1`/`B_s1`) so that the next block's scales can be copied into the idle buffer while the current block's scales are being consumed by `gemmini_mx_load_scales`.
+
+This transforms the latency from sequential `(load + compute + drain) × N_blocks` to approximately `max(load, compute, drain) × N_blocks + startup`, hiding the dominant DMA latency behind compute.

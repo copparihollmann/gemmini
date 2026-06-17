@@ -1,0 +1,346 @@
+{'correct': False, 'test_results': {0: False}, 'compiled': False, 'stdout': "/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/auto_comp_test.c:380:8: error: 'lut_initialized' undeclared (first use in this function)
+/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/auto_comp_test.c:381:25: error: 'LUT_SIZE' undeclared (first use in this function)
+/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/auto_comp_test.c:382:7: error: 'iexp_lut' undeclared (first use in this function)
+make[1]: *** [/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/Makefile:145: auto_comp_test-baremetal] Error 1
+make: *** [Makefile:20: bareMetalC] Error 2
+|                          ^
+/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/auto_comp_test.c: In function 'main':
+380 |   if (!lut_initialized) {
+|        ^~~~~~~~~~~~~~~
+/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/auto_comp_test.c:380:8: note: each undeclared identifier is reported only once for each function it appears in
+381 |     for (int i = 0; i < LUT_SIZE; i++) {
+|                         ^~~~~~~~
+382 |       iexp_lut[i] = mx_iexp(-i);
+|       ^~~~~~~~
+make[1]: Leaving directory '/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/bareMetalC'"}
+Prev latency: 786929
+New latency: N/A
+Plan: Here is a detailed optimization plan to apply **Strategy 1 (Host-side lookup tables)** to accelerate the CPU integer math in the softmax pass.
+
+### Analysis of the Bottleneck
+In the current implementation, Step 2 (the float-free integer softmax pass) is executed entirely on the host CPU. For every element in the attention matrix ($S \times S = 64 \times 64 = 4096$ elements per head), the CPU must compute `mx_iexp(q[j] - mq)`.
+* `q[j] - mq` is always a non-positive integer because `mq` is the maximum value of the row.
+* `mx_iexp` is a mathematically intensive function approximating the natural exponential function using integer arithmetic (shifts, multiplications, and divisions). Computing this $4096 \times \text{ATT\_H}$ times per invocation consumes a massive number of CPU cycles.
+* Because the exponential function decays extremely rapidly, `mx_iexp(x)` becomes exactly `0` once `x` drops below a relatively small negative threshold (typically within a few thousands in Q-format representation).
+
+---
+
+### Optimization Plan: Host-side LUT for `mx_iexp`
+
+We will implement a cache-aligned, L1-resident static lookup table (LUT) to completely eliminate the runtime arithmetic overhead of `mx_iexp`.
+
+1. **Define a Local Lookup Table (LUT):**
+   We will create a static table `iexp_lut` with a size of `16384` entries. Each entry will store an `int64_t` value.
+   ```c
+   #define LUT_SIZE 16384
+   static int64_t iexp_lut[LUT_SIZE];
+   static int lut_initialized = 0;
+   ```
+
+2. **One-Time Lazy Initialization:**
+   At the very beginning of the `solution()` function, we will check if the LUT has been initialized. If not, we will populate the table by calling the original `mx_iexp` function for negative index offsets:
+   ```c
+   if (!lut_initialized) {
+       for (int i = 0; i < LUT_SIZE; i++) {
+           iexp_lut[i] = mx_iexp(-i);
+       }
+       lut_initialized = 1;
+   }
+   ```
+   This guarantees **bit-exact equivalence** to the original math function because the LUT is populated directly using the golden `mx_iexp` implementation.
+
+3. **Replace the Inner-Loop Execution with $O(1)$ Lookup:**
+   Since the input argument to `mx_iexp` is `diff = q[j] - mq` (which is always $\le 0$):
+   * If `diff <= -LUT_SIZE`, we can immediately return `0` (since the exponential value has decayed to zero).
+   * Otherwise, we retrieve the value directly from the table using `iexp_lut[-diff]`.
+
+   We will replace:
+   ```c
+   int64_t pv = mx_iexp(q[j] - mq);
+   ```
+   with:
+   ```c
+   int64_t diff = q[j] - mq;
+   int64_t pv = (diff <= -LUT_SIZE) ? 0 : iexp_lut[-diff];
+   ```
+
+4. **Performance Impact:**
+   This replaces complex shift, multiplication, and branch instructions with a single pointer addition and memory load from an L1-resident array, drastically reducing the CPU cycles spent in the softmax loop.
+
+CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED baseline MHA kernel (S=64, D=64, H=4, H_kv=2, causal=0, fp8:e4m3).
+void solution(void) {
+  for (int h = 0; h < ATT_H; h++) {
+    int kv = h / (ATT_H / ATT_HKV);
+    const elem_t *Q_in = Qs[h];  const uint8_t *Q_sc = Qss[h];
+    const elem_t *KT_in = KTs[kv]; const uint8_t *KT_sc = KTss[kv];
+    const elem_t *V_in = Vs[kv];  const uint8_t *V_sc = Vss[kv];
+  // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)Q_sc, QSS_BYTES, 0);
+    gemmini_mx_load_scales((uint64_t)KT_sc, QSS_BYTES, 1);
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) { int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM); }
+    gemmini_config_ld(ATT_S * sizeof(elem_t));   // B=KT[D][S] stride N=S -> slot (k*tiles_J+j)
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) { int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM); }
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+    gemmini_fence();
+  }
+
+  // ---- 2) FLOAT-FREE integer softmax + fp8 requant (I-BERT iexp; host has no FPU) ----
+  for (int i = 0; i < ATT_S; i++) {
+    int64_t q[ATT_S];
+    int64_t mq = -((int64_t)1 << 62);
+    for (int j = 0; j < ATT_S; j += 4) {                       // unpack 4 bf16/word -> Q(1/1024) int + max
+      uint64_t w = S1_hw[i][j / 4];
+      for (int l = 0; l < 4; l++) {
+#if ATT_CAUSAL
+        if (j + l > i) { q[j + l] = -((int64_t)1 << 62); continue; }   // causal: future col -> iexp()=0
+#endif
+        int64_t qq = mx_ibf16_to_q((uint16_t)((w >> (l * 16)) & 0xFFFF));
+        q[j + l] = qq; if (qq > mq) mq = qq;
+      }
+    }
+    int64_t p[ATT_S];
+    int64_t sm = 0;
+    int64_t gmax_arr[GROUPS_S];                                // fused group-max: capture per-group max IN the iexp pass
+    for (int g = 0; g < GROUPS_S; g++) {                       // (group-nested, register-scalar gmax) -> removes the
+      int64_t gmax = 0;                                        // separate 16384-elem max scan. Output bit-identical.
+      for (int j = g * 32; j < (g + 1) * 32; j++) { int64_t pv = mx_iexp(q[j] - mq); p[j] = pv; sm += pv; if (pv > gmax) gmax = pv; }
+      gmax_arr[g] = gmax;
+    }
+    int ls = mx_ilog2((uint64_t)sm);
+    uint64_t inv_sm = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;   // one rounded reciprocal/row
+    for (int g = 0; g < GROUPS_S; g++) {
+      int64_t gmax = gmax_arr[g];
+      if (gmax == 0) { P_scales[g][i] = 0; for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = 0; continue; }
+      // group e8m0 scale so the group-max lands at ~2^MX_P_TARGET_LOG2 (moderate; avoids e4 overflow)
+      int e = mx_ilog2((uint64_t)gmax) - ls - MX_P_TARGET_LOG2;
+      P_scales[g][i] = (uint8_t)(e + 127);
+      for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = mx_ienc_fp8(p[j], inv_sm, ls, e);
+    }
+  }
+
+  // ---- 3) O = P @ V on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+    gemmini_mx_load_scales((uint64_t)V_sc, VSS_BYTES, 1);
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) { int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM); }
+    gemmini_config_ld(ATT_D * sizeof(elem_t));   // B=V[S][D] stride N=D -> slot (k*tiles_J+j)
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) { int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM); }
+    gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[h][0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+    gemmini_fence();
+  }
+  }
+}
+''',
+score=786929,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'Accelerator-bound: compute and data-movement look balanced; tune tiling / scratchpad occupancy for more overlap.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''Here is a detailed optimization plan to apply **Strategy 1 (Host-side lookup tables)** to accelerate the CPU integer math in the softmax pass.
+
+### Analysis of the Bottleneck
+In the current implementation, Step 2 (the float-free integer softmax pass) is executed entirely on the host CPU. For every element in the attention matrix ($S \times S = 64 \times 64 = 4096$ elements per head), the CPU must compute `mx_iexp(q[j] - mq)`.
+* `q[j] - mq` is always a non-positive integer because `mq` is the maximum value of the row.
+* `mx_iexp` is a mathematically intensive function approximating the natural exponential function using integer arithmetic (shifts, multiplications, and divisions). Computing this $4096 \times \text{ATT\_H}$ times per invocation consumes a massive number of CPU cycles.
+* Because the exponential function decays extremely rapidly, `mx_iexp(x)` becomes exactly `0` once `x` drops below a relatively small negative threshold (typically within a few thousands in Q-format representation).
+
+---
+
+### Optimization Plan: Host-side LUT for `mx_iexp`
+
+We will implement a cache-aligned, L1-resident static lookup table (LUT) to completely eliminate the runtime arithmetic overhead of `mx_iexp`.
+
+1. **Define a Local Lookup Table (LUT):**
+   We will create a static table `iexp_lut` with a size of `16384` entries. Each entry will store an `int64_t` value.
+   ```c
+   #define LUT_SIZE 16384
+   static int64_t iexp_lut[LUT_SIZE];
+   static int lut_initialized = 0;
+   ```
+
+2. **One-Time Lazy Initialization:**
+   At the very beginning of the `solution()` function, we will check if the LUT has been initialized. If not, we will populate the table by calling the original `mx_iexp` function for negative index offsets:
+   ```c
+   if (!lut_initialized) {
+       for (int i = 0; i < LUT_SIZE; i++) {
+           iexp_lut[i] = mx_iexp(-i);
+       }
+       lut_initialized = 1;
+   }
+   ```
+   This guarantees **bit-exact equivalence** to the original math function because the LUT is populated directly using the golden `mx_iexp` implementation.
+
+3. **Replace the Inner-Loop Execution with $O(1)$ Lookup:**
+   Since the input argument to `mx_iexp` is `diff = q[j] - mq` (which is always $\le 0$):
+   * If `diff <= -LUT_SIZE`, we can immediately return `0` (since the exponential value has decayed to zero).
+   * Otherwise, we retrieve the value directly from the table using `iexp_lut[-diff]`.
+
+   We will replace:
+   ```c
+   int64_t pv = mx_iexp(q[j] - mq);
+   ```
+   with:
+   ```c
+   int64_t diff = q[j] - mq;
+   int64_t pv = (diff <= -LUT_SIZE) ? 0 : iexp_lut[-diff];
+   ```
+
+4. **Performance Impact:**
+   This replaces complex shift, multiplication, and branch instructions with a single pointer addition and memory load from an L1-resident array, drastically reducing the CPU cycles spent in the softmax loop.''',
+code='''// AUTO-GENERATED baseline MHA kernel (S=64, D=64, H=4, H_kv=2, causal=0, fp8:e4m3).
+#define LUT_SIZE 16384
+static int64_t iexp_lut[LUT_SIZE] __attribute__((aligned(64)));
+static int lut_initialized = 0;
+
+void solution(void) {
+  // One-time lazy initialization of the iexp lookup table
+  if (!lut_initialized) {
+    for (int i = 0; i < LUT_SIZE; i++) {
+      iexp_lut[i] = mx_iexp(-i);
+    }
+    lut_initialized = 1;
+  }
+
+  for (int h = 0; h < ATT_H; h++) {
+    int kv = h / (ATT_H / ATT_HKV);
+    const elem_t *Q_in = Qs[h];  const uint8_t *Q_sc = Qss[h];
+    const elem_t *KT_in = KTs[kv]; const uint8_t *KT_sc = KTss[kv];
+    const elem_t *V_in = Vs[kv];  const uint8_t *V_sc = Vss[kv];
+  // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)Q_sc, QSS_BYTES, 0);
+    gemmini_mx_load_scales((uint64_t)KT_sc, QSS_BYTES, 1);
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) { int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM); }
+    gemmini_config_ld(ATT_S * sizeof(elem_t));   // B=KT[D][S] stride N=S -> slot (k*tiles_J+j)
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) { int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM); }
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+    gemmini_fence();
+  }
+
+  // ---- 2) FLOAT-FREE integer softmax + fp8 requant (I-BERT iexp; host has no FPU) ----
+  for (int i = 0; i < ATT_S; i++) {
+    int64_t q[ATT_S];
+    int64_t mq = -((int64_t)1 << 62);
+    for (int j = 0; j < ATT_S; j += 4) {                       // unpack 4 bf16/word -> Q(1/1024) int + max
+      uint64_t w = S1_hw[i][j / 4];
+      for (int l = 0; l < 4; l++) {
+#if ATT_CAUSAL
+        if (j + l > i) { q[j + l] = -((int64_t)1 << 62); continue; }   // causal: future col -> iexp()=0
+#endif
+        int64_t qq = mx_ibf16_to_q((uint16_t)((w >> (l * 16)) & 0xFFFF));
+        q[j + l] = qq; if (qq > mq) mq = qq;
+      }
+    }
+    int64_t p[ATT_S];
+    int64_t sm = 0;
+    int64_t gmax_arr[GROUPS_S];                                // fused group-max: capture per-group max IN the iexp pass
+    for (int g = 0; g < GROUPS_S; g++) {                       // (group-nested, register-scalar gmax) -> removes the
+      int64_t gmax = 0;                                        // separate 16384-elem max scan. Output bit-identical.
+      for (int j = g * 32; j < (g + 1) * 32; j++) {
+        int64_t diff = q[j] - mq;
+        int64_t pv = (diff <= -LUT_SIZE) ? 0 : iexp_lut[-diff];
+        p[j] = pv; sm += pv; if (pv > gmax) gmax = pv;
+      }
+      gmax_arr[g] = gmax;
+    }
+    int ls = mx_ilog2((uint64_t)sm);
+    uint64_t inv_sm = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;   // one rounded reciprocal/row
+    for (int g = 0; g < GROUPS_S; g++) {
+      int64_t gmax = gmax_arr[g];
+      if (gmax == 0) { P_scales[g][i] = 0; for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = 0; continue; }
+      // group e8m0 scale so the group-max lands at ~2^MX_P_TARGET_LOG2 (moderate; avoids e4 overflow)
+      int e = mx_ilog2((uint64_t)gmax) - ls - MX_P_TARGET_LOG2;
+      P_scales[g][i] = (uint8_t)(e + 127);
+      for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = mx_ienc_fp8(p[j], inv_sm, ls, e);
+    }
+  }
+
+  // ---- 3) O = P @ V on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+    gemmini_mx_load_scales((uint64_t)V_sc, VSS_BYTES, 1);
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) { int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM); }
+    gemmini_config_ld(ATT_D * sizeof(elem_t));   // B=V[S][D] stride N=D -> slot (k*tiles_J+j)
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) { int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM); }
+    gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[h][0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+    gemmini_fence();
+  }
+  }
+}
+''',
+score=None,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='gemini-3.5-flash',
+code_gen_model='qwen.qwen3-coder-480b-a35b-v1:0',
+stdout=None,
+stderr=None)

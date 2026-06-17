@@ -1,0 +1,48 @@
+## Analysis of the Current Code
+
+The current code has a nested loop `i0` (outer) over `j0` (inner). For each `(i0, j0)` pair, it:
+1. Loads A scales for row-block `i0`
+2. Loads B scales for col-block `j0`
+3. MVINs all A tiles for block `i0`
+4. MVINs all B tiles for block `j0`
+5. Runs `gemmini_loop_ws_spad`
+6. Reads results per-row
+
+**Key inefficiency targeted by Strategy 4:** B tiles depend only on `j0` (not `i0`). With `i0` as the outer loop, B tiles are re-loaded for every `i0` iteration even though they are identical across all `i0` values for a fixed `j0`. There are `BLOCKS_M` redundant B loads per `j0` block.
+
+## Plan: Apply Strategy 4 — Reorder to `j0` Outermost, `i0` Innermost
+
+### What changes
+
+**Swap the loop order** so `j0` is the outer loop and `i0` is the inner loop. This means:
+
+1. **B tile MVIN is hoisted to the `j0` level** — B tiles for column-block `j0` are loaded into the scratchpad once per `j0` iteration and reused across all `i0` iterations.
+2. **A tile MVIN stays inside `i0`** — A tiles change with every `i0`, so they must be re-loaded per `i0`.
+3. **Scale loading**: B scales are loaded once per `j0`; A scales are loaded per `i0` (they differ per row-block). The `gemmini_extended3_config_ex` and `gemmini_flush` must still precede `gemmini_mx_load_scales` per the programming model, so we move the config+flush to the inner loop header (before each `gemmini_mx_load_scales` pair) but hoist the B MVIN outside.
+
+### Concrete restructuring
+
+**Outer `j0` loop:**
+- Compute `ncols`, `b_base`, `tiles_K`
+- MVIN all B tiles for this `j0` into scratchpad at `b_base + (k*tiles + j)*DIM` (unchanged formula, just done once)
+- Set `gemmini_config_ld` for B stride (`MATMUL_N * sizeof(elem_t)`)
+
+**Inner `i0` loop:**
+- Compute `mrows`, `pad_i`, `pad_j`
+- `memcpy` A scales and B scales into staging buffers
+- `gemmini_flush(0)`
+- `gemmini_extended3_config_ex(...)` 
+- `gemmini_mx_load_scales(A_s, ..., 0)` and `gemmini_mx_load_scales(B_s, ..., 1)` — both still issued here (required before compute)
+- MVIN A tiles for this `i0` into scratchpad at `a_base + (i*tiles_K + k)*DIM`
+- `gemmini_mxquant_config_mvout(...)`, `gemmini_config_st(...)`
+- `gemmini_loop_ws_spad(...)` — B tiles already in scratchpad from outer loop
+- `gemmini_mx_read_smem(...)` per-row (unchanged for now)
+- `gemmini_fence()`
+
+### Scratchpad layout validation
+
+The B tiles must remain valid in the scratchpad across all `i0` iterations. Since A uses `a_base = 0` and B uses `b_base = BANK_NUM*BANK_ROWS - tiles_K*tiles_J*DIM` (top of scratchpad, fixed by `j0`'s `tiles` and `tiles_K`), and the constraint `(tiles_I*tiles_K + tiles_J*tiles_K)*DIM ≤ 8192` must hold — with `tiles_I = tiles_J = BLK/DIM` and `tiles_K = MATMUL_K/DIM`, this is the same constraint as before, already satisfied. A tiles are overwritten each `i0` iteration but B tiles at the top are not touched by A MVIN (they start from `b_base > a_base + A_tile_rows`).
+
+### Expected benefit
+
+With `BLOCKS_M` row-blocks and `BLOCKS_N` col-blocks, the original code does `BLOCKS_M × BLOCKS_N` B MVINs. The reordered code does only `BLOCKS_N` B MVINs — a factor of `BLOCKS_M` reduction in B data movement. Since B MVIN volume equals A MVIN volume (both are `BLK × MATMUL_K` elements per block), this approximately halves total MVIN traffic, directly reducing the dominant accelerator-side cost.

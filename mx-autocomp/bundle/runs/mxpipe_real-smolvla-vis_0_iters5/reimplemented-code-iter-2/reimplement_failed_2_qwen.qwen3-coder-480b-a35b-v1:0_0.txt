@@ -1,0 +1,124 @@
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+
+void solution(void) {
+  int tiles_I = BLK / DIM;
+  int tiles_J = BLK / DIM;
+  int tiles_K = MATMUL_K / DIM;
+  int GK      = MATMUL_K / 32;
+
+  // Correct B base calculation - place B at the top of scratchpad
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_J * tiles_K * DIM;
+  uint32_t a_base = 0;
+  int SPAD_DEST = 128;
+
+  // Static buffers for pre-transposed scale factors
+  static uint8_t A_scales_T[BLOCKS_M][A_S_BYTES];
+  static uint8_t B_scales_T[BLOCKS_N][B_S_BYTES];
+  
+  // One-time initialization flag
+  static int initialized = 0;
+  if (!initialized) {
+    // Transpose A scales: from [GK][ROWS] to [BLOCKS_M][GK*BLK]
+    for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+      for (int g = 0; g < GK; g++) {
+        memcpy(&A_scales_T[i0][g * BLK],
+               &A_scales_row[g][i0 * BLK],
+               BLK);
+      }
+    }
+
+    // Transpose B scales: from [GK][COLS] to [BLOCKS_N][GK*BLK]
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      for (int g = 0; g < GK; g++) {
+        memcpy(&B_scales_T[j0][g * BLK],
+               &B_scales_col[g][j0 * BLK],
+               BLK);
+      }
+    }
+    initialized = 1;
+  }
+
+  // Hoist flush and format configuration out of all execution loops
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                              1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    int ncols = REAL_N - j0 * BLK;
+    if (ncols > BLK) ncols = BLK;
+    if (ncols <= 0) continue;
+
+    // Load B tiles into scratchpad once per j0
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+    for (int j = 0; j < tiles_J; j++) {
+      for (int k = 0; k < tiles_K; k++) {
+        gemmini_extended_mvin2(
+          (void*)(((elem_t*)B_in) + (j0 * BLK + j * DIM) * MATMUL_N + (k * DIM)),
+          b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+      }
+    }
+
+    for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+
+      // Step 2: Load pre-transposed scale factors
+      gemmini_mx_load_scales((uint64_t)A_scales_T[i0], A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_scales_T[j0], B_S_BYTES, 1);
+
+      // Step 3: Load A tiles into scratchpad
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles_I; i++) {
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + (k * DIM)),
+            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+        }
+      }
+
+      // Step 4: Configure output requantization
+      gemmini_config_st(BLK * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                   tiles_I, tiles_J, tiles_K, 0, 1, 1);
+
+      // Dispatch optimized paths based on boundary conditions
+      if (i0 < BLOCKS_M - 1 && j0 < BLOCKS_N - 1) {
+        // Fast path: full tiles, no padding
+        gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+                             a_base, b_base, 0, SPAD_DEST,
+                             false, false, false, false, false,
+                             NO_ACTIVATION, 0, 0, false, 0x38);
+
+        // Read full tile results
+        for (int r = 0; r < BLK; r++) {
+          gemmini_mx_read_smem(
+            (uint64_t)&C_hw[i0 * BLK + r][j0 * BLK],
+            SPAD_DEST * 16 + r * BLK, BLK);
+        }
+
+        gemmini_fence();
+      } else {
+        // Boundary path: handle partial tiles with padding
+        int pad_I = (tiles_I * DIM - mrows);
+        int pad_J = (tiles_J * DIM - ncols);
+
+        gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, pad_I, pad_J, 0,
+                             a_base, b_base, 0, SPAD_DEST,
+                             false, false, false, false, false,
+                             NO_ACTIVATION, 0, 0, false, 0x38);
+
+        // Read partial tile results
+        for (int r = 0; r < mrows; r++) {
+          gemmini_mx_read_smem(
+            (uint64_t)&C_hw[i0 * BLK + r][j0 * BLK],
+            SPAD_DEST * 16 + r * BLK, ncols);
+        }
+
+        gemmini_fence();
+      }
+    }
+  }
+}

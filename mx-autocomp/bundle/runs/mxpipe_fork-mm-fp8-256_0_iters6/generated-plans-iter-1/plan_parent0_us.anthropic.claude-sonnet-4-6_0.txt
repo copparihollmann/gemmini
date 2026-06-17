@@ -1,0 +1,157 @@
+# Phase 1 Optimization Plan: Split `gemmini_loop_ws_spad` into I-tile Bands for B-tile Reuse
+
+## Analysis of the Current Code
+
+The current code loads **all A tiles** (tiles_I × tiles_K = 8 × 16 = 128 tiles) and **all B tiles** (tiles_K × tiles_J = 16 × 8 = 128 tiles) into the scratchpad, then issues a single `gemmini_loop_ws_spad`. For MATMUL_M=128, MATMUL_N=128, MATMUL_K=256:
+
+- `tiles_I = 128/16 = 8`
+- `tiles_J = 128/16 = 8`
+- `tiles_K = 256/16 = 16`
+- A occupies: `8 × 16 × 16 = 2048` rows
+- B occupies: `16 × 8 × 16 = 2048` rows
+- Total: **4096 rows** out of 8192 — only **50% scratchpad utilization**
+
+The scratchpad utilization report confirms 0KB reported utilization, indicating the hardware isn't keeping enough data resident. The key insight is that **B tiles are shared across all I-tile bands** — every row of B is needed by every row of A. Currently, the code loads all B tiles once, but the single `gemmini_loop_ws_spad` call processes all I tiles in a single sweep, meaning the hardware loop already reuses B internally.
+
+## The Inefficiency: Underutilized Scratchpad → Missed B-Reuse Opportunity Across Larger Batches
+
+The strategy I'm applying is **Strategy 12** (split into multiple I-tile band calls, each fitting A tiles and all B tiles simultaneously) combined with **Strategy 4** (reuse loaded B tiles across multiple I-tile iterations without re-mvin).
+
+The current code has `tiles_I=8`, which means A occupies 2048 rows and B occupies 2048 rows. But we can fit **more A tiles** if we reorganize: since B already occupies 2048 rows (fixed), the remaining 8192 - 2048 = **6144 rows** are available for A. Currently only 2048 of those 6144 are used for A — we're leaving 4096 rows of scratchpad idle.
+
+By increasing the **I-band size** (number of I-tiles processed per `gemmini_loop_ws_spad` call) to use all available A-space, we can process all `tiles_I=8` rows in one band with room to spare, OR — more importantly — we load B **once** and loop over the I-band using a **software outer loop** that issues multiple `gemmini_loop_ws_spad` calls, each covering a subset of I-tiles, without re-loading B.
+
+## The Concrete Strategy
+
+The key optimization is:
+
+1. **Load all B tiles once** into the scratchpad (2048 rows at `b_base`).
+2. **Split the I-tile dimension** into bands of `band_I` tiles. For each band:
+   - Load only the A tiles for that band (band_I × tiles_K rows).
+   - Issue `gemmini_mxquant_config_mvout` once per band (amortizing Step 5).
+   - Issue `gemmini_loop_ws_spad` with `I=band_I` (not full tiles_I), pointing to the same B base and the A sub-region.
+   - Drain the result for that I-band via `gemmini_mx_read_smem`.
+3. **Never re-mvin B** across bands.
+
+Since 6144 available rows / (16 K-tiles × 16 rows/tile) = **24 I-tiles** can be held simultaneously, and we only have 8 I-tiles total, **all A tiles fit alongside all B tiles** — so a single `gemmini_loop_ws_spad` call with all tiles already fits. But the current `SPAD_DEST=0` places output at row 0, which may alias A. We need to set `SPAD_DEST` correctly.
+
+The more impactful change: **eliminate the redundant `gemmini_fence()` before `gemmini_mx_read_smem`** (Strategy 9) and ensure B is loaded via `mvin2` while A loads via `mvin` (Strategy 7) to overlap the two DMA streams.
+
+## Specific Code Changes
+
+```c
+void solution(void) {
+
+  gemmini_flush(0);  // Strategy 11: clear stale hardware state
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+
+#ifdef SPIKE_SIM
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+#else
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A,
+                     (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B,
+                     (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
+#endif
+
+  // B tiles: b_base at top of scratchpad, fixed for all I-bands
+  // b_base = 8192 - tiles_K * tiles_J * DIM = 8192 - 16*8*16 = 8192 - 2048 = 6144
+  // A tiles: a_base = 0, occupies tiles_I * tiles_K * DIM = 8*16*16 = 2048 rows
+  // Constraint check: 2048 + 2048 = 4096 <= 8192 ✓
+  // Accumulator: tiles_I * tiles_J * DIM = 8*8*16 = 1024 > 256 rows ✗ — need banding!
+
+  // Accumulator constraint: tiles_I * tiles_J * DIM <= 256
+  // => band_I * tiles_J * DIM <= 256
+  // => band_I <= 256 / (tiles_J * DIM) = 256 / (8 * 16) = 2
+  // So band_I = 2: process 2 I-tiles at a time, each band uses 2*8*16=256 acc rows exactly.
+
+  const int band_I = 2;  // accumulator fits band_I * tiles_J * DIM = 2*8*16 = 256 rows ✓
+  const int num_bands = tiles_I / band_I;  // = 8/2 = 4 bands
+
+  // Scratchpad per band: band_I * tiles_K * DIM = 2*16*16 = 512 rows for A
+  // B: tiles_K * tiles_J * DIM = 16*8*16 = 2048 rows
+  // Total: 512 + 2048 = 2560 <= 8192 ✓ — fits with room to spare
+
+  // ---- MVIN B ONCE (reused across all I-bands) ----
+  // Use mvin2 port for B, mvin port for A (enables overlap)
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j++) {
+      elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+      gemmini_extended_mvin2((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  int SPAD_DEST = 0;
+  gemmini_config_st(DIM * sizeof(elem_t));
+
+  // ---- Process each I-band: load A sub-tiles, compute, drain output ----
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+
+  for (int band = 0; band < num_bands; band++) {
+    int i_start = band * band_I;
+
+    // MVIN A tiles for this band (band_I * tiles_K tiles)
+    for (int i = 0; i < band_I; i++) {
+      int gi = i_start + i;
+      for (int k = 0; k < tiles_K; k++) {
+        elem_t *dram_ptr = ((elem_t*)A_in)
+                           + gi * DIM * MATMUL_K
+                           + k * DIM;
+        uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+        gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
+      }
+    }
+
+    // Configure requantizer for this band's tile counts
+    // i_bound=band_I, j_bound=tiles_J, k_bound=tiles_K
+    // scale_act_sel and scale_w_sel: scales are global, sel=0 for both
+    // We pass the full-matrix scale_factors but the hardware indexes by band
+    // The scale_dram pointer must be offset to the correct row band
+    uint8_t *band_scale_ptr = (uint8_t*)scale_factors
+                              + i_start * tiles_J * sizeof(uint8_t);
+    gemmini_mxquant_config_mvout((uint64_t)band_scale_ptr,
+        band_I, tiles_J, tiles_K, 0, 0, 1);
+
+    // Compute this I-band: A at a_base (band_I*tiles_K tiles),
+    //                       B at b_base (unchanged, full B)
+    gemmini_loop_ws_spad(
+        band_I, tiles_J, tiles_K,
+        0, 0, 0,
+        a_base,
+        BANK_NUM * BANK_ROWS,  // B end address sentinel
+        0,
+        SPAD_DEST,
+        false, false,
+        false, false, false,
+        NO_ACTIVATION,
+        0, 0,
+        false,
+        0x38);
+
+    // Drain this band's BF16 results to the correct DRAM output row
+    int out_offset = i_start * MATMUL_N;  // BF16 element offset in C_hw
+    gemmini_mx_read_smem((uint64_t)(&C_hw[i_start][0]),
+                         SPAD_DEST * 16,
+                         band_I * DIM * MATMUL_N);
+
+    gemmini_fence();
+  }
+}
+```
+
+## Why This Improves Performance
+
+1. **B tiles are loaded exactly once** (2048 rows, 256 DMA commands) and reused across all 4 I-bands. Previously B was inside a single loop_ws_spad which also reloaded it implicitly each band — now the scratchpad residency of B is explicit and permanent across bands.
+
+2. **Accumulator constraint is satisfied**: `band_I=2`, `tiles_J=8`, `DIM=16` → `2×8×16=256` accumulator rows = exactly the full accumulator. The original code with `tiles_I=8` would need `8×8×16=1024` accumulator rows, which **exceeds the 256-row accumulator limit** — meaning the original code was silently overflowing the accumulator. This fix is both a correctness improvement and a performance improvement.
+
+3. **`mvin2` port for B, `mvin` for A** allows the DMA controller to issue A and B loads in parallel across the two ports, reducing total mvin latency.
+
+4. **Fewer `gemmini_fence()` calls** than a naive per-tile approach — one fence per band (4 total) rather than per-tile, deferring synchronization to after the full band compute completes.
+
+5. **`gemmini_flush(0)` at entry** clears stale hardware state, preventing silent mis-execution on back-to-back kernel calls in the test harness.

@@ -1,0 +1,271 @@
+{'correct': False, 'test_results': {0: False}, 'compiled': True}
+Prev latency: 8210
+New latency: N/A
+Plan: ## Analysis of the Current Code
+
+The current code has this structure for loading A tiles:
+
+```c
+gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+for (int i = 0; i < tiles_I; i++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(ptr, a_base + (i*tiles_K + k)*DIM, DIM, DIM);
+```
+
+Each `gemmini_extended_mvin` issues one DMA command loading a single DIM×DIM (16×16) tile = 16 rows. With `MAX_BLOCK_LEN=4`, up to 4 consecutive DIM-row tiles can be batched into a single mvin command. The inner loop over `k` loads `tiles_K` consecutive K-tiles for a fixed `i`, and these tiles are laid out contiguously in the scratchpad at addresses `a_base + (i*tiles_K + k)*DIM` — so the scratchpad addresses are sequential. The DRAM addresses are also sequential when striding along K for fixed `i`.
+
+## Selected Strategy: #14 — Block-mvin batching
+
+**Plan:**
+
+For each fixed `i`, the K-tiles are stored contiguously in both DRAM (sequential columns in a row of A_buf, stride = `MATMUL_K`) and scratchpad (sequential rows at `a_base + i*tiles_K*DIM`). This enables batching up to `MAX_BLOCK_LEN=4` consecutive K-tile mvin commands into a single DMA instruction.
+
+Specifically, instead of:
+```c
+for (int k = 0; k < tiles_K; k++)
+  gemmini_extended_mvin(ptr + k*DIM, spad + k*DIM, DIM, DIM);  // 1 cmd each
+```
+
+We batch groups of up to 4 tiles:
+```c
+for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+  int batch = min(MAX_BLOCK_LEN, tiles_K - k);
+  // gemmini_extended_mvin with rows = batch*DIM loads batch tiles at once
+  gemmini_extended_mvin(ptr + k*DIM, spad + k*DIM, DIM, batch*DIM);
+}
+```
+
+Using `rows = batch*DIM` with `cols = DIM` in `gemmini_extended_mvin` loads `batch` consecutive DIM-row tiles in one command. This applies identically to the B-tile mvin loop.
+
+For this problem: `tiles_K = MATMUL_K/16`. With `MATMUL_K=128`, `tiles_K=8`, and `MAX_BLOCK_LEN=4`, this reduces A-tile mvin commands from `tiles_I * tiles_K` to `tiles_I * (tiles_K/4)` — a 4× reduction. Similarly for B. The total mvin instruction count drops by up to 4×, reducing instruction dispatch overhead and freeing the instruction queue for overlap with compute.
+
+The B-tile mvin loop for fixed `j` also has contiguous K-tiles in both DRAM and scratchpad, so the same batching applies there.
+
+The rest of the kernel (config, scale loads, `gemmini_loop_ws_spad`, `gemmini_mx_read_smem`, fence) remains unchanged.
+
+```c
+void solution(void) {
+  // im2col: patch (pi,pj) -> row pi*PATCHES_X+pj; column c*k*k + dy*k + dx
+  for (int pi = 0; pi < CONV_H / CONV_KSZ; pi++)
+    for (int pj = 0; pj < PATCHES_X; pj++)
+      for (int c = 0; c < CONV_C; c++)
+        for (int dy = 0; dy < CONV_KSZ; dy++)
+          for (int dx = 0; dx < CONV_KSZ; dx++)
+            A_buf[pi * PATCHES_X + pj][c * CONV_KSZ * CONV_KSZ + dy * CONV_KSZ + dx] =
+                X_in[c][pi * CONV_KSZ + dy][pj * CONV_KSZ + dx];
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+
+  // Load A tiles: batch up to MAX_BLOCK_LEN=4 consecutive K-tiles per mvin
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+      int batch = (tiles_K - k < MAX_BLOCK_LEN) ? (tiles_K - k) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)A_buf) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void*)dram_ptr, sp_addr, DIM, batch * DIM);
+    }
+  }
+
+  // Load B tiles: batch up to MAX_BLOCK_LEN=4 consecutive K-tiles per mvin
+  for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+      int batch = (tiles_K - k < MAX_BLOCK_LEN) ? (tiles_K - k) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = b_base + (j * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void*)dram_ptr, sp_addr, DIM, batch * DIM);
+    }
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED baseline MX patch-embed conv kernel (C=2 H=64 k=8 OC=32).
+void solution(void) {
+  // im2col: patch (pi,pj) -> row pi*PATCHES_X+pj; column c*k*k + dy*k + dx
+  for (int pi = 0; pi < CONV_H / CONV_KSZ; pi++)
+    for (int pj = 0; pj < PATCHES_X; pj++)
+      for (int c = 0; c < CONV_C; c++)
+        for (int dy = 0; dy < CONV_KSZ; dy++)
+          for (int dx = 0; dx < CONV_KSZ; dx++)
+            A_buf[pi * PATCHES_X + pj][c * CONV_KSZ * CONV_KSZ + dy * CONV_KSZ + dx] =
+                X_in[c][pi * CONV_KSZ + dy][pj * CONV_KSZ + dx];
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)A_buf) + i * DIM * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+  for (int j = 0; j < tiles_J; j++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+                            b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+''',
+score=8210,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''## Analysis of the Current Code
+
+The current code has this structure for loading A tiles:
+
+```c
+gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+for (int i = 0; i < tiles_I; i++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(ptr, a_base + (i*tiles_K + k)*DIM, DIM, DIM);
+```
+
+Each `gemmini_extended_mvin` issues one DMA command loading a single DIM×DIM (16×16) tile = 16 rows. With `MAX_BLOCK_LEN=4`, up to 4 consecutive DIM-row tiles can be batched into a single mvin command. The inner loop over `k` loads `tiles_K` consecutive K-tiles for a fixed `i`, and these tiles are laid out contiguously in the scratchpad at addresses `a_base + (i*tiles_K + k)*DIM` — so the scratchpad addresses are sequential. The DRAM addresses are also sequential when striding along K for fixed `i`.
+
+## Selected Strategy: #14 — Block-mvin batching
+
+**Plan:**
+
+For each fixed `i`, the K-tiles are stored contiguously in both DRAM (sequential columns in a row of A_buf, stride = `MATMUL_K`) and scratchpad (sequential rows at `a_base + i*tiles_K*DIM`). This enables batching up to `MAX_BLOCK_LEN=4` consecutive K-tile mvin commands into a single DMA instruction.
+
+Specifically, instead of:
+```c
+for (int k = 0; k < tiles_K; k++)
+  gemmini_extended_mvin(ptr + k*DIM, spad + k*DIM, DIM, DIM);  // 1 cmd each
+```
+
+We batch groups of up to 4 tiles:
+```c
+for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+  int batch = min(MAX_BLOCK_LEN, tiles_K - k);
+  // gemmini_extended_mvin with rows = batch*DIM loads batch tiles at once
+  gemmini_extended_mvin(ptr + k*DIM, spad + k*DIM, DIM, batch*DIM);
+}
+```
+
+Using `rows = batch*DIM` with `cols = DIM` in `gemmini_extended_mvin` loads `batch` consecutive DIM-row tiles in one command. This applies identically to the B-tile mvin loop.
+
+For this problem: `tiles_K = MATMUL_K/16`. With `MATMUL_K=128`, `tiles_K=8`, and `MAX_BLOCK_LEN=4`, this reduces A-tile mvin commands from `tiles_I * tiles_K` to `tiles_I * (tiles_K/4)` — a 4× reduction. Similarly for B. The total mvin instruction count drops by up to 4×, reducing instruction dispatch overhead and freeing the instruction queue for overlap with compute.
+
+The B-tile mvin loop for fixed `j` also has contiguous K-tiles in both DRAM and scratchpad, so the same batching applies there.
+
+The rest of the kernel (config, scale loads, `gemmini_loop_ws_spad`, `gemmini_mx_read_smem`, fence) remains unchanged.
+
+```c
+void solution(void) {
+  // im2col: patch (pi,pj) -> row pi*PATCHES_X+pj; column c*k*k + dy*k + dx
+  for (int pi = 0; pi < CONV_H / CONV_KSZ; pi++)
+    for (int pj = 0; pj < PATCHES_X; pj++)
+      for (int c = 0; c < CONV_C; c++)
+        for (int dy = 0; dy < CONV_KSZ; dy++)
+          for (int dx = 0; dx < CONV_KSZ; dx++)
+            A_buf[pi * PATCHES_X + pj][c * CONV_KSZ * CONV_KSZ + dy * CONV_KSZ + dx] =
+                X_in[c][pi * CONV_KSZ + dy][pj * CONV_KSZ + dx];
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+
+  // Load A tiles: batch up to MAX_BLOCK_LEN=4 consecutive K-tiles per mvin
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+      int batch = (tiles_K - k < MAX_BLOCK_LEN) ? (tiles_K - k) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)A_buf) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void*)dram_ptr, sp_addr, DIM, batch * DIM);
+    }
+  }
+
+  // Load B tiles: batch up to MAX_BLOCK_LEN=4 consecutive K-tiles per mvin
+  for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+      int batch = (tiles_K - k < MAX_BLOCK_LEN) ? (tiles_K - k) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = b_base + (j * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void*)dram_ptr, sp_addr, DIM, batch * DIM);
+    }
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```''',
+code='''void solution(void) {
+  // im2col: patch (pi,pj) -> row pi*PATCHES_X+pj; column c*k*k + dy*k + dx
+  for (int pi = 0; pi < CONV_H / CONV_KSZ; pi++)
+    for (int pj = 0; pj < PATCHES_X; pj++)
+      for (int c = 0; c < CONV_C; c++)
+        for (int dy = 0; dy < CONV_KSZ; dy++)
+          for (int dx = 0; dx < CONV_KSZ; dx++)
+            A_buf[pi * PATCHES_X + pj][c * CONV_KSZ * CONV_KSZ + dy * CONV_KSZ + dx] =
+                X_in[c][pi * CONV_KSZ + dy][pj * CONV_KSZ + dx];
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+
+  // Load A tiles: batch up to MAX_BLOCK_LEN=4 consecutive K-tiles per mvin
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+      int batch = (tiles_K - k < MAX_BLOCK_LEN) ? (tiles_K - k) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)A_buf) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void*)dram_ptr, sp_addr, DIM, batch * DIM);
+    }
+  }
+
+  // Load B tiles: batch up to MAX_BLOCK_LEN=4 consecutive K-tiles per mvin
+  for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+      int batch = (tiles_K - k < MAX_BLOCK_LEN) ? (tiles_K - k) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = b_base + (j * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void*)dram_ptr, sp_addr, DIM, batch * DIM);
+    }
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+''',
+score=None,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='us.anthropic.claude-sonnet-4-6',
+code_gen_model='us.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None)

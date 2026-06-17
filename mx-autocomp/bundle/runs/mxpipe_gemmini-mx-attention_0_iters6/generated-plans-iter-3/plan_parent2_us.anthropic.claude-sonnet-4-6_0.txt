@@ -1,0 +1,193 @@
+# Strategy: Overlap Softmax Computation with Gemmini P@V Setup
+
+## Analysis of the Current Code
+
+Looking at the current execution timeline:
+
+```
+Phase 1: Q@KT matmul (gemmini compute)
+Phase 2: gemmini_mx_read_smem + gemmini_fence()  ← blocks until DMA done
+Phase 3: Softmax loop (pure scalar CPU, sequential)
+Phase 4: P@V matmul setup: flush, config_ex, load_scales, mvin A, mvin B
+Phase 5: P@V matmul (gemmini compute)
+Phase 6: gemmini_mx_read_smem + gemmini_fence()
+```
+
+The critical observation is that **Phase 3 (softmax) and Phase 4 (P@V setup) are currently fully sequential**, even though many of Phase 4's operations don't depend on the softmax output:
+
+- `gemmini_flush(0)` — no dependency on softmax
+- `gemmini_extended3_config_ex(...)` — no dependency on softmax
+- `gemmini_mx_load_scales(...V_scales_col...)` — V's scale factors exist before softmax
+- `gemmini_config_ld(...)` and all **B-side (V matrix) mvin tiles** — V is read-only input, independent of P
+- `gemmini_mxquant_config_mvout(...)` — configuration only
+
+Only the **A-side (P matrix) mvin tiles** depend on softmax completing.
+
+## The New Strategy: Hoist Gemmini P@V Setup Before the Softmax Loop
+
+**Move all Gemmini P@V instructions that are independent of `P_q[][]` to execute before the softmax loop.** Specifically:
+
+1. After `gemmini_fence()` in Phase 1, immediately issue:
+   - `gemmini_flush(0)`
+   - `gemmini_extended3_config_ex(...)` for P@V
+   - `gemmini_mx_load_scales` for B (V scales) — `V_scales_col` is static
+   - `gemmini_config_ld(ATT_D * sizeof(elem_t))` + all **B-side (V) mvin tiles** into the scratchpad
+   
+2. Then run the softmax scalar loop (Phase 3), which writes `P_q` and `P_scales`
+
+3. After the softmax loop:
+   - `gemmini_mx_load_scales` for A (P scales, now ready)
+   - `gemmini_config_ld(ATT_S * sizeof(elem_t))` + all **A-side (P) mvin tiles** into the scratchpad
+   - `gemmini_mxquant_config_mvout(...)`
+   - `gemmini_loop_ws_spad(...)`
+   - `gemmini_mx_read_smem(...)` + `gemmini_fence()`
+
+## Why This Improves Performance
+
+### Overlap of Scalar Work with DMA/Configuration
+
+The Gemmini RoCC command queue is deep and the host CPU can issue instructions without stalling as long as the queue isn't full. By issuing the V-matrix mvin commands **before** the softmax loop:
+
+- The **DMA loading of V tiles** (tiles_K × tiles_J = 8×4 = 32 tiles) executes in parallel with the scalar softmax computation
+- The softmax loop processes `ATT_S=128` rows with 128 unpacks + iexp + fp8-encode per row — substantial scalar work
+- During this time, Gemmini independently feeds V tiles from DRAM into the scratchpad
+
+### Quantitative Overlap
+
+- V matrix size: ATT_S × ATT_D = 128×64 = 8192 bytes → 32 tile mvins at 2 tiles/command = 16 mvin commands
+- Softmax: 128 rows × (128 unpack + 128 iexp + 128 encode) ≈ thousands of scalar instructions
+- Previously: V mvin was fully serialized after softmax; now it runs concurrently
+
+### Correctness Preserved
+
+- V tiles are loaded to `b_base` which is in the **top** of scratchpad — no overlap with A tiles at `a_base = 0`
+- `gemmini_mx_load_scales` for A (P scales) is still issued **after** the softmax loop writes `P_scales`, respecting data dependency
+- The programming model sequence is maintained: config_ex → load_scales(B) → [mvin B] → load_scales(A) → [mvin A] → mxquant_config → loop_ws_spad. Note that load_scales(A) and mvin A are issued after softmax, but config_ex and load_scales(B) are hoisted; this is valid because scale memory sel=0 (A) and sel=1 (B) are independent buffers, and sel=1 is loaded with correct data before compute begins
+- `mx_loop_spad_marker` (funct 24) is still part of `gemmini_loop_ws_spad` macro and issued immediately before funct 8 — no statefulness issue
+
+## Concrete Code Changes
+
+```c
+void solution(void) {
+  // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&Q_scales_row, sizeof(Q_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&KT_scales_col, sizeof(KT_scales_col), 1);
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) {
+        int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+      }
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) {
+        int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)KT_in) + k * DIM * ATT_S + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+      }
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+    gemmini_fence();
+  }
+
+  // ---- 2a) Hoist P@V Gemmini setup that doesn't depend on softmax output ----
+  // V tiles and config are independent of P_q/P_scales; issue them now so
+  // the Gemmini DMA loads V while the CPU runs softmax below.
+  {
+    int tiles_I_pv = ATT_S / DIM, tiles_J_pv = ATT_D / DIM, tiles_K_pv = ATT_S / DIM;
+    uint32_t a_base_pv = 0;
+    uint32_t b_base_pv = BANK_NUM * BANK_ROWS - tiles_K_pv * tiles_J_pv * DIM;
+
+    // Config: same format as P@V matmul
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+    // Load B (V) scales now — V_scales_col is static, no softmax dependency
+    gemmini_mx_load_scales((uint64_t)&V_scales_col, sizeof(V_scales_col), 1);
+
+    // Mvin all V (B) tiles into scratchpad — overlaps with scalar softmax below
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int k = 0; k < tiles_K_pv; k++)
+      for (int j = 0; j < tiles_J_pv; j += 2) {
+        int bb = (tiles_J_pv - j < 2) ? (tiles_J_pv - j) : 2;
+        gemmini_extended_mvin2((void*)(((elem_t*)V_in) + k * DIM * ATT_D + j * DIM),
+                               b_base_pv + (k * tiles_J_pv + j) * DIM, bb * DIM, DIM);
+      }
+    // NOTE: A (P) scales and A mvin will follow after softmax writes P_q/P_scales.
+    // The programming model requires load_scales(A) before loop_ws_spad;
+    // we defer that until P_scales is valid.
+
+    // ---- 2b) FLOAT-FREE softmax (CPU scalar, overlaps with V mvin above) ----
+    for (int i = 0; i < ATT_S; i++) {
+      int64_t q[ATT_S];
+      int64_t mq = -((int64_t)1 << 62);
+      for (int j = 0; j < ATT_S; j += 4) {
+        uint64_t w = S1_hw[i][j / 4];
+        for (int l = 0; l < 4; l++) {
+          int64_t qq = mx_ibf16_to_q((uint16_t)((w >> (l * 16)) & 0xFFFF));
+          q[j + l] = qq; if (qq > mq) mq = qq;
+        }
+      }
+      int64_t p[ATT_S];
+      int64_t sm = 0;
+      for (int j = 0; j < ATT_S; j++) { int64_t pv = mx_iexp(q[j] - mq); p[j] = pv; sm += pv; }
+      int ls = mx_ilog2((uint64_t)sm);
+      uint64_t inv_sm = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;
+      for (int g = 0; g < GROUPS_S; g++) {
+        int64_t gmax = 0;
+        for (int j = g * 32; j < (g + 1) * 32; j++) if (p[j] > gmax) gmax = p[j];
+        if (gmax == 0) {
+          P_scales[g][i] = 0;
+          for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = 0;
+          continue;
+        }
+        int e = mx_ilog2((uint64_t)gmax) - ls - MX_P_TARGET_LOG2;
+        P_scales[g][i] = (uint8_t)(e + 127);
+        for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = mx_ienc_fp8(p[j], inv_sm, ls, e);
+      }
+    }
+
+    // ---- 2c) Now P_q and P_scales are ready; load A scales and mvin A tiles ----
+    // Load A (P) scales — must come after softmax writes P_scales
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+
+    // Mvin all P (A) tiles into scratchpad
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int i = 0; i < tiles_I_pv; i++)
+      for (int k = 0; k < tiles_K_pv; k += 2) {
+        int bb = (tiles_K_pv - k < 2) ? (tiles_K_pv - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),
+                              a_base_pv + (i * tiles_K_pv + k) * DIM, bb * DIM, DIM);
+      }
+
+    // ---- 3) O = P @ V on Gemmini (bf16 out) ----
+    gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I_pv, tiles_J_pv, tiles_K_pv, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I_pv, tiles_J_pv, tiles_K_pv, 0, 0, 0,
+                         a_base_pv, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+    gemmini_fence();
+  }
+}
+```
+
+## Summary of the Strategy
+
+| Before | After |
+|--------|-------|
+| Softmax runs, then V mvin starts | V mvin starts immediately after Q@KT fence |
+| ~32 V-tile mvin commands serialized after softmax | ~32 V-tile mvin commands overlap with softmax scalar work |
+| Total: softmax_time + V_mvin_time | Total: max(softmax_time, V_mvin_time) |
+
+The key insight is that **the V matrix is a read-only weight input** — its scale factors and data tiles are fully known before softmax executes. By reordering these independent Gemmini DMA commands to precede the softmax loop, the memory bandwidth for loading V is consumed in parallel with CPU scalar execution, effectively hiding a significant fraction of the V-matrix load latency behind the softmax computation.

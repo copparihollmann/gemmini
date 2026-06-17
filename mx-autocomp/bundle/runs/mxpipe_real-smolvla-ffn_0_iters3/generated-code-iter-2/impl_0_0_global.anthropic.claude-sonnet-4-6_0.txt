@@ -1,0 +1,126 @@
+// AUTO-GENERATED outer-tiled MX matmul baseline (50x256x512).
+// Optimization: double-buffered scale staging to overlap host memcpy with accelerator mvin.
+void solution(void) {
+  // Double buffers for scale staging (indexed by cur/nxt)
+  // Each buffer holds GK groups of BLK scale bytes for A and B.
+  static uint8_t A_s_buf[2][MATMUL_K / 32][BLK];
+  static uint8_t B_s_buf[2][MATMUL_K / 32][BLK];
+
+  int cur = 0, nxt = 1;
+
+  // --- PROLOG: stage scales for the very first block (i0=0, j0=0) ---
+  // Only do this if there is at least one valid block to process.
+  if (BLOCKS_M > 0 && BLOCKS_N > 0) {
+    for (int g = 0; g < MATMUL_K / 32; g++) {
+      memcpy(A_s_buf[cur][g], &A_scales_row[g][0 * BLK], BLK);
+      memcpy(B_s_buf[cur][g], &B_scales_col[g][0 * BLK], BLK);
+    }
+  }
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Partial last M/N block: compute only the real rows/cols, pad the rest.
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK;
+      if (ncols > BLK) ncols = BLK;
+      if (ncols <= 0) continue;
+
+      int tiles   = BLK / DIM;
+      int tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST   = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      // PROF accel
+      gemmini_flush(0);
+
+      // Step 1: Configure execution (must precede scale loads).
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                  1, 1, 0, 0, false,
+                                  /*act_mx_fmt*/0, /*wgt_mx_fmt*/0,
+                                  /*out_mx_fmt*/3, /*uselut*/0);
+
+      // Step 2: Load scale factors for CURRENT block (already staged in cur buffer).
+      gemmini_mx_load_scales((uint64_t)A_s_buf[cur], A_S_BYTES, 0); // sel=0 → A scales
+      gemmini_mx_load_scales((uint64_t)B_s_buf[cur], B_S_BYTES, 1); // sel=1 → B scales
+
+      // --- Prefetch: compute NEXT block index and stage its scales into nxt buffer.
+      //     This CPU-side memcpy runs while the accelerator processes the mvin
+      //     commands issued below, hiding the staging latency. ---
+      int j0_next = j0 + 1, i0_next = i0;
+      if (j0_next >= BLOCKS_N) {
+        j0_next = 0;
+        i0_next = i0 + 1;
+      }
+      if (i0_next < BLOCKS_M) {
+        // Clamp j0_next to a valid column block for the purposes of staging.
+        int j0_nxt_clamped = (j0_next < BLOCKS_N) ? j0_next : 0;
+        for (int g = 0; g < MATMUL_K / 32; g++) {
+          memcpy(A_s_buf[nxt][g], &A_scales_row[g][i0_next * BLK], BLK);
+          memcpy(B_s_buf[nxt][g], &B_scales_col[g][j0_nxt_clamped * BLK], BLK);
+        }
+      }
+
+      // Step 3 (no LUT needed for fp8, uselut=0): skip gemmini_mx_load_lut.
+
+      // Step 4: MVIN tiles of A into the scratchpad.
+      // A rows: stride = MATMUL_K bytes (one full row of A).
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin(
+              (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+              a_base + (i * tiles_K + k) * DIM,
+              DIM, DIM);
+
+      // MVIN tiles of B into the scratchpad.
+      // B rows: stride = MATMUL_N bytes (one full row of B).
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int j = 0; j < tiles; j++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin2(
+              (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+              b_base + (k * tiles + j) * DIM,
+              DIM, DIM);
+
+      // Step 5: Configure requantized mvout.
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                   /*i_bound*/tiles, /*j_bound*/tiles,
+                                   /*k_bound*/tiles_K,
+                                   /*scale_act_sel*/0, /*scale_w_sel*/0,
+                                   /*lut_update_granularity*/1);
+
+      // Step 6: Compute the weight-stationary tiled matmul.
+      // gemmini_loop_ws_spad internally issues funct 24 (LOOP_WS_CONFIG_SPAD_AB)
+      // before funct 8 (LOOP_WS), satisfying the one-shot marker requirement.
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K,
+                           pad_i, pad_j, 0,
+                           a_base, BANK_NUM * BANK_ROWS,
+                           0, SPAD_DEST,
+                           false, false,
+                           false, false, false,
+                           NO_ACTIVATION, 0, 0,
+                           false, 0x38);
+
+      // Step 7: Drain BF16-packed results from mx_smem to DRAM, row by row.
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(
+            &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+            SPAD_DEST * 16 + r * BLK,
+            ncols);
+
+      // Full memory barrier: must complete before host reads output.
+      gemmini_fence();
+
+      // Swap cur <-> nxt for the next iteration so the prefetched
+      // scales become the "current" scales without any extra copy.
+      int tmp = cur;
+      cur = nxt;
+      nxt = tmp;
+    }
+  }
+}

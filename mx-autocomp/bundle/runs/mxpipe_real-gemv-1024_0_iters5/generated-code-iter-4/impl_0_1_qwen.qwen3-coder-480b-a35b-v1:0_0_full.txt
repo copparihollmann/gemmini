@@ -1,0 +1,79 @@
+Looking at the optimization requirements and the provided reference implementation, I'll create an optimized version that eliminates CPU-side loops and staging overhead while maintaining correctness.
+
+```c
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+#include "include/matmul_fp8_64x64.h"
+
+#define DIM 16
+#define BF16_PER_WORD 4
+
+typedef uint8_t  elem_t;   // fp8:e4m3 input elements
+typedef uint64_t out_t;    // 4x bf16 packed per word
+
+// Optimized MX matmul avoiding CPU-side loops and staging overhead
+void solution(void) {
+  int tiles_I = MATMUL_M / DIM;  // 64/16 = 4
+  int tiles_J = MATMUL_N / DIM;  // 64/16 = 4
+  int tiles_K = MATMUL_K / DIM;  // 64/16 = 4
+
+  uint32_t a_base = 0;
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;  // 4*4*16 = 256 rows from top
+  int SPAD_DEST = 128;
+  int OUT_COLS = MATMUL_N / BF16_PER_WORD;  // 64/4 = 16
+
+  // 1. Flush and configure execution format for FP8 MX weight-stationary mode
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 
+                              1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // 2. Load scale factors directly from source DRAM arrays
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);  // A/activation scales
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);  // B/weight scales
+
+  // 3. MVIN A tiles directly from strided source DRAM
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));  // Stride: 64 bytes
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;  // Row-major: i*64*64 + k*16
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;  // a_base + (i*4 + k)*16
+      gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  // 4. MVIN B tiles directly from strided source DRAM
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));  // Stride: 64 bytes
+  for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;  // B is KxN, so k*64*64 + j*16
+      uint32_t sp_addr = b_base + (j * tiles_K + k) * DIM;  // b_base + (j*4 + k)*16
+      gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  // 5. Configure store and requantizer parameters for the whole block
+  gemmini_config_st(OUT_COLS * sizeof(out_t));  // Stride: 16 * 8 = 128 bytes
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // 6. Compute the monolithic fused weight-stationary loop
+  gemmini_loop_ws_spad(
+    tiles_I, tiles_J, tiles_K,     // 4, 4, 4
+    0, 0, 0,                       // No padding
+    a_base,                        // A base address
+    BANK_NUM * BANK_ROWS,          // B end address (8192)
+    0,                            // D address (bias)
+    SPAD_DEST,                    // C destination address
+    false, false,                 // No transposes
+    false, false, false,          // full_C, low_D, ex_accumulate
+    NO_ACTIVATION,                // No activation
+    0, 0,                         // a_spad_id, b_spad_id
+    false,                        // is_resadd
+    0x38);                        // Skip mask
+
+  // 7. Drain output results from MX shared memory to DRAM and synchronize
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);  // 128*16, 64*64
+  gemmini_fence();
+}
+```

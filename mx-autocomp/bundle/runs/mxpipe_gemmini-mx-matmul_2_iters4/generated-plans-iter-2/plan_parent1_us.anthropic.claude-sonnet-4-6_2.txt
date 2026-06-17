@@ -1,0 +1,81 @@
+## Analysis of the Original Code
+
+Looking at the original code, I need to identify the key inefficiency to target:
+
+```c
+gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+for (int i = 0; i < tiles_I; i++)
+    for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin(...A tiles...);
+for (int j = 0; j < tiles_J; j++)
+    for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin(...B tiles...);
+```
+
+**Critical Issue:** Both A and B tiles are loaded with the **same** `gemmini_config_ld(MATMUL_K * sizeof(elem_t))` stride. This is **strategy 10**: A and B have different DRAM layouts in general, but more importantly, a single `config_ld` is reused for both. Looking at the reference pattern (`matmul_tiled_fp6_128x128.c`), A and B have separate stride configurations:
+- A stride = `MATMUL_K` bytes (full row width)
+- B stride = `MATMUL_K` bytes (same in fp8 case, but separate calls are issued)
+
+However, examining more carefully: **strategy 11** — the B mvin loop is `j-outer, k-inner`, which causes non-sequential DRAM access. In the B matrix (layout `[MATMUL_K][MATMUL_N]` row-major), iterating `j` in the outer loop and `k` in the inner loop means for each `j`, we scan through all K rows — but each K-row has `MATMUL_N` elements wide, and picking column tile `j` means strided access across K. Swapping to `k-outer, j-inner` would read each K-row sequentially across all J tiles before moving to the next K-row, giving better sequential DRAM access patterns.
+
+## Selected Strategy: Strategy 11
+
+**Swap the B mvin loop order to k-outer, j-inner** to match DRAM row-major layout.
+
+The B matrix in DRAM is laid out as `B_in[MATMUL_K][MATMUL_N]` (K rows, each row has MATMUL_N elements). With `j-outer, k-inner`:
+- For j=0: accesses rows k=0,1,...,tiles_K-1 at column offset 0
+- For j=1: accesses rows k=0,1,...,tiles_K-1 at column offset DIM
+
+This causes the DMA to jump back to row 0 every time j increments, thrashing prefetch/cache lines.
+
+With `k-outer, j-inner`:
+- For k=0: accesses row 0 at columns j=0, DIM, 2*DIM, ... (sequential within the row)
+- For k=1: accesses row 1 at columns j=0, DIM, 2*DIM, ...
+
+This reads DRAM sequentially within each K-row before advancing to the next K-row, maximizing cache-line utilization.
+
+The scratchpad address `b_base + (j*tiles_K + k)*DIM` remains **identical** — loop reordering does not change which address each `(j,k)` tile lands at, only the order of issue. Correctness is fully preserved.
+
+## Plan
+
+Change the B-tile mvin loop from:
+```c
+for (int j = 0; j < tiles_J; j++)
+    for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin(B_in + k * MATMUL_N + j * DIM, b_base + (j*tiles_K + k)*DIM, ...)
+```
+to:
+```c
+for (int k = 0; k < tiles_K; k++)
+    for (int j = 0; j < tiles_J; j++)
+        gemmini_extended_mvin(B_in + k * MATMUL_N + j * DIM, b_base + (j*tiles_K + k)*DIM, ...)
+```
+
+This keeps all other code unchanged. Here is the rewritten solution:
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+  // Swapped to k-outer, j-inner to match DRAM row-major layout of B_in[MATMUL_K][MATMUL_N]
+  for (int k = 0; k < tiles_K; k++)
+    for (int j = 0; j < tiles_J; j++)
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + k * DIM * MATMUL_K + j * DIM),
+                            b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, tiles_I * tiles_J);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```

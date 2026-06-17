@@ -1,0 +1,51 @@
+## Analysis of the Current Code
+
+The current code issues `gemmini_mx_read_smem` in a per-row loop:
+```c
+for (int r = 0; r < mrows; r++)
+    gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                         SPAD_DEST * 16 + r * BLK, ncols);
+```
+This issues `mrows` (up to `BLK/DIM * DIM = BLK`) separate RoCC commands. For a full block (`ncols == BLK`), these reads are consecutive in both smem (stride = BLK) and DRAM (row-major, stride = `MATMUL_N/BF16_PER_WORD` elements). Strategy 3 targets this directly.
+
+## Selected Strategy: Strategy 3
+
+**Consolidate `gemmini_mx_read_smem` per-row calls into a single call when `ncols == BLK`.**
+
+## Plan
+
+### Observation
+
+When `ncols == BLK` (i.e., the output block is full-width, not a partial last column block), the `mrows` rows of smem output are contiguous BF16 values: smem offset `SPAD_DEST*16` through `SPAD_DEST*16 + mrows*BLK - 1`, totaling `mrows * BLK` BF16 elements. The DRAM destination `C_hw[i0*BLK][j0*BLK / BF16_PER_WORD]` is also the start of a contiguous row-major block because each row of `C_hw` has `MATMUL_N / BF16_PER_WORD` words and the `j0*BLK` offset lands at a word-aligned boundary, and consecutive smem rows map to consecutive DRAM rows only when the DRAM row stride equals `BLK` BF16 elements — which is exactly the case when `ncols == BLK` and `C_hw` is stored row-major with row width `MATMUL_N`.
+
+However, when `ncols < BLK` (partial last column block), each row's output is only `ncols` elements wide but smem rows are still `BLK` wide, so a single flat read would include padding garbage between rows. In that case, the per-row loop must be kept.
+
+### Change
+
+Replace the per-row loop with a branch:
+
+- **If `ncols == BLK`**: issue a single `gemmini_mx_read_smem` call with `num_bf16 = mrows * BLK`, starting at smem offset `SPAD_DEST * 16` and DRAM address `&C_hw[i0*BLK + 0][(j0*BLK) / BF16_PER_WORD]`. This reduces RoCC command count from `mrows` to 1.
+
+- **If `ncols < BLK`** (partial column block): keep the existing per-row loop unchanged, since smem rows are `BLK` wide but only `ncols` elements are valid per row.
+
+The `gemmini_fence()` remains after all smem reads, unchanged.
+
+### Concrete Code Change
+
+```c
+      // Accelerator-centric readout
+      if (ncols == BLK) {
+          // Full-width block: all mrows*BLK BF16 values are contiguous in smem
+          // and map directly to contiguous DRAM rows → single RoCC command
+          gemmini_mx_read_smem(&C_hw[i0 * BLK + 0][(j0 * BLK) / BF16_PER_WORD],
+                               SPAD_DEST * 16, mrows * BLK);
+      } else {
+          // Partial last-column block: per-row reads to skip smem padding
+          for (int r = 0; r < mrows; r++)
+              gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                                   SPAD_DEST * 16 + r * BLK, ncols);
+      }
+      gemmini_fence();
+```
+
+This is correct because: (1) smem stores output row-major with row stride `BLK`, (2) `C_hw` rows are contiguous in memory with stride `MATMUL_N / BF16_PER_WORD` words = `MATMUL_N` BF16 elements, and when `ncols == BLK` these two strides match exactly, making the entire `mrows × BLK` block a single flat contiguous transfer. The programming model order is unchanged; only the drain phase is consolidated.

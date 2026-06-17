@@ -1,0 +1,142 @@
+void solution(void) {
+  const int tiles_I_full = MATMUL_M / DIM;
+  const int tiles_J_full = MATMUL_N / DIM;
+  const int tiles_K      = MATMUL_K / DIM;
+  const int GK           = MATMUL_K / 32; // blocks along K
+
+  // Build scale arrays in the layout the hardware expects:
+  // mx_scale_a_mem: indexed as [tile_i][gk] -> one byte per (row-tile, K-block)
+  // mx_scale_b_mem: indexed as [tile_j][gk] -> one byte per (col-tile, K-block)
+  // We load the full matrices' scales once and let the hardware index them.
+  // The hardware uses: scale_dram + m * N_blocks + bi
+  // where m = output row index, N_blocks = tiles_J * GK, bi = j*GK + gk
+  // But for mx_load_scales we just stream the raw bytes into the scale memories.
+
+  // A scales: original layout A_scales_row[GK][MATMUL_M]
+  // We need [tiles_I][GK] per-16-row-group, so transpose to [MATMUL_M/DIM][GK]
+  // Each DIM rows share one scale entry per K-block (since block size=32 along K,
+  // and DIM=16, each tile row has 2 GK entries if K=64, etc.)
+  // Actually: one scale per 32 elements along K, one scale per row of A.
+  // A_scales_row[gk][m] = scale for row m, K-block gk.
+  // Hardware loads linearly, so we provide them row-by-row for the tile block.
+
+  static uint8_t A_scales_blk[MATMUL_M][MATMUL_K / 32];
+  static uint8_t B_scales_blk[MATMUL_N][MATMUL_K / 32];
+
+  // Transpose A_scales_row[GK][M] -> A_scales_blk[M][GK]
+  for (int gk = 0; gk < GK; gk++)
+    for (int m = 0; m < MATMUL_M; m++)
+      A_scales_blk[m][gk] = A_scales_row[gk][m];
+
+  // Transpose B_scales_col[GK][N] -> B_scales_blk[N][GK]
+  for (int gk = 0; gk < GK; gk++)
+    for (int n = 0; n < MATMUL_N; n++)
+      B_scales_blk[n][gk] = B_scales_col[gk][n];
+
+  // Tile dimensions for a single BLK x BLK block
+  const int tiles_per_blk = BLK / DIM;
+
+  // B spad base: top of scratchpad, enough room for tiles_per_blk * tiles_K tiles
+  const uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_per_blk * tiles_K * DIM;
+  const uint32_t a_base = 0;
+  const int SPAD_DEST   = 0; // output destination word offset in mx_smem
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                               /*C_stride*/1, /*A_stride*/1,
+                               /*A_transpose*/0, /*B_transpose*/0,
+                               /*set_only_strides*/false,
+                               /*act_mx_fmt*/0, /*wgt_mx_fmt*/0,
+                               /*out_mx_fmt*/3, /*uselut*/0);
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+
+      int ncols = REAL_N - j0 * BLK;
+      if (ncols > BLK) ncols = BLK;
+      if (ncols <= 0) continue;
+
+      int pad_i = BLK - mrows;
+      int pad_j = BLK - ncols;
+
+      // Load A scales for this block: rows [i0*BLK .. i0*BLK+BLK-1], all GK groups
+      // A_scales_blk[m][gk], contiguous for m in [i0*BLK, i0*BLK+BLK)
+      gemmini_mx_load_scales(
+          (uint64_t)&A_scales_blk[i0 * BLK][0],
+          BLK * GK,   // bytes: BLK rows * GK k-blocks
+          0);         // sel=0 -> A (activation) scales
+
+      // Load B scales for this block: cols [j0*BLK .. j0*BLK+BLK-1], all GK groups
+      gemmini_mx_load_scales(
+          (uint64_t)&B_scales_blk[j0 * BLK][0],
+          BLK * GK,   // bytes: BLK cols * GK k-blocks
+          1);         // sel=1 -> B (weight) scales
+
+      // MVIN A tiles: A is [MATMUL_M][MATMUL_K], row-major, stride = MATMUL_K bytes
+      gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+      for (int i = 0; i < tiles_per_blk; i++) {
+        for (int k = 0; k < tiles_K; k++) {
+          const elem_t *a_ptr = (const elem_t *)A_in
+              + (i0 * BLK + i * DIM) * MATMUL_K
+              + k * DIM;
+          gemmini_extended_mvin(
+              (void *)a_ptr,
+              a_base + (i * tiles_K + k) * DIM,
+              DIM, DIM);
+        }
+      }
+
+      // MVIN B tiles: B is [MATMUL_K][MATMUL_N], row-major, stride = MATMUL_N bytes
+      gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+      for (int j = 0; j < tiles_per_blk; j++) {
+        for (int k = 0; k < tiles_K; k++) {
+          const elem_t *b_ptr = (const elem_t *)B_in
+              + (k * DIM) * MATMUL_N
+              + (j0 * BLK + j * DIM);
+          gemmini_extended_mvin2(
+              (void *)b_ptr,
+              b_base + (j * tiles_K + k) * DIM,
+              DIM, DIM);
+        }
+      }
+
+      // Configure output stride and requantizer
+      gemmini_extended_config_st(BLK * sizeof(out_t), 0, ACC_SCALE_IDENTITY);
+      gemmini_mxquant_config_mvout(
+          (uint64_t)scale_factors,
+          tiles_per_blk,   // i_bound = tiles_I for this block
+          tiles_per_blk,   // j_bound = tiles_J for this block
+          tiles_K,         // k_bound
+          0,               // scale_act_sel: use mx_scale_a_mem
+          0,               // scale_w_sel:   use mx_scale_b_mem
+          1);              // lut_update_granularity
+
+      // Fused tiled matmul - funct 24 marker re-issued inside macro
+      gemmini_loop_ws_spad(
+          tiles_per_blk, tiles_per_blk, tiles_K,
+          pad_i, pad_j, 0,
+          a_base,
+          BANK_NUM * BANK_ROWS, // B end address (top of scratchpad)
+          0,                    // D (no bias)
+          SPAD_DEST,
+          false, false,         // A_transpose, B_transpose
+          false, false, false,  // full_C, low_D, ex_accumulate
+          NO_ACTIVATION,
+          0, 0,                 // a_spad_id, b_spad_id
+          false,                // is_resadd
+          0x38);                // skips
+
+      // Drain results: BF16 packed, 4 per uint64 word
+      // smem layout: SPAD_DEST*16 is the word offset; BLK rows x BLK cols BF16 values
+      for (int r = 0; r < mrows; r++) {
+        gemmini_mx_read_smem(
+            (void *)&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+            SPAD_DEST * 16 + r * BLK,
+            ncols);
+      }
+      gemmini_fence();
+    }
+  }
+}

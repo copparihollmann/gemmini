@@ -1,0 +1,171 @@
+Looking at the error message, the issue is with the MVIN operations where `cols=64` overflows the 6-bit hardware field. The maximum allowed is `cols <= 63`. Since `DIM=16`, the maximum block batch is 3 (3*16=48), not 4 (4*16=64).
+
+Let me fix the code by reducing the block batch size from 4 to 3:
+
+```c
+// Optimized MHA kernel (S=64, D=64, H=4, H_kv=2, causal=0, fp8:e4m3).
+void solution(void) {
+  // ---- 1) Global RoCC Configuration Hoisting ----
+  gemmini_flush(0);
+  
+  // Configure execution state (format: fp8, weight-stationary)
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  
+  int tiles_I = ATT_S / DIM; // 4
+  int tiles_J = ATT_S / DIM; // 4
+  int tiles_K = ATT_D / DIM; // 4
+  uint32_t a_base = 0;
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM; // 8192 - 256 = 7936
+
+  for (int h = 0; h < ATT_H; h++) {
+    int kv = h / (ATT_H / ATT_HKV);
+    const elem_t *Q_in = Qs[h];  const uint8_t *Q_sc = Qss[h];
+    const elem_t *KT_in = KTs[kv]; const uint8_t *KT_sc = KTss[kv];
+    const elem_t *V_in = Vs[kv];  const uint8_t *V_sc = Vss[kv];
+
+    // ---- 2) S1 = Q @ K^T on Gemmini (bf16 out) ----
+    {
+      gemmini_mx_load_scales((uint64_t)Q_sc, QSS_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)KT_sc, QSS_BYTES, 1);
+      
+      // Configure memory load stride for Q (64 bytes)
+      gemmini_config_ld(ATT_D * sizeof(elem_t));
+
+      // Max-Length DMA Block-Tiling for Q (bb = 3 to avoid overflow)
+      for (int i = 0; i < tiles_I; i++) {
+        gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D),
+                              a_base + (i * tiles_K) * DIM, 3 * DIM, DIM);
+      }
+
+      // Configure memory load stride for KT (64 bytes) 
+      gemmini_config_ld(ATT_S * sizeof(elem_t));
+
+      // Max-Length DMA Block-Tiling for KT (bb = 3 to avoid overflow)
+      for (int k = 0; k < tiles_K; k++) {
+        gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S),
+                              b_base + (k * tiles_J) * DIM, 3 * DIM, DIM);
+      }
+
+      // Configure memory store stride
+      gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+      gemmini_fence();
+    }
+
+    // ---- 3) FLOAT-FREE integer softmax + fp8 requant ----
+    for (int i = 0; i < ATT_S; i++) {
+      int64_t q[ATT_S];
+      int64_t mq = -((int64_t)1 << 62);
+      
+      // Fully unrolled 4-element unpacking of bf16 values from 64-bit words
+      for (int j = 0; j < ATT_S; j += 4) {
+        uint64_t w = S1_hw[i][j >> 2];
+        int64_t qq0 = mx_ibf16_to_q((uint16_t)(w));
+        int64_t qq1 = mx_ibf16_to_q((uint16_t)(w >> 16));
+        int64_t qq2 = mx_ibf16_to_q((uint16_t)(w >> 32));
+        int64_t qq3 = mx_ibf16_to_q((uint16_t)(w >> 48));
+
+#if ATT_CAUSAL
+        if (j > i) qq0 = -((int64_t)1 << 62);
+        if (j + 1 > i) qq1 = -((int64_t)1 << 62);
+        if (j + 2 > i) qq2 = -((int64_t)1 << 62);
+        if (j + 3 > i) qq3 = -((int64_t)1 << 62);
+#endif
+
+        q[j] = qq0;     if (qq0 > mq) mq = qq0;
+        q[j + 1] = qq1; if (qq1 > mq) mq = qq1;
+        q[j + 2] = qq2; if (qq2 > mq) mq = qq2;
+        q[j + 3] = qq3; if (qq3 > mq) mq = qq3;
+      }
+
+      int64_t p[ATT_S];
+      int64_t sm = 0;
+      int64_t gmax_arr[GROUPS_S];
+
+      // Unroll the GROUPS_S = 2 loop manually
+      {
+        int64_t gmax0 = 0;
+        for (int j = 0; j < 32; j++) {
+          int64_t pv = mx_iexp(q[j] - mq);
+          p[j] = pv;
+          sm += pv;
+          if (pv > gmax0) gmax0 = pv;
+        }
+        gmax_arr[0] = gmax0;
+      }
+      {
+        int64_t gmax1 = 0;
+        for (int j = 32; j < 64; j++) {
+          int64_t pv = mx_iexp(q[j] - mq);
+          p[j] = pv;
+          sm += pv;
+          if (pv > gmax1) gmax1 = pv;
+        }
+        gmax_arr[1] = gmax1;
+      }
+
+      int ls = mx_ilog2((uint64_t)sm);
+      uint64_t inv_sm = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;
+
+      // Unroll scale quantization step for groups 0 and 1
+      {
+        int64_t gmax0 = gmax_arr[0];
+        if (gmax0 == 0) {
+          P_scales[0][i] = 0;
+          for (int j = 0; j < 32; j++) P_q[i][j] = 0;
+        } else {
+          int e = mx_ilog2((uint64_t)gmax0) - ls - MX_P_TARGET_LOG2;
+          P_scales[0][i] = (uint8_t)(e + 127);
+          for (int j = 0; j < 32; j++) P_q[i][j] = mx_ienc_fp8(p[j], inv_sm, ls, e);
+        }
+      }
+      {
+        int64_t gmax1 = gmax_arr[1];
+        if (gmax1 == 0) {
+          P_scales[1][i] = 0;
+          for (int j = 32; j < 64; j++) P_q[i][j] = 0;
+        } else {
+          int e = mx_ilog2((uint64_t)gmax1) - ls - MX_P_TARGET_LOG2;
+          P_scales[1][i] = (uint8_t)(e + 127);
+          for (int j = 32; j < 64; j++) P_q[i][j] = mx_ienc_fp8(p[j], inv_sm, ls, e);
+        }
+      }
+    }
+
+    // ---- 4) O = P @ V on Gemmini (bf16 out) ----
+    {
+      gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+      gemmini_mx_load_scales((uint64_t)V_sc, VSS_BYTES, 1);
+      
+      // Configure memory load stride for P (64 bytes)
+      gemmini_config_ld(ATT_S * sizeof(elem_t));
+
+      // Max-Length DMA Block-Tiling for P (bb = 3 to avoid overflow)
+      for (int i = 0; i < tiles_I; i++) {
+        gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S),
+                              a_base + (i * tiles_K) * DIM, 3 * DIM, DIM);
+      }
+
+      // Configure memory load stride for V (64 bytes)
+      gemmini_config_ld(ATT_D * sizeof(elem_t));
+
+      // Max-Length DMA Block-Tiling for V (bb = 3 to avoid overflow)
+      for (int k = 0; k < tiles_K; k++) {
+        gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D),
+                              b_base + (k * tiles_J) * DIM, 3 * DIM, DIM);
+      }
+
+      // Configure memory store stride for output
+      gemmini_config_st(ATT_D * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      gemmini_mx_read_smem(&O_hw[h][0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+      gemmini_fence();
+    }
+  }
+}
+```

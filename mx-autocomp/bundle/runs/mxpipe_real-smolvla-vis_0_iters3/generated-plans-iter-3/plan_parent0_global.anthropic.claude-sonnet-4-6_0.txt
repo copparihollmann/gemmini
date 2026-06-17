@@ -1,0 +1,104 @@
+## Analysis of the Current Code
+
+Looking at the original code, the outer loops iterate over `i0` (BLOCKS_M) and `j0` (BLOCKS_N), and **inside each (i0, j0) iteration**, the following are re-issued:
+
+1. `gemmini_flush(0)` — full hardware flush every iteration
+2. `gemmini_extended3_config_ex(...)` — full re-configuration every iteration
+3. `gemmini_mx_load_scales(...)` — both A and B scale loads every iteration
+4. `gemmini_config_ld(...)` — stride configuration (issued twice per iteration)
+5. `gemmini_mxquant_config_mvout(...)` — requantizer configuration every iteration
+
+Many of these are **redundant** across iterations when the configuration doesn't change. Specifically:
+
+- `gemmini_extended3_config_ex` with the same arguments every iteration is wasteful. The format fields, dataflow, and most parameters never change across (i0, j0) iterations.
+- `gemmini_config_ld` strides: The A stride (`MATMUL_K * sizeof(elem_t)`) and B stride (`MATMUL_N * sizeof(elem_t)`) never change — these can be hoisted outside the loops.
+- `gemmini_mxquant_config_mvout`: `tiles`, `tiles_K`, `scale_factors`, and `lut_update_granularity` are all loop-invariant. Only the `scale_dram` address argument uses `scale_factors` which is a fixed stack buffer — this never changes. This entire call can be hoisted.
+- `gemmini_flush(0)`: Should only be needed once at the start, not every iteration.
+
+## Selected Strategy: **Hoist Redundant Operations Out of Loops**
+
+### Plan
+
+**Move all loop-invariant configuration calls outside the (i0, j0) double loop.** Specifically:
+
+1. **Hoist `gemmini_flush(0)`** — move it before the loops. The hardware only needs to be flushed once at program start, not once per output tile block.
+
+2. **Hoist `gemmini_extended3_config_ex(...)`** — the arguments `(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0)` are identical every iteration. Move this call before the outer loops.
+
+3. **Hoist the two `gemmini_config_ld(...)` calls** — the A stride `MATMUL_K * sizeof(elem_t)` and B stride `MATMUL_N * sizeof(elem_t)` are loop-invariant constants. However, since mvin uses the last-configured stride, and we alternate between A and B strides, we cannot hoist both to a single call outside — but we can observe that the **A stride** is always set before the A mvin loop and the **B stride** before the B mvin loop. These two `gemmini_config_ld` calls could be hoisted outside the (i0,j0) loops only if we restructure to always do A-mvins then B-mvins across all blocks, but that would change the semantics. Instead, we note that for strategy 1 (hoist), we can still hoist the **first** `gemmini_config_ld` before the loop and only re-issue the second one inside (since two different strides are needed interleaved). More importantly, we can hoist `gemmini_config_ld(MATMUL_N * sizeof(elem_t))` to be set once before the B mvin section knowing it's always the same — the A mvin `gemmini_config_ld(MATMUL_K * sizeof(elem_t))` can similarly stay constant since MATMUL_K never changes. Both values are loop-invariant, but since they alternate, both still need to be issued each iteration in sequence. **However, `gemmini_config_ld` is a simple register write with no data dependency** — the key insight is we can restructure the loop to hoist the config that doesn't change: since MATMUL_K and MATMUL_N are compile-time constants, both strides are fixed.
+
+4. **Hoist `gemmini_mxquant_config_mvout(...)`** — `scale_factors`, `tiles` (= BLK/DIM), `tiles_K` (= MATMUL_K/DIM), and `lut_update_granularity=1` are all loop-invariant. The `scale_factors` buffer pointer never changes. This entire call can be moved before the (i0, j0) loops, and **also** `gemmini_config_st(BLK_OUTC * sizeof(out_t))` since `BLK_OUTC` is a constant — hoist it too.
+
+5. **Keep `gemmini_mx_load_scales` inside the loop** — the scale data (`A_s`, `B_s`) changes for each (i0, j0) block because different rows/columns of the scale arrays are memcpy'd in. These cannot be hoisted.
+
+### Key Invariant Calls to Hoist
+
+| Call | Loop-invariant? | Action |
+|------|----------------|--------|
+| `gemmini_flush(0)` | Yes (once at start) | Hoist before outer loops |
+| `gemmini_extended3_config_ex(WEIGHT_STATIONARY,0,0,ACC_SCALE_IDENTITY,1,1,0,0,false,0,0,3,0)` | Yes (same args every iter) | Hoist before outer loops |
+| `gemmini_config_ld(MATMUL_K * sizeof(elem_t))` | Yes (same value every iter) | Hoist before outer loops; only re-issue before B mvin (different stride) |
+| `gemmini_config_st(BLK_OUTC * sizeof(out_t))` | Yes | Hoist before outer loops |
+| `gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1)` | Yes (`tiles`, `tiles_K`, `scale_factors` all constant) | Hoist before outer loops |
+| `gemmini_mx_load_scales(...)` | No (scale data differs per block) | Stays in loop |
+| `gemmini_config_ld(MATMUL_N * sizeof(elem_t))` | Yes (value constant) | Keep before B mvin loop, but no need to recompute — still issued per iter since A stride must be set after it for next iter. Actually: restructure so config_ld for A is hoisted, and config_ld for B is the only one inside the loop before the B mvin section. |
+
+### Revised Structure
+
+```
+// === HOISTED (before all loops) ===
+int tiles   = BLK / DIM;
+int tiles_K = MATMUL_K / DIM;
+uint32_t a_base  = 0;
+uint32_t b_base  = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+int SPAD_DEST    = 128;
+uint32_t scale_factors[512] __attribute__((aligned(32))) = {0};
+
+gemmini_flush(0);
+gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+    1, 1, 0, 0, false, 0, 0, 3, 0);
+gemmini_config_st(BLK_OUTC * sizeof(out_t));
+gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+    tiles, tiles, tiles_K, 0, 0, 1);
+
+// === OUTER LOOP ===
+for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    int mrows = ...; int ncols = ...;
+    // CPU scale staging (unavoidable per block)
+    for (int g = 0; g < MATMUL_K/32; g++) {
+      memcpy(&A_s[g][0], &A_scales_row[g][i0*BLK], BLK);
+      memcpy(&B_s[g][0], &B_scales_col[g][j0*BLK], BLK);
+    }
+    int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+    // Scale loads vary per block — stay here
+    gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+    gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+    // A mvin
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i = 0; i < tiles; i++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin(...);
+
+    // B mvin
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+    for (int j = 0; j < tiles; j++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin(...);
+
+    // gemmini_config_st and gemmini_mxquant_config_mvout are now GONE from here
+
+    gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0,
+        a_base, BANK_NUM*BANK_ROWS, 0, SPAD_DEST,
+        false,false,false,false,false, NO_ACTIVATION, 0,0,false, 0x38);
+
+    for (int r = 0; r < mrows; r++)
+      gemmini_mx_read_smem(...);
+    gemmini_fence();
+  }
+}
+```
+
+This eliminates `gemmini_flush`, `gemmini_extended3_config_ex`, `gemmini_config_st`, and `gemmini_mxquant_config_mvout` from being redundantly re-issued on every (i0, j0) iteration, reducing the instruction overhead per block from ~6 configuration instructions to ~2 (only the two `gemmini_config_ld` calls for A and B strides, which differ in value and must stay in order before their respective mvin loops, plus the per-block scale loads which are data-dependent).

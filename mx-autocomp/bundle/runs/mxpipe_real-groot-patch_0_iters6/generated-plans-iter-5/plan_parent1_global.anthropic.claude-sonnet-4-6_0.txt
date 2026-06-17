@@ -1,0 +1,100 @@
+## Analysis
+
+Looking at the code, I need to identify what can be simplified or removed.
+
+### Key Observation: The `memcpy` calls for scale factors are unnecessary
+
+The original code does:
+```c
+for (int g = 0; g < MATMUL_K / 32; g++) {
+    memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+    memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+}
+```
+
+This copies a sub-block of scale factors into staging buffers `A_s` and `B_s`, then passes those buffers to `gemmini_mx_load_scales`. But `gemmini_mx_load_scales` takes a DRAM address and length — it can read directly from any contiguous memory region.
+
+However, `A_scales_row[g][i0*BLK]` and `B_scales_col[g][j0*BLK]` are **not contiguous across g** — they're strided in the full scale arrays. So the memcpy serves to pack them contiguously. This is legitimate staging.
+
+### Actual simplification: `gemmini_flush(0)` is called every iteration
+
+`gemmini_flush(0)` is a full hardware flush/reset called on every `(i0, j0)` iteration. This is almost certainly unnecessary after the first call — the hardware state relevant to the computation is set by `gemmini_extended3_config_ex` and the scale loads. The flush adds overhead every tile block.
+
+### Bigger simplification: The `gemmini_extended3_config_ex` is identical every iteration
+
+The configuration never changes between iterations. It can be moved outside the loop.
+
+### Plan
+
+**Strategy: Simplify or remove unnecessary code**
+
+Move `gemmini_flush(0)` and `gemmini_extended3_config_ex(...)` outside the `(i0, j0)` loop. These are called once-per-block but their values are **identical every iteration** — the format, dataflow, strides, and activation never change. A single flush and config at the start suffices.
+
+- `gemmini_flush(0)`: only needed once at startup to drain any prior state; calling it in every iteration wastes cycles
+- `gemmini_extended3_config_ex(...)`: the format/dataflow parameters are constant across all `(i0,j0)` blocks; re-issuing it each iteration is redundant
+
+This directly addresses the "unnecessary code" inefficiency: these two instructions are issued `BLOCKS_M * BLOCKS_N` times but only need to be issued once. For a 41×512×512 problem with BLK=32, that's a meaningful number of wasted flushes/reconfigs.
+
+The `gemmini_config_ld` and `gemmini_config_st` calls also have constant arguments across iterations and can be hoisted out of the loop.
+
+Here is the rewritten code:
+
+```c
+void solution(void) {
+  // One-time flush and config: format/dataflow never change across blocks.
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                               1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // Config LD strides are also constant: A stride = K, B stride = N.
+  // Config ST stride is also constant: BLK_OUTC * sizeof(out_t).
+  // Hoist these out of the loop.
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));   // will be re-set before B, but first set here
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+   for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      // Stage per-block scale factors (must be contiguous for gemmini_mx_load_scales).
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      // Load per-block scales (differ each (i0,j0) block, must reload).
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      // MVIN A: stride = K.
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+      // MVIN B: stride = N.
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int j = 0; j < tiles; j++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+}
+```

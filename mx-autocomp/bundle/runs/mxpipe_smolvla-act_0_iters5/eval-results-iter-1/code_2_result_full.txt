@@ -1,0 +1,211 @@
+{'correct': False, 'test_results': {0: False}, 'compiled': True}
+Prev latency: 15922
+New latency: N/A
+Plan: ## Analysis of the Current Code
+
+The current code has **BLK separate `gemmini_mx_read_smem` calls** per output block (one per row):
+
+```c
+for (int r = 0; r < BLK; r++)
+    gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                         SPAD_DEST * 16 + r * BLK, BLK);
+```
+
+This issues `BLK` separate RoCC instructions with small transfers, each with instruction dispatch overhead. Strategy 12 directly addresses this.
+
+## Selected Strategy: #12 — Batch all `gemmini_mx_read_smem` calls into a single call
+
+### Plan
+
+**Observation:** The current code issues `BLK` separate `gemmini_mx_read_smem` calls, each reading `BLK` BF16 values (one row at a time) from `mx_smem` into non-contiguous rows of `C_hw`. This works because each output row `r` maps to `smem_off = SPAD_DEST*16 + r*BLK` and DRAM destination `&C_hw[i0*BLK + r][(j0*BLK)/BF16_PER_WORD]`.
+
+**Key insight:** The `mx_smem` stores all `BLK × BLK` BF16 values contiguously starting at `SPAD_DEST*16`. The DRAM output `C_hw` is row-major, so `C_hw[i0*BLK + r][(j0*BLK)/BF16_PER_WORD]` for `r = 0..BLK-1` are **also contiguous in memory** (each row has `MATMUL_N/BF16_PER_WORD` words, but the block columns `j0*BLK/BF16_PER_WORD` through `(j0*BLK + BLK - 1)/BF16_PER_WORD` are contiguous within a row, and rows are laid out sequentially).
+
+**Problem with naïve single call:** `C_hw` rows have stride `MATMUL_N/BF16_PER_WORD` words (the full output width), so rows of the output block are **not contiguous** in DRAM unless `BLK == MATMUL_N`. The per-row loop is needed to handle this non-contiguous DRAM layout.
+
+**However:** Looking at the code, `gemmini_mx_read_smem` takes a flat DRAM address and copies `num_bf16` contiguous BF16 words from smem to DRAM sequentially. The smem layout for the block is `BLK × BLK` contiguous BF16 values. If we allocate a **temporary contiguous staging buffer** of size `BLK × BLK` BF16 values (i.e., `BLK * BLK / BF16_PER_WORD` uint64 words), we can:
+
+1. Issue **one** `gemmini_mx_read_smem` call into the staging buffer (one RoCC instruction, one DMA transfer of `BLK*BLK` BF16 values).
+2. After `gemmini_fence()`, copy from the staging buffer into `C_hw` on the CPU (a simple scatter with `BLK` `memcpy` calls of `BLK/BF16_PER_WORD` words each).
+
+But this reintroduces CPU staging. A better approach: observe that `gemmini_mx_read_smem` can write directly to any DRAM address. Since `C_hw[i0*BLK]` starts at a known address and `C_hw` rows are `MATMUL_N/BF16_PER_WORD` uint64 words apart, we **cannot** avoid the per-row calls unless rows are contiguous.
+
+**Correct single-call approach:** When `j0 == 0` and `BLK == MATMUL_N`, rows are contiguous and one call suffices. In general, the per-row loop is necessary for correctness. But we can **replace `BLK` RoCC instructions with a single RoCC instruction** by using a **contiguous scratch output buffer** declared as a local or static array, issuing one `gemmini_mx_read_smem` into it, then scattering rows into `C_hw` with `memcpy`.
+
+**Concrete change:**
+
+- Declare `static out_t block_out[BLK][BLK / BF16_PER_WORD]` (a flat `BLK × BLK` BF16 staging area).
+- Replace the `BLK`-iteration `gemmini_mx_read_smem` loop with:
+  ```c
+  gemmini_mx_read_smem(&block_out[0][0], SPAD_DEST * 16, BLK * BLK);
+  gemmini_fence();
+  for (int r = 0; r < BLK; r++)
+      memcpy(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+             &block_out[r][0],
+             (BLK / BF16_PER_WORD) * sizeof(out_t));
+  ```
+- This reduces `BLK` RoCC instructions to **1**, trading RoCC dispatch overhead for a CPU `memcpy` scatter (which is much cheaper than RoCC instruction overhead × BLK).
+- Also move `gemmini_flush(0)` outside the `i0`/`j0` loop (strategy 11 — directly applicable and trivially correct since flush only needs to happen once before the entire computation, not once per block).
+
+The dominant saving is reducing RoCC instruction count from `BLK` to `1` per output block, eliminating `BLK - 1` RoCC round-trips per `(i0, j0)` pair.
+
+CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED outer-tiled MX matmul baseline (128x320x320).
+void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+   for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // PROF cpu_stage
+      // Stage only the tiny per-32-group scales; A/B data is mvin\'d DIRECTLY
+      // from DRAM (no host-side block memcpy — that was 98% of the cycles).
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      // PROF accel
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+      for (int j = 0; j < tiles; j++)                    // B[k][j0*BLK+j] -> slot (k*tiles + j)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      // Accelerator-centric readout: per-row hardware DMA from smem straight into the
+      // bf16-packed row-major output. The old CPU bf16->fp32 assembly was ~99% of cycles
+      // (gemmini was ~1%); this DMA path is ~74x faster on 256x256x512 and exposes the
+      // accelerator work for autocomp to optimize.
+      for (int r = 0; r < BLK; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, BLK);
+      gemmini_fence();
+    }
+}
+''',
+score=15922,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'CPU/host data staging detected (2 memcpy, ~0 scalar copy loops). Host staging is typically the dominant cost on this accelerator and autocomp cannot speed it up directly: mvin tiles STRIDED straight from the source DRAM arrays instead of copying through a host buffer, and keep partial sums in shared memory (bf16 accumulate) rather than accumulating on the CPU.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''## Analysis of the Current Code
+
+The current code has **BLK separate `gemmini_mx_read_smem` calls** per output block (one per row):
+
+```c
+for (int r = 0; r < BLK; r++)
+    gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                         SPAD_DEST * 16 + r * BLK, BLK);
+```
+
+This issues `BLK` separate RoCC instructions with small transfers, each with instruction dispatch overhead. Strategy 12 directly addresses this.
+
+## Selected Strategy: #12 — Batch all `gemmini_mx_read_smem` calls into a single call
+
+### Plan
+
+**Observation:** The current code issues `BLK` separate `gemmini_mx_read_smem` calls, each reading `BLK` BF16 values (one row at a time) from `mx_smem` into non-contiguous rows of `C_hw`. This works because each output row `r` maps to `smem_off = SPAD_DEST*16 + r*BLK` and DRAM destination `&C_hw[i0*BLK + r][(j0*BLK)/BF16_PER_WORD]`.
+
+**Key insight:** The `mx_smem` stores all `BLK × BLK` BF16 values contiguously starting at `SPAD_DEST*16`. The DRAM output `C_hw` is row-major, so `C_hw[i0*BLK + r][(j0*BLK)/BF16_PER_WORD]` for `r = 0..BLK-1` are **also contiguous in memory** (each row has `MATMUL_N/BF16_PER_WORD` words, but the block columns `j0*BLK/BF16_PER_WORD` through `(j0*BLK + BLK - 1)/BF16_PER_WORD` are contiguous within a row, and rows are laid out sequentially).
+
+**Problem with naïve single call:** `C_hw` rows have stride `MATMUL_N/BF16_PER_WORD` words (the full output width), so rows of the output block are **not contiguous** in DRAM unless `BLK == MATMUL_N`. The per-row loop is needed to handle this non-contiguous DRAM layout.
+
+**However:** Looking at the code, `gemmini_mx_read_smem` takes a flat DRAM address and copies `num_bf16` contiguous BF16 words from smem to DRAM sequentially. The smem layout for the block is `BLK × BLK` contiguous BF16 values. If we allocate a **temporary contiguous staging buffer** of size `BLK × BLK` BF16 values (i.e., `BLK * BLK / BF16_PER_WORD` uint64 words), we can:
+
+1. Issue **one** `gemmini_mx_read_smem` call into the staging buffer (one RoCC instruction, one DMA transfer of `BLK*BLK` BF16 values).
+2. After `gemmini_fence()`, copy from the staging buffer into `C_hw` on the CPU (a simple scatter with `BLK` `memcpy` calls of `BLK/BF16_PER_WORD` words each).
+
+But this reintroduces CPU staging. A better approach: observe that `gemmini_mx_read_smem` can write directly to any DRAM address. Since `C_hw[i0*BLK]` starts at a known address and `C_hw` rows are `MATMUL_N/BF16_PER_WORD` uint64 words apart, we **cannot** avoid the per-row calls unless rows are contiguous.
+
+**Correct single-call approach:** When `j0 == 0` and `BLK == MATMUL_N`, rows are contiguous and one call suffices. In general, the per-row loop is necessary for correctness. But we can **replace `BLK` RoCC instructions with a single RoCC instruction** by using a **contiguous scratch output buffer** declared as a local or static array, issuing one `gemmini_mx_read_smem` into it, then scattering rows into `C_hw` with `memcpy`.
+
+**Concrete change:**
+
+- Declare `static out_t block_out[BLK][BLK / BF16_PER_WORD]` (a flat `BLK × BLK` BF16 staging area).
+- Replace the `BLK`-iteration `gemmini_mx_read_smem` loop with:
+  ```c
+  gemmini_mx_read_smem(&block_out[0][0], SPAD_DEST * 16, BLK * BLK);
+  gemmini_fence();
+  for (int r = 0; r < BLK; r++)
+      memcpy(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+             &block_out[r][0],
+             (BLK / BF16_PER_WORD) * sizeof(out_t));
+  ```
+- This reduces `BLK` RoCC instructions to **1**, trading RoCC dispatch overhead for a CPU `memcpy` scatter (which is much cheaper than RoCC instruction overhead × BLK).
+- Also move `gemmini_flush(0)` outside the `i0`/`j0` loop (strategy 11 — directly applicable and trivially correct since flush only needs to happen once before the entire computation, not once per block).
+
+The dominant saving is reducing RoCC instruction count from `BLK` to `1` per output block, eliminating `BLK - 1` RoCC round-trips per `(i0, j0)` pair.''',
+code='''// AUTO-GENERATED outer-tiled MX matmul baseline (128x320x320).
+void solution(void) {
+  // Declare a contiguous staging buffer for the block output (BLK x BLK BF16 values)
+  static out_t block_out[BLK][BLK / BF16_PER_WORD];
+
+  // Flush once before the entire computation (not per block)
+  gemmini_flush(0);
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Stage only the tiny per-32-group scales; A/B data is mvin\'d DIRECTLY
+      // from DRAM (no host-side block memcpy).
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+      for (int j = 0; j < tiles; j++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin2((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                 b_base + (k * tiles + j) * DIM, DIM, DIM);
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Single gemmini_mx_read_smem call: read all BLK*BLK BF16 values into
+      // a contiguous staging buffer (1 RoCC instruction instead of BLK).
+      gemmini_mx_read_smem(&block_out[0][0], SPAD_DEST * 16, BLK * BLK);
+      gemmini_fence();
+
+      // Scatter rows from the contiguous staging buffer into C_hw.
+      for (int r = 0; r < BLK; r++)
+        memcpy(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+               &block_out[r][0],
+               (BLK / BF16_PER_WORD) * sizeof(out_t));
+    }
+}
+''',
+score=None,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='us.anthropic.claude-sonnet-4-6',
+code_gen_model='us.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None)

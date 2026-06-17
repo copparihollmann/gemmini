@@ -1,0 +1,57 @@
+## Analysis of the Baseline Code
+
+Looking at the baseline code, the mvin loop structure is:
+
+```c
+// All A tiles first (sequential)
+for (int i = 0; i < tiles_I; i++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(A_tile, a_base + ..., DIM, DIM);
+
+// Then all B tiles (sequential)
+for (int j = 0; j < tiles_J; j++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(B_tile, b_base + ..., DIM, DIM);
+```
+
+**Problem:** All A tiles are loaded via the same mvin port (funct `k_MVIN`), then all B tiles also via the same port sequentially. The DMA engine cannot overlap A and B loads because they're issued to the same port back-to-back in two completely separate loops.
+
+## Selected Strategy: #13 — Interleave A and B mvin calls
+
+**Strategy 13:** Issue A mvin and B mvin calls interleaved (one A tile followed by one B tile per loop iteration) so the DMA engine can pipeline loads to different scratchpad regions simultaneously, rather than draining all A then all B sequentially.
+
+**How to apply it:**
+
+For this 128×128×256 problem: `tiles_I = 8`, `tiles_J = 8`, `tiles_K = 16`.
+
+The key insight is to use `gemmini_extended_mvin` (port 0) for A tiles and `gemmini_extended_mvin2` (port 1) for B tiles. When issued together in an interleaved fashion, the DMA engine can process them in parallel since they target different scratchpad regions (A at `a_base`, B at the top of scratchpad near `b_base`).
+
+**Concrete plan:**
+
+1. Keep the outer loop structure, but merge the A and B mvin loops into a single loop that issues one A tile (via `gemmini_extended_mvin`) immediately followed by one B tile (via `gemmini_extended_mvin2`) per iteration.
+
+2. Since `tiles_I = tiles_J = 8` and `tiles_K = 16`, we can iterate over `(i, k)` and `(j, k)` pairs together. We loop over `j` in the outer loop and `k` in the inner loop, emitting B tiles with mvin2, and separately loop over `i` interleaved. The simplest form: flatten the (i,k) and (j,k) iterations and pair them up.
+
+3. A practical interleaving: loop over `k` in the outer loop, and for each k, issue all i-indexed A-row tiles via mvin and all j-indexed B-column tiles via mvin2 alternating within that k-slice. This gives the DMA maximum opportunity to overlap since the two ports target disjoint memory regions.
+
+**Specific code change:**
+
+Replace the two separate nested loops with a single loop over `k` (the reduction dimension), and within that loop interleave `mvin` for A (all `i` at fixed `k`) with `mvin2` for B (all `j` at fixed `k`):
+
+```c
+gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+for (int k = 0; k < tiles_K; k++) {
+    for (int i = 0; i < tiles_I; i++) {
+        gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    }
+    for (int j = 0; j < tiles_J; j++) {
+        gemmini_extended_mvin2(
+            (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+            b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+    }
+}
+```
+
+This restructures the issue order so that for each K-slice, A tiles and B tiles are loaded in close temporal proximity using different ports, allowing the hardware DMA to pipeline them. The `gemmini_extended_mvin2` macro targets a separate port (`k_MVIN2`), so both ports can be in-flight simultaneously. The scratchpad addresses are unchanged (A tiles still go to `a_base + (i*tiles_K+k)*DIM`, B tiles to `b_base + (j*tiles_K+k)*DIM`), preserving correctness of the subsequent `gemmini_loop_ws_spad` call.

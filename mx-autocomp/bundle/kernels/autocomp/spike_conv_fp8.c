@@ -1,0 +1,82 @@
+#include <string.h>
+
+void solution(void) {
+
+  const int tiles_I = MATMUL_M / DIM;
+  const int tiles_J = MATMUL_N / DIM;
+  const int tiles_K = MATMUL_K / DIM;
+
+  const int a_base  = 0;
+  const int b_base  = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+  const int SPAD_DEST = 0;
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+  for (int j = 0; j < tiles_J; j++) {
+    int k = 0;
+    for (; k + 4 <= tiles_K; k += 4) {
+      gemmini_extended_mvin2(
+          (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+          b_base + (j * tiles_K + k) * DIM,
+          4 * DIM, DIM);
+    }
+    for (; k < tiles_K; k++) {
+      gemmini_extended_mvin2(
+          (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+          b_base + (j * tiles_K + k) * DIM,
+          DIM, DIM);
+    }
+  }
+
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+
+  for (int i = 0; i < tiles_I; i++) {
+    for (int li = 0; li < DIM; li++) {
+      int patch_idx = i * DIM + li;
+
+      int pi = patch_idx / PATCHES_X;
+      int pj = patch_idx % PATCHES_X;
+
+      elem_t *dst_row = A_buf[patch_idx];
+      for (int c = 0; c < CONV_C; c++) {
+        for (int dy = 0; dy < CONV_KSZ; dy++) {
+
+          const elem_t *src = &X_in[c][pi * CONV_KSZ + dy][pj * CONV_KSZ];
+          elem_t *dst = dst_row + (c * CONV_KSZ + dy) * CONV_KSZ;
+
+          memcpy(dst, src, CONV_KSZ * sizeof(elem_t));
+        }
+      }
+    }
+
+    int k = 0;
+    for (; k + 4 <= tiles_K; k += 4) {
+      gemmini_extended_mvin(
+          (void*)(((elem_t*)A_buf) + i * DIM * MATMUL_K + k * DIM),
+          a_base + (i * tiles_K + k) * DIM,
+          4 * DIM, DIM);
+    }
+    for (; k < tiles_K; k++) {
+      gemmini_extended_mvin(
+          (void*)(((elem_t*)A_buf) + i * DIM * MATMUL_K + k * DIM),
+          a_base + (i * tiles_K + k) * DIM,
+          DIM, DIM);
+    }
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+      tiles_I, tiles_J, tiles_K, 0, 0, tiles_K);
+
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+      a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+      false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}

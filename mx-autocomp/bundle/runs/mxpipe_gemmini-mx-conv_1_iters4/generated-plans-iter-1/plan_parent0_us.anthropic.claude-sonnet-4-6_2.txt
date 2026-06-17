@@ -1,0 +1,110 @@
+# Strategy: Interleave im2col Row Computation with Immediate mvin Issuance
+
+## Analysis of the Current Code
+
+The baseline code has two distinct sequential phases:
+
+1. **Phase 1 (CPU-only):** Complete the entire im2col loop nest, filling all of `A_buf[PATCHES_Y × PATCHES_X][MATMUL_K]` in DRAM before touching Gemmini at all.
+2. **Phase 2 (Gemmini):** Configure, mvin all tiles, compute, readout.
+
+This creates a pipeline bubble: the CPU finishes all im2col work, then sits idle while Gemmini DMAs, then Gemmini computes while CPU sits idle. The im2col step and the DMA loading of `A_buf` rows into the scratchpad are completely serialized with zero overlap.
+
+## The New Strategy: Fuse im2col Row Completion with Immediate mvin Issuance (Strategy 12 + 10)
+
+**Inspired by strategy 12** ("interleave im2col row computation with mvin issuance row-by-row") combined with **strategy 10** ("split `gemmini_config_ld` into separate calls for A and B tiles with their respective row strides").
+
+### Key Insight
+
+For this specific convolution shape:
+- `MATMUL_M = PATCHES_Y × PATCHES_X` (number of output patches = `(32/4) × (32/4) = 64` for H=32, k=4)
+- `MATMUL_K = C × k × k = 2 × 4 × 4 = 32`
+- `MATMUL_N = OC = 32`
+- `tiles_I = 64/16 = 4`, `tiles_K = 32/16 = 2`, `tiles_J = 32/16 = 2`
+
+Each row of `A_buf` (one im2col row = one patch) is `MATMUL_K = 32` bytes. A scratchpad tile is `DIM × DIM = 16 × 16 = 256` bytes = 16 rows of `A_buf`. So `tiles_I × tiles_K = 4 × 2 = 8` tiles of A, each covering 16 consecutive rows.
+
+The im2col fills `A_buf` row by row. After exactly `DIM = 16` rows are filled, that constitutes one complete A-tile column (for a fixed `i`). **We can issue the mvin for that tile immediately after filling it**, while the CPU continues computing the next 16 rows — overlapping CPU work with DMA.
+
+### Implementation Plan
+
+**Step 1: Hoist all Gemmini configuration before the im2col loop.**
+
+Issue `gemmini_extended3_config_ex`, `gemmini_mx_load_scales`, `gemmini_config_st`, and `gemmini_mxquant_config_mvout` *before* entering the im2col/mvin loop. Also pre-configure the A load stride with `gemmini_config_ld(MATMUL_K * sizeof(elem_t))` (this is invariant).
+
+**Step 2: Restructure the im2col loop so the outer loop is over `i` (tile row index, stride DIM), then `k` (tile column index).**
+
+For each `(i, k)` pair:
+1. Fill `DIM` rows × `DIM` columns of `A_buf` corresponding to this tile (the im2col inner loops for patches `i*DIM` through `i*DIM + DIM - 1`, columns `k*DIM` through `k*DIM + DIM - 1`).
+2. **Immediately issue `gemmini_extended_mvin`** for that tile into the scratchpad at `a_base + (i * tiles_K + k) * DIM`.
+
+The CPU moves to the next `(i, k)` tile while Gemmini's DMA engine is still transferring the previous tile.
+
+**Step 3: Issue B mvins (with correct stride `MATMUL_K * sizeof(elem_t)`) separately after the A mvin loop**, using a separate `gemmini_config_ld` call for B's stride — this is strategy 10, which prevents the stride mismatch bug. B tiles are loaded from `B_in` (already in DRAM, no CPU preprocessing), so they can be issued in a tight loop after A mvin issuance completes.
+
+**Step 4:** Issue `gemmini_loop_ws_spad`, `gemmini_mx_read_smem`, `gemmini_fence()` as before.
+
+### Why This Improves Performance
+
+- **CPU–DMA overlap:** When tile `(i=0, k=0)` is done being computed by the CPU and its mvin is issued, the Gemmini DMA starts transferring 256 bytes to the scratchpad. Meanwhile the CPU is already computing im2col rows for tile `(i=0, k=1)`. These two operations run in parallel.
+- **Reduced effective im2col latency:** Instead of `T_im2col + T_mvin_A_all` sequentially, we get approximately `max(T_im2col, T_mvin_A_all)` since each mvin is issued as soon as its data is ready.
+- **No correctness impact:** Each `gemmini_extended_mvin` is issued only after its source rows in `A_buf` are fully written by the CPU. The Gemmini DMA reads from `A_buf` in DRAM, which is coherent from the CPU's perspective. The scratchpad layout `a_base + (i*tiles_K + k)*DIM` is unchanged.
+- **Strategy 10 benefit:** Using a separate `gemmini_config_ld` for B (with stride `MATMUL_K`) after the A mvin loop avoids the silent stride mismatch that would occur if B rows have a different byte width (in a generalized version of this code).
+
+### Concrete Code Structure
+
+```c
+void solution(void) {
+  // --- Hoist all configuration before im2col ---
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                               1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Configure A load stride (invariant across all A tiles)
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+
+  // --- Fused im2col + mvin A: issue mvin as soon as each DIM×DIM tile is ready ---
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      // Fill the DIM rows × DIM cols of A_buf for tile (i,k)
+      for (int row = i * DIM; row < (i + 1) * DIM; row++) {
+        int pi = row / PATCHES_X;
+        int pj = row % PATCHES_X;
+        for (int col = k * DIM; col < (k + 1) * DIM; col++) {
+          int c  = col / (CONV_KSZ * CONV_KSZ);
+          int dy = (col % (CONV_KSZ * CONV_KSZ)) / CONV_KSZ;
+          int dx = col % CONV_KSZ;
+          A_buf[row][col] = X_in[c][pi * CONV_KSZ + dy][pj * CONV_KSZ + dx];
+        }
+      }
+      // Immediately DMA this tile to the scratchpad
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin(
+          (void*)(((elem_t*)A_buf) + i * DIM * MATMUL_K + k * DIM),
+          sp_addr, DIM, DIM);
+      // CPU proceeds to next tile while DMA runs
+    }
+  }
+
+  // --- MVIN B (separate config_ld for B's stride) ---
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));  // B row stride = MATMUL_K bytes
+  for (int j = 0; j < tiles_J; j++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin(
+          (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+          b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+
+  // --- Configure output and compute ---
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+                       a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                       false, false, false, false, false,
+                       NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+This preserves the correct programming model sequence (config → scales → mvin → mvout-config → loop → read → fence) while maximally overlapping CPU im2col with Gemmini DMA, reducing the effective critical path.

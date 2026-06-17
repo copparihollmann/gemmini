@@ -1,0 +1,60 @@
+## Analysis
+
+Looking at the current code, the key inefficiency I want to target is **strategy 6**: for the j0-outer reuse pattern, load B scales and B tiles once before the i0 inner loop and skip reloading them inside i0 iterations.
+
+Currently the loop structure is:
+```c
+for (int i0 = 0; i0 < BLOCKS_M; i0++)
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(...);
+    gemmini_mx_load_scales(pre_A_s[i0], A_S_BYTES, 0);  // A scales
+    gemmini_mx_load_scales(pre_B_s[j0], B_S_BYTES, 1);  // B scales
+    // mvin A tiles
+    // mvin B tiles
+    // compute
+  }
+```
+
+For a fixed `j0`, the B block (tiles and scales) is **identical** across all `i0` iterations. Yet we reload B scales and re-mvin all B tiles on every `(i0, j0)` pair — `BLOCKS_M` redundant loads per j0.
+
+## Plan: Hoist B loads outside the i0 loop (Strategy 6)
+
+**Restructure the loop order to j0-outer, i0-inner**, then:
+
+1. **Before the i0 loop** (once per j0):
+   - Pre-stage B scales for `j0` (already done in `pre_B_s`)
+   - Call `gemmini_mx_load_scales(pre_B_s[j0], B_S_BYTES, 1)` **once**
+   - Call `gemmini_config_ld(MATMUL_N * sizeof(elem_t))` and mvin all B tiles for `j0` into the scratchpad **once**
+
+2. **Inside the i0 loop** (per i0):
+   - Call `gemmini_flush(0)` and `gemmini_extended3_config_ex(...)` (still needed per block for correctness/statefulness — but `gemmini_flush` resets state so we need to reconsider)
+   
+   Actually, `gemmini_flush` resets all accelerator state including scale memory, so it **cannot** be moved inside without reloading B. The fix is to **move `gemmini_flush` outside the j0 loop entirely** (call it once before all blocks), and restructure as:
+
+   ```
+   gemmini_flush(0);  // once total
+   for j0 in BLOCKS_N:
+     gemmini_extended3_config_ex(...)   // once per j0
+     load B scales (sel=1) once
+     mvin B tiles once
+     for i0 in BLOCKS_M:
+       load A scales (sel=0)
+       mvin A tiles
+       gemmini_mxquant_config_mvout(...)
+       gemmini_loop_ws_spad(...)
+       gemmini_mx_read_smem(...)
+       gemmini_fence()
+   ```
+
+   Since `gemmini_mx_load_scales` loads into persistent scale memory (sel=0 for A, sel=1 for B), and A scales differ per i0 but B scales are fixed per j0, we can load B scales once per j0 and only reload A scales per i0. The programming model requires both A and B scales to be loaded before `gemmini_loop_ws_spad`, but does **not** require them to be loaded in the same iteration — as long as B scales haven't been overwritten (they won't be, since we only call `gemmini_mx_load_scales(..., 1)` once per j0).
+
+   Similarly, B tiles in the scratchpad remain valid across i0 iterations because A and B occupy different scratchpad regions: A at `a_base` (bottom), B at `b_base` (top). The A mvin only touches `a_base + ...` rows, never overlapping with B. So B tiles loaded once per j0 remain valid for all i0 within that j0.
+
+3. **B tile layout**: `b_base = BANK_NUM*BANK_ROWS - tiles*tiles_K*DIM` stays the same (where `tiles = BLK/DIM`). A tiles go to `a_base = 0`. The constraint `(tiles_I_inner*tiles_K + tiles_J_inner*tiles_K)*DIM ≤ 8192` must hold — for the inner block, `tiles_I = tiles_J = BLK/DIM` tiles, `tiles_K = MATMUL_K/DIM`. With BLK=64 (tiles=4) and K=512 (tiles_K=32): A needs 4×32×16=2048 rows, B needs 4×32×16=2048 rows, total 4096 ≤ 8192. ✓
+
+4. **`gemmini_config_ld` for B** (stride=`MATMUL_N * sizeof(elem_t)`) is set once before the B mvin loop per j0. Then inside i0, we call `gemmini_config_ld(MATMUL_K * sizeof(elem_t))` for A tiles. No redundancy.
+
+5. **The `gemmini_extended3_config_ex` call** can be hoisted to once per j0 (or even once total, since format doesn't change), but to be safe and maintain the required ordering relative to scale loads, keep it once per j0 before B scale loading. This is still `BLOCKS_M`× less frequent than before.
+
+This eliminates `BLOCKS_M - 1` redundant B scale loads and `BLOCKS_M - 1` full sets of B tile mvins per j0 — a significant saving when `BLOCKS_M > 1`.

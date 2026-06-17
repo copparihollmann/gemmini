@@ -1,0 +1,112 @@
+Looking at the original code, I need to analyze the performance bottlenecks and optimize:
+
+1. **`gemmini_flush(0)` is called every iteration** - this is expensive and unnecessary unless state is stale
+2. **No batching of mvin operations** - can use `MAX_BLOCK_LEN=4` to batch up to 4 tiles per mvin
+3. **B matrix mvin uses wrong port** - B should use `mvin2` for overlap with A loads
+4. **Scale buffers are rebuilt every (i0,j0) iteration** - unavoidable since scales change per block
+5. **The inner loop ordering for B mvin is `(j,k)` but scratchpad layout is `b_base + (k*tiles+j)*DIM`** - can batch along k for B
+6. **`gemmini_config_ld` is re-issued each direction** - unavoidable but minimize redundant calls
+
+Key optimizations:
+- Use `gemmini_extended_mvin` for A (port 0) and `gemmini_extended_mvin2` for B (port 1) to overlap loads
+- Batch mvin calls using `MAX_BLOCK_LEN=4` where rows are contiguous in DRAM and scratchpad
+- Move `gemmini_flush` outside the loop (only flush once at start)
+- Batch A loads: for each `i`, all `k` tiles are contiguous in scratchpad (`(i*tiles_K+0)*DIM` to `(i*tiles_K+tiles_K-1)*DIM`) and in DRAM (row `i0*BLK+i*DIM`, columns `0..K-1`)
+
+```c
+void solution(void) {
+  gemmini_flush(0);
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+
+      int tiles = BLK / DIM;
+      int tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                  1, 1, 0, 0, false, 0, 0, 3, 0);
+
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      // Load A tiles using mvin (port 0), batch up to MAX_BLOCK_LEN=4 along k
+      gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+      for (int i = 0; i < tiles; i++) {
+        int k = 0;
+        while (k < tiles_K) {
+          int batch = tiles_K - k;
+          if (batch > MAX_BLOCK_LEN) batch = MAX_BLOCK_LEN;
+          // Check scratchpad contiguity: a_base+(i*tiles_K+k)*DIM to ...+(k+batch-1)*DIM are contiguous
+          // DRAM: row (i0*BLK+i*DIM), col k*DIM, batch*DIM cols wide
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM,
+            batch * DIM, DIM);
+          k += batch;
+        }
+      }
+
+      // Load B tiles using mvin2 (port 1), batch up to MAX_BLOCK_LEN=4 along k
+      // B scratchpad layout: b_base + (k*tiles + j)*DIM
+      // For fixed j, varying k: addresses b_base+(0*tiles+j)*DIM, b_base+(1*tiles+j)*DIM, ...
+      //   these are NOT contiguous (stride = tiles*DIM between k steps), so can't batch along k for B
+      // For fixed k, varying j: addresses b_base+(k*tiles+0)*DIM, ..., b_base+(k*tiles+j)*DIM
+      //   these ARE contiguous in scratchpad (stride = DIM), so batch along j
+      // DRAM for B: B_in is (K x N), row k*DIM+dk, col j0*BLK+j*DIM
+      //   for fixed k, varying j: cols j0*BLK+0, j0*BLK+DIM, ... contiguous if j stride=DIM
+      //   DRAM stride is MATMUL_N, so rows of B for fixed k are at B_in[k*DIM][j0*BLK + j*DIM]
+      //   varying j means varying column offset by DIM each time - NOT contiguous rows in DRAM
+      //   Actually each mvin loads a DIM x DIM tile: rows [k*DIM, k*DIM+DIM), cols [j0*BLK+j*DIM, ...)
+      //   For batching: we need both DRAM and spad to be contiguous
+      //   DRAM base ptr for (k,j): ((elem_t*)B_in) + k*DIM*MATMUL_N + (j0*BLK+j*DIM)
+      //   Spad addr for (k,j): b_base + (k*tiles+j)*DIM
+      //   For fixed k, j=0..tiles-1: spad addresses are contiguous (b_base+k*tiles*DIM, +DIM, +2*DIM...)
+      //   DRAM ptrs for fixed k, j=0..tiles-1: base + j*DIM - these are contiguous columns in same rows
+      //   Since config_ld stride = MATMUL_N, each "row" of the tile is MATMUL_N apart
+      //   The mvin with cols=batch*DIM, rows=DIM will load batch*DIM elements per DRAM row -> contiguous cols OK
+      gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+      for (int k = 0; k < tiles_K; k++) {
+        int j = 0;
+        while (j < tiles) {
+          int batch = tiles - j;
+          if (batch > MAX_BLOCK_LEN) batch = MAX_BLOCK_LEN;
+          gemmini_extended_mvin2(
+            (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+            b_base + (k * tiles + j) * DIM,
+            batch * DIM, DIM);
+          j += batch;
+        }
+      }
+
+      gemmini_extended_config_st(BLK_OUTC * sizeof(out_t), 0, ACC_SCALE_IDENTITY);
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0,
+                           a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                           false, false, false, false, false,
+                           NO_ACTIVATION, 0, 0, false, 0x38);
+
+      if (mrows == BLK && ncols == BLK) {
+        gemmini_mx_read_smem(&C_hw[i0 * BLK][j0 * BLK / BF16_PER_WORD],
+                             SPAD_DEST * 16, BLK * BLK);
+      } else {
+        for (int r = 0; r < mrows; r++)
+          gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                               SPAD_DEST * 16 + r * BLK, ncols);
+      }
+    }
+
+  gemmini_fence();
+}
+```

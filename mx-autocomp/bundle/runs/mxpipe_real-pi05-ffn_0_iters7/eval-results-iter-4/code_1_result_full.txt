@@ -1,0 +1,356 @@
+{'correct': True, 'test_results': {0: True}, 'compiled': True, 'latency_spike_raw': 435925, 'latency': 435925}
+Prev latency: 341415
+New latency: 435925
+Plan: An elegant and highly effective optimization plan to improve the execution time of your program is to apply **Strategy 6: Coalesce multiple row-by-row `gemmini_mx_read_smem` calls into a single contiguous bulk shared-memory read to minimize host CPU RoCC instruction dispatch overhead.**
+
+---
+
+### Inefficiency Analysis
+
+In the original code, the output results are drained from the MX shared memory (`mx_smem`) back to DRAM row-by-row using a loop of `mrows` iterations:
+```c
+for (int r = 0; r < mrows; r++) {
+  gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                       SPAD_DEST * 16 + r * BLK, ncols);
+}
+```
+When `BLK = 64`, this loop issues **64 individual RoCC commands** (`k_MX_READ_SMEM`) to the Gemmini accelerator. Each instruction dispatch incurs significant control-plane latency on the RISC-V host CPU (instruction decoding, queueing, and RoCC interface handshaking), stalling the processor and severely degrading performance.
+
+### Optimization Plan
+
+We can completely eliminate this loop and its accompanying overhead by coalescing these strided transfers into a **single bulk contiguous transfer** using a temporary staging buffer on the stack. 
+
+1. **Allocate a Contiguous Staging Buffer**: Create a stack-allocated, 32-byte-aligned array `C_staging` large enough to hold one block of BF16-packed outputs (`BLK * BLK / BF16_PER_WORD` words of `uint64_t`).
+2. **Issue One Contiguous Read**: Perform a single bulk `gemmini_mx_read_smem` call to copy all `mrows * ncols` BF16 elements from shared memory into `C_staging` contiguously.
+3. **Synchronize via Fence**: Issue `gemmini_fence()` immediately after the bulk read to guarantee that the Gemmini DMA controller has fully written the results to DRAM before the host CPU accesses them.
+4. **Copy on Host CPU**: Perform a fast, CPU-side row-by-row transfer (e.g., using `memcpy`) to scatter the contiguous rows of `C_staging` into the strided DRAM layout of `C_hw`. CPU-side memory copying is executed via standard assembly loads/stores, bypassing the expensive RoCC coprocessor instruction dispatch pipeline entirely.
+
+---
+
+### Proposed Code Modification
+
+Replace the draining loop in the original `solution` function with the following optimized implementation:
+
+```c
+      // Perform computation utilizing the stationary A tiles and new B tiles
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // --- OPTIMIZED COALESCED DRAIN START ---
+      // Allocate a contiguous staging buffer on the stack
+      uint64_t C_staging[BLK * BLK / BF16_PER_WORD] __attribute__((aligned(32)));
+
+      // Read all rows contiguously in a single bulk RoCC instruction
+      gemmini_mx_read_smem(C_staging, SPAD_DEST * 16, mrows * ncols);
+      
+      // Fence must be issued after smem read and before the host CPU reads the staging buffer
+      gemmini_fence();
+
+      // Copy from the contiguous staging buffer to the strided DRAM destination on CPU
+      int out_cols_per_block = ncols / BF16_PER_WORD;
+      for (int r = 0; r < mrows; r++) {
+        memcpy(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+               &C_staging[r * out_cols_per_block],
+               out_cols_per_block * sizeof(uint64_t));
+      }
+      // --- OPTIMIZED COALESCED DRAIN END ---
+    }
+  }
+}
+```
+
+CodeCandidate(parent=CodeCandidate(parent=None,
+plan='''prior autocomp winner (mxpipe_real-pi05-ffn_0_iters5)''',
+code='''// AUTO-GENERATED outer-tiled MX matmul optimized via Stationary Operand Caching.
+void solution(void) {
+  // Pre-format scale factor matrices to eliminate CPU-side staging in the hot loop
+  static uint8_t A_scales_perf[BLOCKS_M][MATMUL_K / 32][BLK];
+  static uint8_t B_scales_perf[BLOCKS_N][MATMUL_K / 32][BLK];
+
+  // One-time pre-formatting before main loops start
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int g = 0; g < MATMUL_K / 32; g++) {
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+      
+      // Only copy actual data, handle partial blocks correctly
+      for (int i = 0; i < mrows; i++) {
+        A_scales_perf[i0][g][i] = A_scales_row[g][i0 * BLK + i];
+      }
+      // Pad with zeros for partial blocks if needed
+      for (int i = mrows; i < BLK; i++) {
+        A_scales_perf[i0][g][i] = 0;
+      }
+    }
+  }
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    for (int g = 0; g < MATMUL_K / 32; g++) {
+      int ncols = REAL_N - j0 * BLK;
+      if (ncols > BLK) ncols = BLK;
+      if (ncols <= 0) continue;
+      
+      // Only copy actual data, handle partial blocks correctly
+      for (int j = 0; j < ncols; j++) {
+        B_scales_perf[j0][g][j] = B_scales_col[g][j0 * BLK + j];
+      }
+      // Pad with zeros for partial blocks if needed
+      for (int j = ncols; j < BLK; j++) {
+        B_scales_perf[j0][g][j] = 0;
+      }
+    }
+  }
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    int mrows = REAL_M - i0 * BLK; 
+    if (mrows > BLK) mrows = BLK; 
+    if (mrows <= 0) continue;
+
+    int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+    uint32_t a_base = 0;
+
+    // Configure execution once per row block
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+    // Load stationary A scale factors once per row block
+    gemmini_mx_load_scales((uint64_t)&A_scales_perf[i0][0][0], A_S_BYTES, 0);
+
+    // Keep A tiles stationary in the lower half of the scratchpad
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t)); // A rows: stride K
+    for (int i = 0; i < tiles; i++) {
+      for (int k = 0; k < tiles_K; k += 2) {
+        gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, 2 * DIM, DIM);
+      }
+    }
+
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int ncols = REAL_N - j0 * BLK; 
+      if (ncols > BLK) ncols = BLK; 
+      if (ncols <= 0) continue;
+
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      // Flush to synchronize state
+      gemmini_flush(0);
+
+      // Load dynamic B scale factors
+      gemmini_mx_load_scales((uint64_t)&B_scales_perf[j0][0][0], B_S_BYTES, 1);
+
+      // Load dynamic B tiles into the upper half of the scratchpad
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t)); // B rows: stride N
+      for (int k = 0; k < tiles_K; k++) {
+        for (int j = 0; j < tiles; j += 2) {
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, 2 * DIM, DIM);
+        }
+      }
+
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      
+      // Perform computation utilizing the stationary A tiles and new B tiles
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Drain results to DRAM
+      for (int r = 0; r < mrows; r++) {
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      }
+      gemmini_fence();
+    }
+  }
+}
+''',
+score=341415,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'Accelerator-bound: compute and data-movement look balanced; tune tiling / scratchpad occupancy for more overlap.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''An elegant and highly effective optimization plan to improve the execution time of your program is to apply **Strategy 6: Coalesce multiple row-by-row `gemmini_mx_read_smem` calls into a single contiguous bulk shared-memory read to minimize host CPU RoCC instruction dispatch overhead.**
+
+---
+
+### Inefficiency Analysis
+
+In the original code, the output results are drained from the MX shared memory (`mx_smem`) back to DRAM row-by-row using a loop of `mrows` iterations:
+```c
+for (int r = 0; r < mrows; r++) {
+  gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                       SPAD_DEST * 16 + r * BLK, ncols);
+}
+```
+When `BLK = 64`, this loop issues **64 individual RoCC commands** (`k_MX_READ_SMEM`) to the Gemmini accelerator. Each instruction dispatch incurs significant control-plane latency on the RISC-V host CPU (instruction decoding, queueing, and RoCC interface handshaking), stalling the processor and severely degrading performance.
+
+### Optimization Plan
+
+We can completely eliminate this loop and its accompanying overhead by coalescing these strided transfers into a **single bulk contiguous transfer** using a temporary staging buffer on the stack. 
+
+1. **Allocate a Contiguous Staging Buffer**: Create a stack-allocated, 32-byte-aligned array `C_staging` large enough to hold one block of BF16-packed outputs (`BLK * BLK / BF16_PER_WORD` words of `uint64_t`).
+2. **Issue One Contiguous Read**: Perform a single bulk `gemmini_mx_read_smem` call to copy all `mrows * ncols` BF16 elements from shared memory into `C_staging` contiguously.
+3. **Synchronize via Fence**: Issue `gemmini_fence()` immediately after the bulk read to guarantee that the Gemmini DMA controller has fully written the results to DRAM before the host CPU accesses them.
+4. **Copy on Host CPU**: Perform a fast, CPU-side row-by-row transfer (e.g., using `memcpy`) to scatter the contiguous rows of `C_staging` into the strided DRAM layout of `C_hw`. CPU-side memory copying is executed via standard assembly loads/stores, bypassing the expensive RoCC coprocessor instruction dispatch pipeline entirely.
+
+---
+
+### Proposed Code Modification
+
+Replace the draining loop in the original `solution` function with the following optimized implementation:
+
+```c
+      // Perform computation utilizing the stationary A tiles and new B tiles
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // --- OPTIMIZED COALESCED DRAIN START ---
+      // Allocate a contiguous staging buffer on the stack
+      uint64_t C_staging[BLK * BLK / BF16_PER_WORD] __attribute__((aligned(32)));
+
+      // Read all rows contiguously in a single bulk RoCC instruction
+      gemmini_mx_read_smem(C_staging, SPAD_DEST * 16, mrows * ncols);
+      
+      // Fence must be issued after smem read and before the host CPU reads the staging buffer
+      gemmini_fence();
+
+      // Copy from the contiguous staging buffer to the strided DRAM destination on CPU
+      int out_cols_per_block = ncols / BF16_PER_WORD;
+      for (int r = 0; r < mrows; r++) {
+        memcpy(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+               &C_staging[r * out_cols_per_block],
+               out_cols_per_block * sizeof(uint64_t));
+      }
+      // --- OPTIMIZED COALESCED DRAIN END ---
+    }
+  }
+}
+```''',
+code='''// AUTO-GENERATED outer-tiled MX matmul optimized via Stationary Operand Caching.
+void solution(void) {
+  // Pre-format scale factor matrices to eliminate CPU-side staging in the hot loop
+  static uint8_t A_scales_perf[BLOCKS_M][MATMUL_K / 32][BLK];
+  static uint8_t B_scales_perf[BLOCKS_N][MATMUL_K / 32][BLK];
+
+  // One-time pre-formatting before main loops start
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int g = 0; g < MATMUL_K / 32; g++) {
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+      
+      // Only copy actual data, handle partial blocks correctly
+      for (int i = 0; i < mrows; i++) {
+        A_scales_perf[i0][g][i] = A_scales_row[g][i0 * BLK + i];
+      }
+      // Pad with zeros for partial blocks if needed
+      for (int i = mrows; i < BLK; i++) {
+        A_scales_perf[i0][g][i] = 0;
+      }
+    }
+  }
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    for (int g = 0; g < MATMUL_K / 32; g++) {
+      int ncols = REAL_N - j0 * BLK;
+      if (ncols > BLK) ncols = BLK;
+      if (ncols <= 0) continue;
+      
+      // Only copy actual data, handle partial blocks correctly
+      for (int j = 0; j < ncols; j++) {
+        B_scales_perf[j0][g][j] = B_scales_col[g][j0 * BLK + j];
+      }
+      // Pad with zeros for partial blocks if needed
+      for (int j = ncols; j < BLK; j++) {
+        B_scales_perf[j0][g][j] = 0;
+      }
+    }
+  }
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    int mrows = REAL_M - i0 * BLK; 
+    if (mrows > BLK) mrows = BLK; 
+    if (mrows <= 0) continue;
+
+    int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+    uint32_t a_base = 0;
+
+    // Configure execution once per row block
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+    // Load stationary A scale factors once per row block
+    gemmini_mx_load_scales((uint64_t)&A_scales_perf[i0][0][0], A_S_BYTES, 0);
+
+    // Keep A tiles stationary in the lower half of the scratchpad
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t)); // A rows: stride K
+    for (int i = 0; i < tiles; i++) {
+      for (int k = 0; k < tiles_K; k += 2) {
+        gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, 2 * DIM, DIM);
+      }
+    }
+
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int ncols = REAL_N - j0 * BLK; 
+      if (ncols > BLK) ncols = BLK; 
+      if (ncols <= 0) continue;
+
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      // Flush to synchronize state
+      gemmini_flush(0);
+
+      // Load dynamic B scale factors
+      gemmini_mx_load_scales((uint64_t)&B_scales_perf[j0][0][0], B_S_BYTES, 1);
+
+      // Load dynamic B tiles into the upper half of the scratchpad
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t)); // B rows: stride N
+      for (int k = 0; k < tiles_K; k++) {
+        for (int j = 0; j < tiles; j += 2) {
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, 2 * DIM, DIM);
+        }
+      }
+
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      
+      // Perform computation utilizing the stationary A tiles and new B tiles
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // --- OPTIMIZED COALESCED DRAIN START ---
+      // Allocate a contiguous staging buffer on the stack
+      uint64_t C_staging[BLK * BLK / BF16_PER_WORD] __attribute__((aligned(32)));
+
+      // Read all rows contiguously in a single bulk RoCC instruction
+      gemmini_mx_read_smem(C_staging, SPAD_DEST * 16, mrows * ncols);
+      
+      // Fence must be issued after smem read and before the host CPU reads the staging buffer
+      gemmini_fence();
+
+      // Copy from the contiguous staging buffer to the strided DRAM destination on CPU
+      int out_cols_per_block = ncols / BF16_PER_WORD;
+      for (int r = 0; r < mrows; r++) {
+        memcpy(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+               &C_staging[r * out_cols_per_block],
+               out_cols_per_block * sizeof(uint64_t));
+      }
+      // --- OPTIMIZED COALESCED DRAIN END ---
+    }
+  }
+}
+''',
+score=None,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='gemini-3.5-flash',
+code_gen_model='qwen.qwen3-coder-480b-a35b-v1:0',
+stdout=None,
+stderr=None)

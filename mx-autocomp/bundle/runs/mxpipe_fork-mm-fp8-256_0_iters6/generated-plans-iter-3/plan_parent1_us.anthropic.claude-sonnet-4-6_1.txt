@@ -1,0 +1,113 @@
+## Analysis of the Original Code
+
+Looking at the original code, the key inefficiency I'll address is **strategy 9: pack A and B tiles contiguously in scratchpad to maximize `gemmini_loop_ws_spad` fused loop coverage**.
+
+The original code uses `SPAD_DEST = 0` for the accumulator output, but more importantly, I notice that the B tile MVIN uses the wrong scratchpad layout formula. Looking carefully:
+
+- Original B layout: `b_base + (k * tiles_J + j) * DIM` — this is a K-outer, J-inner ordering
+- The `gemmini_loop_ws_spad` expects B tiles at `b_base + (j*tiles_K + k)*DIM` per the architecture docs
+
+This means the original code has a **tile layout mismatch** that could cause incorrect addressing. But more critically for performance, I want to apply **strategy 9** by ensuring A and B tiles are packed in the canonical layout expected by the fused hardware loop, and also fix the `gemmini_config_ld` stride for B which currently uses `MATMUL_N * sizeof(elem_t)` — but B in memory is laid out as `B_in[MATMUL_K][MATMUL_N]`, so the stride should be `MATMUL_N * sizeof(elem_t)`. That part is correct.
+
+However, looking more carefully at the B mvin loop and comparing to the reference patterns:
+
+- Reference `matmul_tiled_fp8_64x64.c` uses: `b_base + (j * tiles_K + k) * DIM` — J-outer, K-inner
+- Original code uses: `b_base + (k * tiles_J + j) * DIM` — K-outer, J-inner
+
+These produce different scratchpad layouts. The `gemmini_loop_ws_spad` hardware loop iterates over B in a specific order. Per the reference `matmul_ws_mx_generic.c`, B is stored as `(k * tiles_J + j) * K_TILE` offsets — but that reference uses `K_TILE` rows per tile for packed FP6. For FP8, tiles are `DIM` rows.
+
+The reference `matmul_tiled_fp8_64x64.c` uses `b_base + (j * tiles_K + k) * DIM`. I'll align to this canonical layout.
+
+## Plan: Strategy 9 — Pack A and B Tiles Contiguously with Correct Layout
+
+**The fix:** Reorder the B tile scratchpad indexing from `(k * tiles_J + j)` to `(j * tiles_K + k)` to match the canonical layout that `gemmini_loop_ws_spad` expects. This ensures:
+1. B tiles are packed contiguously per J-group (each J-slice's K-tiles are adjacent), enabling the hardware loop to sweep K tiles correctly for each output column
+2. The fused hardware loop can traverse all tiles without skipping or revisiting scratchpad rows
+
+Additionally, the `b_base` calculation uses `tiles_K * tiles_J * DIM` which is correct for this layout.
+
+The DRAM pointer for B also needs to match: `B_in[k * DIM * MATMUL_N + j * DIM]` — iterating J outer, K inner:
+
+```
+dram_ptr = B_in + j * DIM * MATMUL_K * ... 
+```
+
+Wait — `B_in` is `[MATMUL_K][MATMUL_N]`, row-major. For tile (j, k): rows `k*DIM .. (k+1)*DIM`, columns `j*DIM .. (j+1)*DIM`. DRAM pointer = `B_in + k * DIM * MATMUL_N + j * DIM`. The config_ld stride stays `MATMUL_N`.
+
+The loop order changes to J-outer, K-inner to match the `(j * tiles_K + k) * DIM` spad layout.
+
+## Rewritten Code
+
+```c
+void solution(void) {
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+#ifdef SPIKE_SIM
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+#else
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
+#endif
+
+  // ---- MVIN A: tile (i,k) -> a_base + (i*tiles_K + k)*DIM ----
+  // A is stored row-major: A_in[MATMUL_M][MATMUL_K], stride = MATMUL_K
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  // ---- MVIN B: tile (j,k) -> b_base + (j*tiles_K + k)*DIM ----
+  // B is stored row-major: B_in[MATMUL_K][MATMUL_N], stride = MATMUL_N
+  // J-outer, K-inner loop matches the (j*tiles_K + k) spad layout expected
+  // by gemmini_loop_ws_spad, packing each J-group's K-tiles contiguously.
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+
+  for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base + (j * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  int SPAD_DEST = 0;
+
+  gemmini_config_st(DIM * sizeof(elem_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // ---- Compute ----
+  gemmini_loop_ws_spad(
+      tiles_I, tiles_J, tiles_K,
+      0, 0, 0,
+      a_base,
+      BANK_NUM * BANK_ROWS,
+      0,
+      SPAD_DEST,
+      false, false,
+      false, false, false,
+      NO_ACTIVATION,
+      0, 0,
+      false,
+      0x38);
+
+#ifdef SPIKE_SIM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+#else
+  for (int i = 0; i < tiles_J*tiles_I*2; i++) {
+      gemmini_mvout((void*)((uint64_t*) C_hw + i*2*DIM), SPAD_DEST + i*DIM);
+  }
+  gemmini_fence();
+#endif
+
+}
+```
+
+**Summary of change:** The B tile MVIN loop was restructured from K-outer/J-inner with spad index `(k * tiles_J + j) * DIM` to **J-outer/K-inner** with spad index `(j * tiles_K + k) * DIM`. This matches the canonical layout that `gemmini_loop_ws_spad` expects when sweeping B tiles, ensuring the hardware fused loop finds each B tile at the correct scratchpad address and can execute the full tiled matmul correctly and efficiently without address mismatches.

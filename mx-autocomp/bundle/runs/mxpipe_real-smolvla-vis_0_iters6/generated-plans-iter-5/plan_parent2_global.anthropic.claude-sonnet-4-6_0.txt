@@ -1,0 +1,104 @@
+## Analysis of the Current Code
+
+The current code has a `gemmini_fence()` call **inside** the inner `j0` loop, immediately after every `gemmini_mx_read_smem`. This means:
+
+1. After each `(i0, j0)` tile pair, the CPU blocks until the accelerator fully completes
+2. The accelerator queue drains completely between tiles
+3. No overlap between the output drain of tile `(i0, j0)` and the mvin/compute of tile `(i0, j0+1)`
+
+## Strategy: Defer `gemmini_fence()` to After a Batch of Iterations (Strategy 5)
+
+### Plan
+
+**Move the `gemmini_fence()` out of the inner `j0` loop and place it after the entire `j0` loop completes** (once per `i0` iteration, or even once after all `i0` iterations).
+
+The key insight is that `gemmini_mx_read_smem` is an accelerator instruction that gets enqueued — it doesn't stall the CPU. The `gemmini_fence()` is the only thing that causes a stall. By deferring the fence, we allow the accelerator to process the entire sequence of:
+
+```
+[tile j0=0: config → load_scales → mvin → compute → read_smem]
+[tile j0=1: config → load_scales → mvin → compute → read_smem]
+[tile j0=2: ...]
+...
+```
+
+...as a continuous pipeline without CPU stalls between tiles. The accelerator's internal queue can overlap the `MX_READ_SMEM` output drain of tile `j0` with the `mvin` loads for tile `j0+1`.
+
+### Correctness
+
+The fence is still issued before the host reads any output from `C_hw`. Since the host doesn't read `C_hw` until after `solution()` returns (or within the function after the fence), all writes are still visible. The `gemmini_mx_read_smem` calls all target disjoint regions of `C_hw` (different `i0*BLK+r` rows and `j0*BLK` column offsets), so there are no ordering conflicts between them.
+
+The programming model sequence per tile is preserved: each tile still follows `config_ex → load_scales → mvin → mxquant_config_mvout → loop_ws_spad → read_smem`. The fence is simply batched to cover multiple tiles.
+
+Note that `SPAD_DEST` is the same for all `j0` tiles (value 128). Since `gemmini_loop_ws_spad` completes before `gemmini_mx_read_smem` is processed (the accelerator serializes these in its queue), and `gemmini_mx_read_smem` drains `mx_smem` to DRAM before the next `loop_ws_spad` overwrites it (also serialized in queue), the same `SPAD_DEST` can be reused safely across `j0` tiles without a fence between them.
+
+### Code Change
+
+```c
+// AUTO-GENERATED outer-tiled MX matmul baseline (113x256x256).
+// Strategy 5 applied: defer gemmini_fence() to outside the j0 inner loop,
+// allowing the accelerator queue to stay full across consecutive tile
+// computations and overlapping output drains with next-tile input loads.
+
+void solution(void) {
+  const int GK = MATMUL_K / 32;
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+
+    // Hoist A scale staging outside j0 loop: A scales only depend on i0.
+    for (int g = 0; g < GK; g++)
+      memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      for (int g = 0; g < GK; g++)
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      // PROF accel
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+      for (int j = 0; j < tiles; j++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      // Fence moved outside j0 loop: do NOT fence here.
+    }
+    // Fence once per i0 block: all j0 tiles' read_smem calls are now
+    // drained before the host can observe C_hw for this i0 strip.
+    gemmini_fence();
+  }
+}
+```
+
+### Why This Works
+
+- The accelerator serializes instructions internally, so `read_smem` for tile `j0` always completes before `loop_ws_spad` for tile `j0+1` overwrites `mx_smem`
+- The CPU issues all instructions for `j0=0,1,...,BLOCKS_N-1` without stalling, keeping the accelerator queue filled
+- `MX_READ_SMEM` for tile `j0` can overlap with `mvin` setup for tile `j0+1` inside the accelerator pipeline
+- A single fence per `i0` strip (covering all `BLOCKS_N` tiles) ensures all DMA writes to `C_hw` are visible before the next `i0` iteration (which doesn't read `C_hw`, so even this fence could potentially be moved further, but one-per-`i0` is safe and sufficient)

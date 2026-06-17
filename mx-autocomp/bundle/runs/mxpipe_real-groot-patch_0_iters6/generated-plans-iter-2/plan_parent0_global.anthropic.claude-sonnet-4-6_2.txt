@@ -1,0 +1,44 @@
+## Analysis
+
+Looking at the code, the inner loops for loading A and B tiles issue one `gemmini_extended_mvin` per DIM×DIM tile (16 columns). Each call loads exactly `cols=DIM=16` elements per row. Strategy 3 says we can batch 2 tiles per mvin call (cols=32), halving the number of mvin instructions.
+
+Currently:
+- A: `tiles * tiles_K` mvin calls = `(BLK/16) * (K/16)` = `(BLK/16) * 32` calls for K=512
+- B: `tiles * tiles_K` mvin calls = same count
+
+With batch=2, we can merge consecutive `k` iterations into a single `gemmini_extended_mvin` with `cols=32`, cutting the instruction count in half.
+
+## Plan: Batch mvin loads with cols=32 (batch=2)
+
+**For the A-tile loop:** A tiles for a fixed `i` are laid out at consecutive scratchpad addresses `a_base + (i*tiles_K + k)*DIM` for k=0,1,2,.... Since consecutive k tiles for the same `i` are contiguous in the scratchpad (stride=DIM=16 rows), we can pair k and k+1 into one call with `cols=2*DIM=32`. Similarly in DRAM, A row `i*DIM` has its k-th block at offset `k*DIM` along the K dimension — also contiguous. So batching k in steps of 2 is valid.
+
+**For the B-tile loop:** B tiles for fixed `j` are at `b_base + (k*tiles + j)*DIM`. For fixed `j`, consecutive k values give addresses `b_base + k*tiles*DIM + j*DIM` — these are NOT adjacent (stride=`tiles*DIM`). However, for fixed `k`, consecutive `j` values give `b_base + k*tiles*DIM + j*DIM` — these ARE adjacent in the scratchpad (stride=DIM). In DRAM, B is stored row-major with stride `MATMUL_N`, so consecutive `j` tiles at the same `k` are also contiguous in DRAM. Therefore, batch the **j loop** (not k) for B loading: pair j and j+1 in a single mvin with cols=32.
+
+**Implementation:**
+- A inner loop: iterate `k` in steps of 2; when `tiles_K` is even (32 here, which is even), always pair. Issue `gemmini_extended_mvin(..., cols=32, rows=DIM)` pointing to DRAM address of tile `(i,k)` and spad address `a_base + (i*tiles_K + k)*DIM`.
+- B inner loop: iterate `j` in steps of 2 in the outer loop (swapping loop order to `k` outer, `j` inner); when `tiles` is even, always pair. Issue `gemmini_extended_mvin2(..., cols=32, rows=DIM)`.
+
+Since `tiles_K = 512/16 = 32` (even) and `tiles = BLK/16` where BLK is a power-of-two multiple of 16 (even), both loops divide evenly by 2 with no remainder handling needed for typical sizes. We should still add a fallback for odd remainders for correctness.
+
+Use `gemmini_extended_mvin` for A and `gemmini_extended_mvin2` for B (matching the original port assignment implied by the architecture: mvin=A, mvin2=B).
+
+**Config_ld stride:** The stride configured via `gemmini_config_ld` is the DRAM row stride in bytes. For A (rows of the full matrix), stride = `MATMUL_K * sizeof(elem_t)` — this is the stride between DIM-row groups, unchanged. For B (rows along K), stride = `MATMUL_N * sizeof(elem_t)` — also unchanged. Batching cols does not affect the configured stride (it controls how many columns of a single DIM-row block are loaded, not the inter-row stride).
+
+**Concrete change:** Replace:
+```c
+for (int i = 0; i < tiles; i++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(..., DIM, DIM);
+```
+with:
+```c
+for (int i = 0; i < tiles; i++) {
+  for (int k = 0; k < tiles_K - 1; k += 2)
+    gemmini_extended_mvin(..., 2*DIM, DIM);  // cols=32
+  if (tiles_K % 2 != 0)
+    gemmini_extended_mvin(..., DIM, DIM);    // remainder
+}
+```
+And similarly batch B's j-loop (reorder to k-outer, j-inner, batch j by 2).
+
+This halves the mvin instruction count for both A and B, reducing instruction dispatch overhead and improving throughput.

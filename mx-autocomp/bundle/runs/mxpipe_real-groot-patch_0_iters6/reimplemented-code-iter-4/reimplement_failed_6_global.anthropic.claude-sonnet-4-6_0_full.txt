@@ -1,0 +1,103 @@
+Looking at the failing code, I need to identify the bugs:
+
+1. **B tile mvin layout is wrong**: The B tile index should be `b_base + (j*tiles_K + k)*DIM` (matching the documented layout), but the code uses `b_base + (k*tiles + j)*DIM`. The B layout in the docs is `b_base + (j*tiles_K + k)*DIM`.
+
+2. **gemmini_mx_load_scales sel convention**: sel=0 is A (activation), sel=1 is B (weight) — this looks correct in the code already.
+
+3. **scale_factors**: The `gemmini_mxquant_config_mvout` is called with `scale_factors` but the scales loaded are from `A_s` and `B_s` staging buffers. The scale_dram address in mxquant_config_mvout refers to the output quantization scale memory, which should point to the staged scale data properly.
+
+4. **gemmini_flush** placement: Should be done once before the entire loop, not inside the inner loop (causes stale state reset).
+
+5. **mvin2 for B**: B tiles should use `gemmini_extended_mvin2` (mvin2 port) while A uses `gemmini_extended_mvin`.
+
+6. **C_hw read smem offset**: The `/ BF16_PER_WORD` division may be incorrect for byte addressing.
+
+```c
+// AUTO-GENERATED outer-tiled MX matmul baseline (41x512x512).
+void solution(void) {
+  int last_i0_staged = -1;
+
+  gemmini_flush(0);
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    int ncols = REAL_N - j0 * BLK;
+    if (ncols <= 0) continue;
+    if (ncols > BLK) ncols = BLK;
+
+    // Stage B scales once per j0 column-block.
+    for (int g = 0; g < MATMUL_K / 32; g++)
+      memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+
+    for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+
+      // Stage A scales only when i0 changes.
+      if (i0 != last_i0_staged) {
+        for (int g = 0; g < MATMUL_K / 32; g++)
+          memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        last_i0_staged = i0;
+      }
+
+      int tiles   = BLK / DIM;
+      int tiles_K = MATMUL_K / DIM;
+      uint32_t a_base   = 0;
+      uint32_t b_base   = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int      SPAD_DEST = 128;
+      int pad_i = BLK - mrows;
+      int pad_j = BLK - ncols;
+
+      // Step 1: config_ex — FP8 E4M3 inputs, BF16 output, no LUT.
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                   1, 1, 0, 0, false, 0, 0, 3, 0);
+
+      // Step 2: Load A scales (sel=0) then B scales (sel=1).
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      // Step 3: MVIN A tiles into scratchpad via mvin port.
+      //         Stride = full K row width in bytes.
+      gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+      for (int i = 0; i < tiles; i++) {
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin(
+              (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+              a_base + (i * tiles_K + k) * DIM,
+              DIM, DIM);
+        }
+      }
+
+      // Step 4: MVIN B tiles into scratchpad via mvin2 port.
+      //         B layout: b_base + (j*tiles_K + k)*DIM  (doc-specified).
+      //         Stride = full N row width in bytes.
+      gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+      for (int j = 0; j < tiles; j++) {
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin2(
+              (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+              b_base + (j * tiles_K + k) * DIM,
+              DIM, DIM);
+        }
+      }
+
+      // Step 5: Configure requantized mvout.
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                    tiles, tiles, tiles_K,
+                                    0, 0, 1);
+
+      // Step 6: Fused hardware weight-stationary tiled matmul.
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0,
+                            a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                            false, false, false, false, false,
+                            NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Step 7: Drain BF16-packed results from mx_smem to DRAM, then fence.
+      gemmini_mx_read_smem((uint64_t)(&C_hw[i0 * BLK][j0 * BLK]),
+                            SPAD_DEST * 16, mrows * ncols);
+      gemmini_fence();
+    }
+  }
+}
+```

@@ -1,0 +1,111 @@
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+#include "include/matmul_fp8_64x64.h"
+
+#define GEMMINI_SF_MEM 0x40088000
+#define GEMMINI_SF_MEM_A (GEMMINI_SF_MEM + 0x2000)
+#define GEMMINI_SF_MEM_B GEMMINI_SF_MEM
+#define SMEM 0x40000000
+
+#define DIM 16
+#define ADDR_LEN 32
+
+#define BF16_PER_WORD 4
+#define OUT_COLS (MATMUL_N / BF16_PER_WORD) // Corrected from M to N for C matrix
+
+typedef uint8_t  elem_t;   // fp8:e4m3 input elements
+typedef uint8_t  welem_t;  // fp8:e4m3 weight elements
+typedef uint64_t out_t;    // 4x bf16 packed per word
+
+void solution(void) {
+  // 1. Reset/Flush Gemmini state
+  gemmini_flush(0);
+
+  // 2. Configure execution: Weight-Stationary, FP8 inputs, BF16 output
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 
+                              1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // 3. Batch load scale factors once for the entire matrix (Strategy 4)
+  //    Note: Scale memory expects layout [K_groups][Rows_or_Cols]
+  //    So for A (M rows), it's [K/32][M] and for B (N cols), it's [K/32][N]
+  gemmini_mx_load_scales((uint64_t)A_scales_row, (MATMUL_K / 32) * MATMUL_M, 0); // sel=0 for A
+  gemmini_mx_load_scales((uint64_t)B_scales_col, (MATMUL_K / 32) * MATMUL_N, 1); // sel=1 for B
+
+  // 4. Calculate tiling and scratchpad base offsets
+  const int tiles_I = MATMUL_M / DIM; // 64/16 = 4
+  const int tiles_J = MATMUL_N / DIM; // 64/16 = 4
+  const int tiles_K = MATMUL_K / DIM; // 64/16 = 4
+
+  const uint32_t a_base = 0;
+  // Place B tiles at the top of the scratchpad, growing downwards
+  const uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM; // 8192 - 4*4*16 = 8192 - 256 = 7936
+  const int SPAD_DEST = 0; // Use beginning of accumulator for output
+
+  // 5. MVIN A tiles to scratchpad (batched 2-at-a-time for efficiency)
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t)); // Stride for A (M x K matrix)
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k += 2) { // Process up to 2 tiles in K-dimension
+      const int k_tiles_to_load = (k + 2 > tiles_K) ? (tiles_K - k) : 2;
+      gemmini_extended_mvin(
+          (void*)(((elem_t*)A_in) + (i * DIM) * MATMUL_K + k * DIM), // DRAM addr
+          a_base + (i * tiles_K + k) * DIM,                          // Spad addr
+          k_tiles_to_load * DIM,                                     // Cols (2 tiles wide)
+          DIM                                                        // Rows (1 tile high)
+      );
+    }
+  }
+
+  // 6. MVIN B tiles to scratchpad (batched 2-at-a-time for efficiency)
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t)); // Stride for B (K x N matrix)
+  for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j += 2) { // Process up to 2 tiles in J-dimension
+      const int j_tiles_to_load = (j + 2 > tiles_J) ? (tiles_J - j) : 2;
+      gemmini_extended_mvin2(
+          (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + j * DIM), // DRAM addr
+          b_base + (k * tiles_J + j) * DIM,                          // Spad addr
+          j_tiles_to_load * DIM,                                     // Cols (2 tiles wide)
+          DIM                                                        // Rows (1 tile high)
+      );
+    }
+  }
+
+  // 7. Configure output stride and the requantizer
+  gemmini_config_st(OUT_COLS * sizeof(out_t)); // Stride for packed BF16 output
+  static uint32_t scale_factors[512] __attribute__((aligned(32))) = {0};
+  gemmini_mxquant_config_mvout(
+      (uint64_t)scale_factors,
+      tiles_I, tiles_J, tiles_K, // Bounds matching the loop dimensions
+      0, 0,                      // scale_act_sel=0, scale_w_sel=0 (use first loaded scales)
+      1                          // lut_update_granularity=1 (update frequently)
+  );
+
+  // 8. Execute fused hardware matrix multiplication loop
+  // Issue the one-shot marker configuration for scratchpad loop
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, 
+      ((uint64_t)(0) << 32) | ((uint64_t)(0) << 16) | (uint64_t)(0), // pad_K, pad_J, pad_I
+      ((uint64_t)(tiles_K) << 32) | ((uint64_t)(tiles_J) << 16) | (uint64_t)(tiles_I), // K, J, I
+      k_LOOP_WS_CONFIG_BOUNDS);
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, 
+      a_base, b_base, 
+      k_LOOP_WS_CONFIG_SPAD_AB);
+  
+  // Execute the main loop
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, 
+      ((uint64_t)(0) << 18) | ((uint64_t)(0) << 16) | // a_spad_id=0, b_spad_id=0
+      ((uint64_t)(NO_ACTIVATION) << 8) | // act
+      ((0) << 2) | ((0) << 1) | (0),     // low_D=0, full_C=0, ex_accumulate=0
+      ((uint64_t)(0) << 32) | 0x200U | (0x38) | // C_spad_offset, marker, skips
+      ((0) << 2) | ((0) << 1) | (0),     // is_resadd=0, B_transpose=0, A_transpose=0
+      k_LOOP_WS);
+
+  // 9. Read packed BF16 results from SMEM and synchronize
+  // Results are in mx_smem at SPAD_DEST * 16 word offset
+  gemmini_mx_read_smem(
+      (uint64_t)&C_hw[0][0],        // DRAM destination
+      SPAD_DEST * 16,               // SMEM word offset (each row is 16 words)
+      MATMUL_M * MATMUL_N           // Total number of BF16 elements
+  );
+  gemmini_fence(); // Ensure completion before CPU reads C_hw
+}

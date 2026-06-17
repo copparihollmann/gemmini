@@ -1,0 +1,41 @@
+## Strategy: Increase Tile Size to Amortize Fixed Per-Invocation Costs
+
+### Identified Inefficiency
+
+The current code uses `BLK`-sized tiles (the block size defined by `BLOCKS_M`/`BLOCKS_N`), which creates a large number of outer loop iterations. Each iteration incurs heavy **fixed per-invocation overhead**:
+
+1. `gemmini_flush(0)` — full pipeline flush every iteration
+2. `gemmini_extended3_config_ex(...)` — full reconfiguration every iteration
+3. Two `gemmini_mx_load_scales(...)` calls — DRAM→hardware scale memory transfers every iteration
+4. `gemmini_config_ld(...)` / `gemmini_config_st(...)` — stride reconfiguration every iteration
+5. `gemmini_mxquant_config_mvout(...)` — requantizer reconfiguration every iteration
+
+These fixed costs are paid **once per (i0, j0) block pair**, regardless of how much work is done inside that block. With small `BLK`, the ratio of overhead instructions to actual compute instructions is unfavorable.
+
+### The Strategy: Fuse Multiple Output Tiles Per `gemmini_loop_ws_spad` Invocation
+
+The key insight is that `gemmini_loop_ws_spad` already supports arbitrary `tiles_I` and `tiles_J` counts in a single hardware-fused call. Currently, the code calls it once per `(i0, j0)` block pair with `tiles = BLK/DIM` in each dimension. Instead, we can **increase the effective tile counts passed to a single `gemmini_loop_ws_spad` call** by merging multiple (i0, j0) blocks together, subject to the scratchpad and accumulator capacity constraints.
+
+Specifically:
+
+**Scratchpad constraint:** `(tiles_I * tiles_K + tiles_J * tiles_K) * DIM ≤ 8192`
+
+With `MATMUL_K/DIM = tiles_K`, we want to maximize `tiles_I_big * tiles_J_big` such that all A and B tiles fit simultaneously.
+
+**Accumulator constraint:** `tiles_I_big * tiles_J_big * DIM ≤ 256`, i.e., `tiles_I_big * tiles_J_big ≤ 16`.
+
+### Concrete Change
+
+Instead of iterating `i0` over `BLOCKS_M` and `j0` over `BLOCKS_N` and calling `gemmini_loop_ws_spad` with `(tiles, tiles, tiles_K)` each time, restructure the outer loops to process larger blocks:
+
+- Choose `BIGBLK_I` and `BIGBLK_J` (in units of DIM tiles) such that the constraints are satisfied. For example, if `MATMUL_K/DIM = 4`, then the scratchpad can hold `(tiles_I_big * 4 + tiles_J_big * 4) * 16 ≤ 8192`, i.e., `tiles_I_big + tiles_J_big ≤ 128`. The accumulator caps at `tiles_I_big * tiles_J_big ≤ 16`. A balanced choice like `tiles_I_big = 4, tiles_J_big = 4` (i.e., `BIGBLK = 4 * DIM = 64`) uses `(4*4 + 4*4)*16 = 128 ≤ 8192` scratchpad rows and `4*4*16 = 256` accumulator rows — exactly filling the accumulator with a single `gemmini_loop_ws_spad` call.
+
+- Load A scales for the full `[i0*BIGBLK : (i0+1)*BIGBLK]` row-slice and B scales for the full `[j0*BIGBLK : (j0+1)*BIGBLK]` col-slice **once**, then issue one `gemmini_loop_ws_spad(tiles_I_big, tiles_J_big, tiles_K, ...)`.
+
+- This reduces the number of `gemmini_flush`, `gemmini_extended3_config_ex`, `gemmini_mx_load_scales`, `gemmini_config_ld`, `gemmini_config_st`, and `gemmini_mxquant_config_mvout` calls by a factor of `(BIGBLK/BLK)²`, directly cutting instruction-issue overhead proportionally.
+
+- The `gemmini_mx_read_smem` call at the end drains the larger fused result block in one or a few calls rather than many small ones.
+
+### Why This Improves Performance
+
+Each fixed-overhead instruction serializes the pipeline. By doing `tiles_I_big * tiles_J_big` times more useful compute per overhead instruction, the amortized cost per output element drops significantly. The `gemmini_flush(0)` inside the loop is particularly expensive — it stalls the entire accelerator pipeline — and eliminating it from inner iterations alone is a large win. The hardware fused loop `gemmini_loop_ws_spad` is designed to execute the full `I×J×K` matmul without software loop overhead, so passing it larger tile counts directly exploits this capability rather than wasting it on single small tiles.

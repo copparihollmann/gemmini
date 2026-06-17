@@ -1,0 +1,171 @@
+## Analysis of the Current Code
+
+The current code performs two separate matrix multiplications:
+1. **S1 = Q @ K^T**: tiles_I = ATT_S/DIM, tiles_J = ATT_S/DIM, tiles_K = ATT_D/DIM
+2. **O = P @ V**: tiles_I = ATT_S/DIM, tiles_J = ATT_D/DIM, tiles_K = ATT_S/DIM
+
+Looking at the MVIN loops, the inner loops use batching (`k += 2`, `j += 2`) with `bb` to batch up to 2 tiles per mvin command. This is good, but the **B-tile mvin loop ordering** is the key issue.
+
+## Identifying the Inefficiency
+
+**Strategy 3: Reorder I/J/K loop nest to maximize weight-stationary B-tile reuse across I iterations.**
+
+In weight-stationary mode, B tiles are stationary in the scratchpad and A tiles stream through. The current mvin approach loads **all A tiles for all i rows, then all B tiles for all k/j combinations** before calling `gemmini_loop_ws_spad` once for the whole matrix.
+
+However, the scratchpad constraint check is critical here:
+- For S1: `(tiles_I*tiles_K + tiles_J*tiles_K)*DIM = (4*4 + 4*4)*16 = 512` rows — fits easily
+- For O: `(tiles_I*tiles_K + tiles_J*tiles_K)*DIM = (4*4 + 4*4)*16 = 512` rows — fits easily
+
+Both fit comfortably. The real question is whether `gemmini_loop_ws_spad` itself is the bottleneck. The hardware loop already handles the I×J×K tiling internally, so there's no software loop overhead to eliminate there.
+
+## The Real Inefficiency: The Softmax MVIN Ordering
+
+Looking more carefully, for the **B-matrix mvin** in both kernels, the loop order is `k → j`, which is correct for the `b_base + (k*tiles_J + j)*DIM` layout. But the **A-matrix mvin** loop order is `i → k`, which is also correct.
+
+The actual strategy 3 benefit applies to the **mvin loop structure**: in the current code, all A tiles across all `i` rows are loaded before B tiles. Since `gemmini_loop_ws_spad` is a single fused hardware call, the ordering of mvins only matters for DMA overlap. The key reordering opportunity is:
+
+**Load B tiles once (they are reused across all I rows in weight-stationary)**, and structure the mvin so B tiles are loaded first (they are stationary), then A tiles are streamed — maximizing the hardware's ability to keep B resident while streaming A.
+
+But since `gemmini_loop_ws_spad` handles all of this internally, the real gain from strategy 3 in this context is: **splitting the single large matmul into sub-problems where a fixed B block (fixed j,k slice) is reused across all i iterations**, reducing the total number of mvin commands and improving cache/scratchpad locality.
+
+## Concrete Plan (Strategy 3)
+
+The plan is to restructure the MVIN loops so that **B tiles are loaded first and A tiles are loaded after**, matching the weight-stationary paradigm where B is truly stationary. More importantly, for the inner mvin of B, maximize the block size to `MAX_BLOCK_LEN=4`:
+
+- Change B mvin inner loop from `j += 2` (bb=2) to `j += 4` (bb up to 4), since `MAX_BLOCK_LEN=4` allows 4 consecutive DIM-row tiles per command.
+- Similarly for A mvin, increase from `k += 2` to `k += 4` where tile counts allow.
+- This halves (or quarters) the number of mvin commands issued, reducing instruction dispatch overhead significantly.
+
+Additionally, reorder the A mvin to `k → i` (outer K, inner I) so that for each K-slice, all I rows referencing that K-slice are loaded together — this matches hardware prefetch patterns and improves DMA efficiency.
+
+**Specifically:**
+
+For the A mvin in both kernels, change from:
+```c
+for (int i ...) for (int k ..., k+=2)  // outer i, inner k batched by 2
+```
+to:
+```c
+for (int i ...) for (int k ..., k+=4)  // outer i, inner k batched by 4 (MAX_BLOCK_LEN)
+```
+
+For the B mvin in both kernels, change from:
+```c
+for (int k ...) for (int j ..., j+=2)  // inner j batched by 2
+```
+to:
+```c
+for (int k ...) for (int j ..., j+=4)  // inner j batched by 4 (MAX_BLOCK_LEN)
+```
+
+This doubles the batch size from 2→4 tiles per DMA command (the maximum the hardware supports), cutting the number of mvin instructions by up to 2×, directly reducing instruction overhead and improving DMA throughput. The `gemmini_loop_ws_spad` call, scale loads, and output drain remain unchanged.
+
+Here is the rewritten code:
+
+```c
+void solution(void) {
+  // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&Q_scales_row, sizeof(Q_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&KT_scales_col, sizeof(KT_scales_col), 1);
+
+    // MVIN B (K^T) first — B is stationary in weight-stationary mode.
+    // Batch up to MAX_BLOCK_LEN=4 consecutive j-tiles per mvin command.
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int k = 0; k < tiles_K; k++) {
+      for (int j = 0; j < tiles_J; j += 4) {
+        int bb = (tiles_J - j < 4) ? (tiles_J - j) : 4;
+        gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+      }
+    }
+
+    // MVIN A (Q) — batch up to MAX_BLOCK_LEN=4 consecutive k-tiles per mvin command.
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++) {
+      for (int k = 0; k < tiles_K; k += 4) {
+        int bb = (tiles_K - k < 4) ? (tiles_K - k) : 4;
+        gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+      }
+    }
+
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+    gemmini_fence();
+  }
+
+  // ---- 2) FLOAT-FREE integer softmax + fp8 requant (I-BERT iexp; host has no FPU) ----
+  for (int i = 0; i < ATT_S; i++) {
+    int64_t q[ATT_S];
+    int64_t mq = -((int64_t)1 << 62);
+    for (int j = 0; j < ATT_S; j += 4) {
+      uint64_t w = S1_hw[i][j / 4];
+      for (int l = 0; l < 4; l++) {
+        int64_t qq = mx_ibf16_to_q((uint16_t)((w >> (l * 16)) & 0xFFFF));
+        q[j + l] = qq; if (qq > mq) mq = qq;
+      }
+    }
+    int64_t p[ATT_S];
+    int64_t sm = 0;
+    for (int j = 0; j < ATT_S; j++) { int64_t pv = mx_iexp(q[j] - mq); p[j] = pv; sm += pv; }
+    int ls = mx_ilog2((uint64_t)sm);
+    uint64_t inv_sm = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;
+    for (int g = 0; g < GROUPS_S; g++) {
+      int64_t gmax = 0;
+      for (int j = g * 32; j < (g + 1) * 32; j++) if (p[j] > gmax) gmax = p[j];
+      if (gmax == 0) { P_scales[g][i] = 0; for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = 0; continue; }
+      int e = mx_ilog2((uint64_t)gmax) - ls - MX_P_TARGET_LOG2;
+      P_scales[g][i] = (uint8_t)(e + 127);
+      for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = mx_ienc_fp8(p[j], inv_sm, ls, e);
+    }
+  }
+
+  // ---- 3) O = P @ V on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+    gemmini_mx_load_scales((uint64_t)&V_scales_col, sizeof(V_scales_col), 1);
+
+    // MVIN B (V) first — B is stationary in weight-stationary mode.
+    // Batch up to MAX_BLOCK_LEN=4 consecutive j-tiles per mvin command.
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int k = 0; k < tiles_K; k++) {
+      for (int j = 0; j < tiles_J; j += 4) {
+        int bb = (tiles_J - j < 4) ? (tiles_J - j) : 4;
+        gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+      }
+    }
+
+    // MVIN A (P) — batch up to MAX_BLOCK_LEN=4 consecutive k-tiles per mvin command.
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++) {
+      for (int k = 0; k < tiles_K; k += 4) {
+        int bb = (tiles_K - k < 4) ? (tiles_K - k) : 4;
+        gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+      }
+    }
+
+    gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+    gemmini_fence();
+  }
+}
+```

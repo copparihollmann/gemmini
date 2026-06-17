@@ -1,0 +1,88 @@
+## Strategy: Hoist `gemmini_flush` and `gemmini_extended3_config_ex` Outside the Outer Loop
+
+### Analysis of the Current Code
+
+In the current implementation, every iteration of the `(i0, j0)` block loop executes:
+
+```c
+gemmini_flush(0);
+gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+```
+
+These two instructions are **identical on every iteration** — the format fields (`act_mx_fmt=0`, `wgt_mx_fmt=0`, `out_mx_fmt=3`, `uselut=0`), the dataflow, strides, and activation never change across tiles. `gemmini_flush(0)` in particular is a pipeline drain that stalls until all in-flight commands complete, so issuing it `BLOCKS_M * BLOCKS_N` times (once per tile block) introduces `BLOCKS_M * BLOCKS_N` full pipeline stalls between tiles where there is no benefit.
+
+### Why This Hurts Performance
+
+- `gemmini_flush(0)` serializes the entire accelerator pipeline. Issuing it at the top of every `(i0, j0)` iteration prevents any overlap between the tail of one tile's computation/DMA and the setup of the next.
+- `gemmini_extended3_config_ex` writes the same constant value to the CONFIG_EX register every iteration. The architecture document notes: "avoid redundant re-issue when format, stride, and scale are unchanged across consecutive tiles." Each re-issue adds an unnecessary instruction and a potential pipeline bubble.
+- Together, these two redundant calls add `BLOCKS_M * BLOCKS_N - 1` extra flush-stall + config cycles to the total runtime.
+
+### The Fix: Hoist Both Calls Before the Loop
+
+Move `gemmini_flush(0)` and `gemmini_extended3_config_ex(...)` to execute exactly once before the `i0`/`j0` loop. The CONFIG_EX state persists across iterations (the hardware retains it until overwritten), so the systolic array format configuration is still valid for every tile block. Only one flush is needed at startup to ensure a clean initial state.
+
+```c
+void solution(void) {
+  // Hoist flush and config_ex outside the tile loop — they are
+  // loop-invariant: same format/dataflow/strides for every (i0,j0) block.
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                               1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      // No gemmini_flush or config_ex here anymore — state persists from above.
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int j = 0; j < tiles; j++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      if (mrows == BLK && ncols == BLK) {
+        gemmini_mx_read_smem(&C_hw[i0 * BLK][j0 * BLK / BF16_PER_WORD],
+                             SPAD_DEST * 16, BLK * BLK);
+      } else {
+        for (int r = 0; r < mrows; r++)
+          gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                               SPAD_DEST * 16 + r * BLK, ncols);
+      }
+    }
+  }
+  gemmini_fence();
+}
+```
+
+### Why This Is Correct
+
+- The `gemmini_extended3_config_ex` register state persists in hardware until overwritten. Since no other code between iterations changes the format, dataflow, strides, or activation fields, the configuration remains valid for all `(i0, j0)` iterations.
+- `gemmini_flush(0)` is only needed once at the very start to clear any prior pipeline state. The per-tile `gemmini_loop_ws_spad` already implies internal ordering of mvin→compute→smem, so no inter-tile flush is needed for correctness.
+- The programming model sequence (`config_ex` → `load_scales` → `mvin` → `mxquant_config_mvout` → `loop_ws_spad` → `read_smem`) is still satisfied within each `(i0, j0)` iteration; hoisting only moves the one-time hardware initialization before the loop.

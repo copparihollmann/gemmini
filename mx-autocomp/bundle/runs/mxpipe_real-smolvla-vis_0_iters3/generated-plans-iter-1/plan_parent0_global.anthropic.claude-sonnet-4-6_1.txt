@@ -1,0 +1,65 @@
+## Analysis of the Current Code
+
+The current code has a per-row `gemmini_mx_read_smem` call inside the output loop:
+
+```c
+for (int r = 0; r < mrows; r++)
+    gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                         SPAD_DEST * 16 + r * BLK, ncols);
+gemmini_fence();
+```
+
+This issues `mrows` separate DMA commands (up to `BLK` commands per output block), each transferring only `ncols` BF16 values from a single row. This is highly inefficient due to command overhead.
+
+## Selected Strategy: Consolidate `gemmini_mx_read_smem` Calls
+
+**Strategy 3**: Consolidate `gemmini_mx_read_smem` calls by issuing a single call per output block row-group rather than one call per row.
+
+## Plan
+
+### Key Observation
+
+The output array `C_hw` is row-major with `OUT_COLS / BF16_PER_WORD` words per row. The MX shared memory stores the output block in row-major order with an in-smem row stride of `BLK` BF16 elements. The DRAM destination `C_hw[i0*BLK + r][(j0*BLK)/BF16_PER_WORD]` is contiguous across rows **only if** the smem row stride matches the DRAM row stride.
+
+### When Full Consolidation Is Possible
+
+If `BLK == OUT_COLS` (i.e., the block covers the full output width), then consecutive smem rows map to consecutive DRAM rows with no gap — a single `gemmini_mx_read_smem` call suffices for the entire `mrows × ncols` block.
+
+When `BLK < OUT_COLS`, the DRAM rows have stride `OUT_COLS` BF16 elements but smem rows have stride `BLK` — so per-row calls are needed **unless** we use the full-width case. However, we can still reduce call count by reading full rows (all `BLK` columns including padding columns), if the output buffer has contiguous row layout and we cap reads to `ncols`.
+
+### Concrete Change
+
+Replace the per-row loop with a **single** `gemmini_mx_read_smem` call when the output rows in `C_hw` are contiguous in memory (i.e., `ncols == BLK` and `mrows == BLK`, or more generally when the smem layout is stride-compatible with DRAM).
+
+For the general case, consolidate to read `mrows` full rows at once when `ncols == BLK` (full-width column block), and keep per-row calls only when `ncols < BLK` (partial last column block). Since `BLK` divides `REAL_N` evenly (except possibly the last block), most blocks will have `ncols == BLK`.
+
+Specifically:
+- **When `ncols == BLK`** (full column block, which is the common case): issue a single `gemmini_mx_read_smem(&C_hw[i0*BLK][j0*BLK/BF16_PER_WORD], SPAD_DEST*16, mrows * BLK)` — one DMA transfer for the entire `mrows × BLK` contiguous region.
+- **When `ncols < BLK`** (partial last column block): keep the per-row loop (required since smem stride `BLK` ≠ DRAM stride `OUT_COLS`... but actually even here, if `BLK == ncols` they're the same; otherwise fall back to per-row).
+
+The single call eliminates up to `BLK - 1` RoCC instructions per output block and removes the loop overhead entirely for full blocks, directly reducing accelerator command latency.
+
+### Summary of Code Change
+
+```c
+// Replace:
+for (int r = 0; r < mrows; r++)
+    gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                         SPAD_DEST * 16 + r * BLK, ncols);
+gemmini_fence();
+
+// With:
+if (ncols == BLK) {
+    // Full-width block: smem and DRAM rows are both BLK wide → contiguous
+    gemmini_mx_read_smem(&C_hw[i0 * BLK][(j0 * BLK) / BF16_PER_WORD],
+                         SPAD_DEST * 16, mrows * BLK);
+} else {
+    // Partial last column block: must transfer row by row
+    for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+}
+gemmini_fence();
+```
+
+This consolidates the dominant case (full column blocks) from `mrows` DMA commands into 1, reducing RoCC instruction overhead proportional to `mrows` (up to `BLK/DIM = tiles` times fewer commands per output block).

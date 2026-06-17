@@ -1,0 +1,90 @@
+## Analysis of the Current Code
+
+Looking at the current code, I need to identify which strategy is most impactful:
+
+**Strategy 5: Hoist loop-invariant scalar computations outside both loops**
+
+The current code recomputes inside the `i0/j0` loop body:
+- `int tiles = BLK / DIM` — constant, doesn't depend on i0 or j0
+- `int tiles_K = MATMUL_K / DIM` — constant
+- `uint32_t a_base = 0` — constant
+- `uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM` — constant (depends only on `tiles` and `tiles_K`)
+- `int SPAD_DEST = 128` — constant
+- The `gemmini_flush(0)` call is inside the loop — this is expensive and unnecessary every iteration since we just need to flush once before the first tile
+- The `gemmini_extended3_config_ex(...)` call is inside the loop — the format/dataflow configuration doesn't change between tiles, so this re-issues a full CONFIG_EX every iteration unnecessarily
+- `gemmini_config_ld(MATMUL_K * sizeof(elem_t))` and `gemmini_config_ld(MATMUL_N * sizeof(elem_t))` — the strides for A and B loads don't change between outer tiles, so these can be hoisted
+
+By moving these outside the `i0/j0` loops, we eliminate redundant hardware configuration instructions on every tile iteration, reducing instruction overhead.
+
+## Plan
+
+1. **Hoist scalar constants** (`tiles`, `tiles_K`, `a_base`, `b_base`, `SPAD_DEST`) to before the `i0` loop.
+
+2. **Hoist `gemmini_flush(0)`** to before the outer loop — it only needs to happen once at kernel startup.
+
+3. **Hoist `gemmini_extended3_config_ex(...)`** to before the outer loop — the format, dataflow, strides, and MX format fields are identical for every `(i0, j0)` tile, so issuing it once is sufficient. Use `set_only_strides=false` (as now) for the initial call.
+
+4. **Hoist `gemmini_config_ld(MATMUL_K * sizeof(elem_t))`** (for A mvin) before the outer loop. It only changes between the A-mvin and B-mvin sections, so we still need to issue it before each format-change, but the stride for A is always `MATMUL_K` and the stride for B is always `MATMUL_N` — these can be moved to just before the inner mvin loops, outside `i0/j0`.
+
+5. **Keep `gemmini_mx_load_scales`** and the `gemmini_config_st`/`gemmini_mxquant_config_mvout` inside the loop since they use tile-dependent values (`A_s`, `B_s`, `mrows`, `ncols`, `pad_i`, `pad_j`).
+
+The key insight is that `gemmini_flush` + `gemmini_extended3_config_ex` are expensive configuration instructions that currently run `BLOCKS_M * BLOCKS_N` times but only need to run once. Similarly the `gemmini_config_ld` for the two strides can be placed just once before the outer loop (the A-stride config before the A-mvin loop, the B-stride config before the B-mvin loop), but since both strides are constants they can be moved outside `i0/j0` while still being issued in the correct sequence (before their respective mvin calls).
+
+Here is the rewritten code:
+
+```c
+void solution(void) {
+  // Hoist all loop-invariant scalar computations outside both loops.
+  int tiles   = BLK / DIM;
+  int tiles_K = MATMUL_K / DIM;
+  uint32_t a_base   = 0;
+  uint32_t b_base   = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+  int SPAD_DEST = 128;
+
+  // Hoist flush and format configuration: these are identical for every tile.
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                               1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Partial last M/N block: compute only the real rows/cols, pad the rest.
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+      // PROF cpu_stage
+      // Stage only the tiny per-32-group scales; A/B data is mvin'd DIRECTLY
+      // from DRAM (no host-side block memcpy).
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+      // PROF accel
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+      // A-mvin: stride is always MATMUL_K bytes (constant across all tiles).
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      // B-mvin: stride is always MATMUL_N bytes (constant across all tiles).
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int j = 0; j < tiles; j++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      // Accelerator-centric readout: per-row hardware DMA from smem straight into the
+      // bf16-packed row-major output (block-internal smem row stride is BLK).
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+  }
+}
+```

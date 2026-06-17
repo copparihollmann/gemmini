@@ -1,0 +1,64 @@
+## Analysis of the Current Code
+
+The current code has this structure:
+```
+for j0 (outer):
+    mvin B tiles (once per j0) ← good, B is hoisted
+    for i0 (inner):
+        gemmini_flush(0)        ← expensive full flush every i0 iteration
+        config_ex
+        load A scales
+        load B scales
+        mvin A tiles
+        config_st + mxquant_config_mvout
+        gemmini_loop_ws_spad
+        gemmini_mx_read_smem (row by row)
+        gemmini_fence()
+```
+
+The key inefficiency I see: **`gemmini_flush(0)` is called every inner iteration**, which is a full pipeline flush. This is expensive and redundant — the fence already provides sufficient synchronization. Also, looking at the strategies, **double buffering** can overlap the A tile loading for the next `i0` iteration with the computation of the current one.
+
+## Plan: Double Buffering A Tiles
+
+### Strategy: Double Buffering
+
+The current code sequentially: loads A tiles → computes → drains output → repeats for next `i0`. There's no overlap between loading and compute.
+
+**Double buffering** the A scratchpad allocation allows us to load A tiles for iteration `i0+1` while `gemmini_loop_ws_spad` is executing for `i0`.
+
+### Concrete Changes
+
+1. **Split the A scratchpad into two halves.** The scratchpad has 8192 rows. B tiles occupy the top: `b_base = BANK_NUM*BANK_ROWS - tiles*tiles_K*DIM`. With `tiles=tiles_K=16` (BLK=256, K=256, DIM=16), B uses `16*16*16 = 4096` rows. That leaves 4096 rows for A. Each A block needs `tiles*tiles_K*DIM = 16*16*16 = 4096` rows — so two A buffers would require 8192 rows total, which exactly equals the scratchpad minus B... but B takes 4096, so we only have 4096 rows left.
+
+   Re-examine: `tiles = BLK/DIM = 256/16 = 16`, `tiles_K = MATMUL_K/DIM = 256/16 = 16`. A needs `tiles*tiles_K*DIM = 16*16*16 = 4096` rows. B needs `tiles*tiles_K*DIM = 4096` rows. Total = 8192 = exactly the full scratchpad. No room for double buffering A while keeping B resident.
+
+2. **Adjust tiling to enable double buffering.** Since B is hoisted per `j0` and stays fixed for all `i0` iterations, we can instead double-buffer using the `a_spad_id` parameter (0, 1, 2) in `gemmini_loop_ws_spad`. However, the hardware `a_spad_id` parameter controls reuse, not double-buffering of loads.
+
+3. **Revised approach — remove `gemmini_flush` and pipeline across i0 iterations.** The `gemmini_flush(0)` at the start of each `i0` is the main overhead. Replace it by removing it entirely (the `gemmini_fence()` at the end of the previous iteration already ensures ordering) and instead **overlap the mvin of A for i0+1 with the loop_ws_spad + mx_read_smem of i0**:
+
+   - Issue **mvin A tiles for `i0+1`** into the alternate A buffer (`a_base_next = tiles*tiles_K*DIM`) immediately after issuing `gemmini_loop_ws_spad` for `i0` (before its fence).
+   - Since scratchpad fits both: use `a_base_ping = 0` and `a_base_pong = tiles*tiles_K*DIM` alternating. But with B using 4096 rows and two A buffers using 8192 rows, it doesn't fit.
+
+4. **Correct feasibility check with actual matrix dimensions.** MATMUL_M=113, MATMUL_N=256, MATMUL_K=256, BLK=256 (from context). So `BLOCKS_M = ceil(113/256) = 1`, `BLOCKS_N = ceil(256/256) = 1`. With only 1 block in each dimension, double buffering across blocks gives no benefit.
+
+   Let me reconsider: BLK must be smaller. Looking at the code: `tiles = BLK/DIM` and `b_base = BANK_NUM*BANK_ROWS - tiles*tiles_K*DIM`. The scratchpad constraint: `(tiles_I*tiles_K + tiles_J*tiles_K)*DIM ≤ 8192`, with `tiles_I = tiles_J = tiles`: `2*tiles*tiles_K*DIM ≤ 8192 → tiles ≤ 8192/(2*16*16) = 16`. So `BLK ≤ 256`. With M=113, N=256, K=256, one block covers everything already.
+
+### Revised Plan: Remove `gemmini_flush` (Eliminate Redundant Computation)
+
+Actually, reviewing the strategies again: **eliminate redundant computation** is directly applicable here. The `gemmini_flush(0)` is the dominant redundant operation — it's a full pipeline drain issued every inner iteration, but only a `gemmini_fence()` is needed (and already issued at end of prior iteration). Removing the flush eliminates a full synchronization barrier per tile.
+
+Additionally, `gemmini_extended3_config_ex` is called every `i0` iteration even though the format fields never change across iterations — it only needs to be called once before the outer loop.
+
+Similarly, `gemmini_config_ld(MATMUL_K * sizeof(elem_t))` for A and `gemmini_config_ld(MATMUL_N * sizeof(elem_t))` for B are called every iteration without change.
+
+### Final Plan
+
+**Strategy: Eliminate Redundant Computation**
+
+1. **Hoist `gemmini_extended3_config_ex`** out of the `j0`/`i0` loops — call it once before any loop.
+2. **Remove `gemmini_flush(0)`** entirely from the inner loop — it is unnecessary because the fence from the previous iteration already ensures ordering, and the flush adds expensive pipeline drain overhead on every tile.
+3. **Hoist `gemmini_config_ld(MATMUL_N * sizeof(elem_t))`** for B loading out of the `j0` loop (it never changes).
+4. **Hoist `gemmini_config_ld(MATMUL_K * sizeof(elem_t))`** for A loading — set it once outside both loops and restore after B mvin.
+5. **Hoist `gemmini_config_st`** out of the inner loop since `BLK_OUTC` is constant.
+
+These changes eliminate O(BLOCKS_M * BLOCKS_N) redundant flush+config instructions from the hot path.

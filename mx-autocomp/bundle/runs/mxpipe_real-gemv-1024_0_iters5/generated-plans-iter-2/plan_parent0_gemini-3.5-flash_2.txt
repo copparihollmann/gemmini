@@ -1,0 +1,68 @@
+### Optimization Strategy: Unblocked Single-Pass Execution with Direct Scale Factor Loading
+
+The proposed strategy is **Unblocked Single-Pass Execution with Direct Scale Factor Loading**.
+
+By analyzing the scratchpad and accumulator capacities for a $64 \times 64 \times 64$ matrix multiplication, we find that the entire problem fits completely within the on-chip SRAM of MX-Gemmini:
+1. **Scratchpad requirement**: $(tiles_I \times tiles_K + tiles_J \times tiles_K) \times \text{DIM} = (4 \times 4 + 4 \times 4) \times 16 = 512$ rows, which is well below the 8192 rows limit.
+2. **Accumulator requirement**: $tiles_I \times tiles_J \times \text{DIM} = 4 \times 4 \times 16 = 256$ rows, which perfectly matches the 256 rows accumulator limit.
+
+By utilizing 100% of the accumulator capacity, we can completely eliminate the outer loop blocking (`BLOCKS_M` and `BLOCKS_N`). This yields three massive performance benefits:
+- **Zero Host Staging Stalls**: The row/column scale factors (`A_scales_row` and `B_scales_col`) no longer need to be sliced and copied into staging buffers (`A_s_pool`, `B_s_pool`) via CPU `memcpy`. They are loaded directly from their contiguous DRAM addresses in a single call to `gemmini_mx_load_scales`.
+- **Fused Computational Loop**: The entire $64 \times 64$ matrix multiplication runs in a single, uninterrupted hardware loop (`gemmini_loop_ws_spad`), maximizing systolic array utilization and avoiding redundant configuration/flushing.
+- **Vectorized Shared Memory Readout**: We drain the entire output from the shared memory to DRAM using a single `gemmini_mx_read_smem` call instead of 64 separate row-by-row calls, drastically reducing instruction dispatch overhead.
+
+### Optimized Code
+
+```c
+void solution(void) {
+  int tiles_I = MATMUL_M / DIM;
+  int tiles_J = MATMUL_N / DIM;
+  int tiles_K = MATMUL_K / DIM;
+
+  uint32_t a_base = 0;
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+  int SPAD_DEST = 128;
+
+  gemmini_flush(0);
+
+  // 1. Configure execution for weight-stationary FP8
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // 2. Stream all row and column scale factors directly from contiguous DRAM to scale memories
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // 3. MVIN A tiles to scratchpad
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i * DIM) * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    }
+  }
+
+  // 4. MVIN B tiles to scratchpad
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + j * DIM),
+                            b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+    }
+  }
+
+  // 5. Configure the requantizer for vector output
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // 6. Execute fused hardware loop
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+                       a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                       false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // 7. Vectorized readout of BF16-packed results from shared memory
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+
+  // 8. Synchronize
+  gemmini_fence();
+}
+```

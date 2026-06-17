@@ -1,0 +1,79 @@
+Looking at the error and the code, I can see several issues that need to be fixed:
+
+1. The `gemmini_mx_read_smem` call has incorrect addressing - it's trying to read `ncols` elements but the data is packed 4 BF16 values per uint64 word
+2. The scratchpad layout calculation for B tiles is incorrect
+3. The output reading logic doesn't account for proper BF16 packing
+
+Let me fix these issues:
+
+```c
+// Optimized MX matmul (50x256x512)
+void solution(void) {
+  // Hoist invariant configurations outside of all loops
+  gemmini_config_st(BLK_OUTC * sizeof(out_t));
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // === Optimization: Load scale factors once, directly from DRAM ===
+  // Load A scales (activations) into scale memory bank 0
+  gemmini_mx_load_scales((uint64_t)A_scales_row, sizeof(A_scales_row), 0);
+  // Load B scales (weights) into scale memory bank 1
+  gemmini_mx_load_scales((uint64_t)B_scales_col, sizeof(B_scales_col), 1);
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    // Determine exact row count and padding for current M-block
+    int mrows = REAL_M - i0 * BLK; 
+    if (mrows > BLK) mrows = BLK; 
+    if (mrows <= 0) continue;
+
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Determine exact column count and padding for current N-block
+      int ncols = REAL_N - j0 * BLK; 
+      if (ncols > BLK) ncols = BLK; 
+      if (ncols <= 0) continue;
+
+      int tiles_I = BLK / DIM, tiles_J = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_J * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      gemmini_flush(0);
+
+      // MVIN A tiles directly from source DRAM
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles_I; i++) {
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+        }
+      }
+
+      // MVIN B tiles directly from source DRAM
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int j = 0; j < tiles_J; j++) {
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin2((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                 b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+        }
+      }
+
+      // Requantizer setup & Compute execution
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+      
+      // Issue the one-shot marker before the loop
+      ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, a_base, b_base, k_LOOP_WS_CONFIG_SPAD_AB);
+      
+      gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, pad_i, pad_j, 0, a_base, b_base, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Store outputs directly from SMEM to DRAM - corrected for BF16 packing
+      int bf16_words = (ncols + 3) / 4; // Round up to handle packing of 4 BF16 per uint64
+      for (int r = 0; r < mrows; r++) {
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][j0 * BLK / 4],
+                             SPAD_DEST * 16 + r * BLK, bf16_words * 4); // Read in terms of BF16 elements
+      }
+      gemmini_fence();
+    }
+  }
+}
+```

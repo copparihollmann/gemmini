@@ -1,0 +1,73 @@
+## Strategy: Overlap MVIN Data Loading with Independent Operations Using Mvin2 for B-matrix Loading
+
+### Analysis of the Current Code
+
+In both the QK^T and PV matmul blocks, the current code serially loads all A tiles, then loads all B tiles, then issues the compute instruction:
+
+```c
+// Load ALL A tiles first (serial)
+gemmini_config_ld(ATT_D*sizeof(elem_t));
+for(int i=0;i<ti;i++)for(int k=0;k<tk;k++)
+    gemmini_extended_mvin(...); // A via port 0
+
+// Then load ALL B tiles (serial)
+gemmini_config_ld(ATT_S*sizeof(elem_t)/2);
+for(int k=0;k<tk;k++)for(int j=0;j<tj;j++)
+    gemmini_extended_mvin(...); // B also via port 0!
+```
+
+**The critical inefficiency**: Both A and B tiles are loaded through **the same mvin port (port 0 / `k_MVIN`)** with two separate `gemmini_config_ld` reconfiguration calls in between. The hardware has **three independent DMA ports** (`mvin`/`mvin2`/`mvin3`), and loading both matrices through port 0 means:
+1. A and B loads are strictly serialized — B cannot begin until all A loads complete
+2. Two `gemmini_config_ld` calls are needed (one for stride `ATT_D*sizeof(elem_t)`, one for `ATT_S*sizeof(elem_t)/2`), each stalling the pipeline
+3. The DMA engine is underutilized at 1/3 capacity during the entire loading phase
+
+### The Strategy: Use `mvin2` for B-matrix Loading with Concurrent Stride Configuration
+
+**Change**: Load A tiles via `gemmini_extended_mvin` (port 0) and B tiles via `gemmini_extended_mvin2` (port 1) simultaneously. Use `gemmini_extended3_config_ld` with `id=0` and `id=1` to configure both ports independently, allowing both A and B DMA transfers to proceed in parallel through the hardware pipeline.
+
+The key insight is that `gemmini_extended3_config_ld(stride, scale, shrunk, id)` takes an `id` parameter (0, 1, or 2) that selects which mvin port's configuration register is written. Port 0 controls `mvin`, port 1 controls `mvin2`, port 2 controls `mvin3`. By configuring the two ports with different strides before issuing any mvin commands, both can then be issued interleaved — the hardware queues them independently and executes them concurrently.
+
+### Concrete Code Change
+
+Replace the sequential dual-`gemmini_config_ld` + serial loops with:
+
+```c
+// Configure both ports independently (no reconfiguration mid-loop)
+gemmini_extended3_config_ld(ATT_D*sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0); // port 0: A stride
+gemmini_extended3_config_ld((ATT_S*sizeof(elem_t)/2), MVIN_SCALE_IDENTITY, false, 1); // port 1: B stride
+
+// Interleave A (port 0) and B (port 1) loads in a single pass
+for(int k=0;k<tk;k++){
+    for(int i=0;i<ti;i++)
+        gemmini_extended_mvin((void*)(((elem_t*)Q_hw)+i*DIM*ATT_D+k*DIM),
+                              ab+(i*tk+k)*DIM, DIM, DIM);          // port 0
+    for(int j=0;j<tj;j++)
+        gemmini_extended_mvin2((void*)(((elem_t*)KT_in)+k*DIM*(ATT_S/2)+j*DIM),
+                               bb+(k*tj+j)*DIM, DIM, DIM);         // port 1
+}
+```
+
+Apply the same transformation to the PV block:
+```c
+gemmini_extended3_config_ld(ATT_S*sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);   // port 0: P stride
+gemmini_extended3_config_ld(ATT_D*sizeof(elem_t)/2, MVIN_SCALE_IDENTITY, false, 1); // port 1: V stride
+
+for(int k=0;k<tk;k++){
+    for(int i=0;i<ti;i++)
+        gemmini_extended_mvin((void*)(((elem_t*)P_hw)+i*DIM*ATT_S+k*DIM),
+                              ab+(i*tk+k)*DIM, DIM, DIM);
+    for(int j=0;j<tj;j++)
+        gemmini_extended_mvin2((void*)(((elem_t*)V_in)+k*DIM*(ATT_D/2)+j*DIM),
+                               bb+(k*tj+j)*DIM, DIM, DIM);
+}
+```
+
+### Why This Improves Performance
+
+1. **Parallel DMA bandwidth**: Port 0 and port 1 issue independently to the DMA engine. In the QK^T block, A has `ti*tk = 4*4 = 16` tiles and B has `tj*tk = 4*4 = 16` tiles, totaling 32 sequential mvin commands on port 0. With the split, 16 commands go to each port, and the hardware overlaps their DRAM fetches — effectively halving the load phase latency for the dominant bandwidth-limited portion.
+
+2. **Eliminates mid-loop reconfiguration**: The original code issues `gemmini_config_ld` twice with different strides, serializing around a configuration fence between A and B loading. The new code configures both ports once before any data movement, removing two stall-inducing configuration instructions from the critical path.
+
+3. **Better DRAM access interleaving**: By iterating over k in the outer loop and interleaving A-row and B-column loads for the same k-block, DRAM requests for A and B tiles access different DRAM row addresses concurrently, reducing DRAM bank conflicts compared to loading all of one matrix then all of another.
+
+4. **No correctness impact**: Both A and B tiles land at the same scratchpad addresses as before (`ab+(i*tk+k)*DIM` and `bb+(k*tj+j)*DIM`). The `gemmini_loop_ws_spad` instruction reads from these addresses after all mvins complete — the hardware loop waits for the scratchpad to be populated before executing, so the reordering of which port delivers which tile is transparent to the compute stage. Scale loads, LUT loads, and the programming model sequence are all unchanged.

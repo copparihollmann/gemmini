@@ -1,0 +1,383 @@
+{'correct': False, 'test_results': {0: False}, 'compiled': True, 'stdout': 'Kernel produced an INCORRECT/illegal result on spike. Diagnostic (fix this before optimizing):
+GEMMINI LOOP_WS ILLEGAL: a loop_ws input was loaded via mvin2/mvin3 (port != 0); the MX loop_ws_spad reads A/B from the port-0 scratchpad region on RTL, so this is spike-correct but RTL-WRONG (the fp8-128 dual-port-B winner). Use single-port gemmini_extended_mvin for loop_ws inputs. -- spike<->RTL dual-port divergence (task #38)
+Gemmini extension configured with:
+dim = 16'}
+Prev latency: 18858
+New latency: N/A
+Plan: An elegant and highly effective optimization strategy to reduce execution time for this MX-Gemmini FP4 kernel focuses on **Host Loop Unrolling and Address Calculation Strength-Reduction for RoCC Command Streaming**, coupled with **Dual DMA Port Parallelism via `mvin2`**.
+
+### Optimization Strategy: Host Loop Unrolling & Dual DMA Parallelism
+
+In the baseline code, the RISC-V host CPU performs complex 2D address calculations (including multiple multiplications and additions) inside nested loops to determine the DRAM pointer and scratchpad address for every single tile load. Since the systolic array relies on the host CPU to stream these RoCC instructions, a slow host loop can starve the Gemmini instruction queue, leading to execution stalls.
+
+We optimize this by:
+1. **Unrolling the inner loops** of both A and B matrix loads. Since $tk = 16$ (8 iterations of `k += 2` for A) and $tj = 4$ (4 iterations for B) are known constants, we can fully unroll them to eliminate loop overhead entirely.
+2. **Replacing multi-dimensional pointer arithmetic with simple sequential pointer updates**, removing all multiplication operations inside the hot path.
+3. **Using the dedicated `mvin2` instruction for B-matrix tiles**, which utilizes Gemmini's separate B-side DMA stream to optimize bus bandwidth.
+4. **Ensuring strict programming sequence order** by moving the store/requantizer configurations to occur directly after the `mvin` sequence and right before the compute loop execution.
+
+### Rewritten Program
+
+```c
+// AUTO-GENERATED optimized MX matmul kernel (128x128x256, fp4:e2m1).
+void solution(void) {
+  int ti = MATMUL_M / DIM / 2;
+  int tj = MATMUL_N / DIM / 2;
+  int tk = MATMUL_K / DIM;
+  uint32_t ab = 0;
+  uint32_t bb = BANK_NUM * BANK_ROWS - tk * tj * DIM;
+  int SDST = 128;
+
+  // 1. Configure execution with A_stride = 2 to match the batched scratchpad layout
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 2, 0, 0, false, 2, 2, 3, 0);
+
+  // 2. Load scale factors
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // 3. MVIN A: Batched by 2 along the K dimension (cols = 2 * DIM)
+  // Fully unrolled inner loop with strength-reduced pointer arithmetic
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < ti; i++) {
+    elem_t *a_ptr = ((elem_t*)A_in_hw) + i * DIM * MATMUL_K;
+    uint32_t sp_addr = ab + i * tk * DIM;
+
+    gemmini_extended_mvin(a_ptr,           sp_addr,           2 * DIM, DIM);
+    gemmini_extended_mvin(a_ptr + 2 * DIM,  sp_addr + 2 * DIM,  2 * DIM, DIM);
+    gemmini_extended_mvin(a_ptr + 4 * DIM,  sp_addr + 4 * DIM,  2 * DIM, DIM);
+    gemmini_extended_mvin(a_ptr + 6 * DIM,  sp_addr + 6 * DIM,  2 * DIM, DIM);
+    gemmini_extended_mvin(a_ptr + 8 * DIM,  sp_addr + 8 * DIM,  2 * DIM, DIM);
+    gemmini_extended_mvin(a_ptr + 10 * DIM, sp_addr + 10 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin(a_ptr + 12 * DIM, sp_addr + 12 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin(a_ptr + 14 * DIM, sp_addr + 14 * DIM, 2 * DIM, DIM);
+  }
+
+  // 4. MVIN B: Streamed utilizing dedicated gemmini_extended_mvin2
+  // Fully unrolled inner loop with strength-reduced pointer arithmetic
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2);
+  for (int k = 0; k < tk; k++) {
+    elem_t *b_ptr = ((elem_t*)B_in) + k * DIM * (MATMUL_N / 2);
+    uint32_t sp_addr = bb + k * tj * DIM;
+
+    gemmini_extended_mvin2(b_ptr,           sp_addr,           DIM, DIM);
+    gemmini_extended_mvin2(b_ptr + DIM,     sp_addr + DIM,     DIM, DIM);
+    gemmini_extended_mvin2(b_ptr + 2 * DIM, sp_addr + 2 * DIM, DIM, DIM);
+    gemmini_extended_mvin2(b_ptr + 3 * DIM, sp_addr + 3 * DIM, DIM, DIM);
+  }
+
+  // 5. Configure store and requantizer (placed immediately before compute)
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti, tj, tk, 0, 0, 1);
+
+  // 6. Compute Weight-Stationary Matrix Multiplication
+  gemmini_loop_ws_spad(ti, tj, tk, 0, 0, 0, ab, BANK_NUM * BANK_ROWS, 0, SDST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // 7. Drain output BF16 elements from shared memory to DRAM
+  gemmini_mx_read_smem(&C_hw[0][0], SDST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+### How This Improves Performance
+
+1. **Continuous Coprocessor Command Saturation:** Unrolling the inner loops for $tk$ and $tj$ eliminates all branch execution penalty on the host. More importantly, computing pointers using compile-time constants (such as `a_ptr + 2*DIM` rather than calculating `i*DIM*MATMUL_K + k*DIM` dynamically) reduces complex arithmetic instructions to single additions. This prevents the CPU from falling behind the hardware's consumption rate.
+2. **Dedicated DMA Channel Execution:** By employing `gemmini_extended_mvin2` for the $B$ matrix inputs, we isolate $A$ and $B$ streams into their respective scratchpad load interfaces. This enhances bus utilization and increases overlap during the preloading phase.
+3. **Adherence to State Transition Protocols:** Placing `gemmini_mxquant_config_mvout` strictly after the scratchpad data load and immediately before `gemmini_loop_ws_spad` respects Gemmini's sequential register configuration pipeline, eliminating speculative bubbles.
+
+CodeCandidate(parent=CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED baseline MX matmul kernel (128x128x256, fp4:e2m1).
+void solution(void) {
+  {
+    int ti = MATMUL_M / DIM / 2, tj = MATMUL_N / DIM / 2, tk = MATMUL_K / DIM;
+    uint32_t ab = 0;
+    uint32_t bb = BANK_NUM * BANK_ROWS - tk * tj * DIM;
+    int SDST = 128;
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 2, 2, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti, tj, tk, 0, 0, 1);
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i = 0; i < ti; i++)
+      for (int k = 0; k < tk; k++)
+        gemmini_extended_mvin((void*)(((elem_t*)A_in_hw) + i*DIM*MATMUL_K + k*DIM), ab + (i*tk + k)*DIM, DIM, DIM);
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2);
+    for (int k = 0; k < tk; k++)
+      for (int j = 0; j < tj; j++)
+        gemmini_extended_mvin((void*)(((elem_t*)B_in) + k*DIM*(MATMUL_N/2) + j*DIM), bb + (k*tj + j)*DIM, DIM, DIM);
+    gemmini_loop_ws_spad(ti, tj, tk, 0, 0, 0, ab, BANK_NUM * BANK_ROWS, 0, SDST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&C_hw[0][0], SDST * 16, MATMUL_M * MATMUL_N);
+    gemmini_fence();
+  }
+}
+''',
+score=18909,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'Accelerator-bound: compute and data-movement look balanced; tune tiling / scratchpad occupancy for more overlap.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''An elegant and highly effective optimization plan for this stage is to apply **Strategy 7: batch the mvin with block_mvin**.
+
+### Inefficiency Analysis
+In the baseline code, the activation matrix $A$ is loaded tile-by-tile in the inner loop:
+```c
+for (int i = 0; i < ti; i++)
+  for (int k = 0; k < tk; k++)
+    gemmini_extended_mvin((void*)(((elem_t*)A_in_hw) + i*DIM*MATMUL_K + k*DIM), ab + (i*tk + k)*DIM, DIM, DIM);
+```
+This issues a separate `gemmini_extended_mvin` command for every single $16 \times 16$ tile. Since $tk = 16$ and $ti = 4$, this results in $64$ individual DMA load instructions for matrix $A$ alone. Each instruction incurs host-coprocessor round-trip latency, control overhead, and command queue slots.
+
+### Optimization Plan
+We will batch the DMA load of matrix $A$ along the $K$ dimension by a factor of 2 (setting `batch = 2`), loading $32$ columns of data ($2 \times \text{DIM}$) in a single instruction.
+
+1. **Step the Loop by 2**: Change the inner loop over $k$ to increment by 2 (`k += 2`).
+2. **Increase Columns in `mvin`**: Update the `cols` parameter of `gemmini_extended_mvin` from `DIM` to `2 * DIM` (32 columns).
+3. **Configure Scratchpad Stride**: In Gemmini, writing a 32-column row into a 16-column scratchpad row causes the two tiles to be interleaved row-by-row. To handle this layout during compute, we must change the scratchpad reading stride of A from `1` to `2`. We achieve this by modifying the 6th argument (`A_stride`) of `gemmini_extended3_config_ex` to `2`.
+
+This reduces the total `mvin` instructions for matrix $A$ by 50% without violating any hardware limits or correctness checks.
+
+### Optimized Code
+
+```c
+// AUTO-GENERATED optimized MX matmul kernel (128x128x256, fp4:e2m1).
+void solution(void) {
+  {
+    int ti = MATMUL_M / DIM / 2, tj = MATMUL_N / DIM / 2, tk = MATMUL_K / DIM;
+    uint32_t ab = 0;
+    uint32_t bb = BANK_NUM * BANK_ROWS - tk * tj * DIM;
+    int SDST = 128;
+    
+    // Configure execution with A_stride = 2 to match the batched scratchpad layout
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 2, 0, 0, false, 2, 2, 3, 0);
+    
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti, tj, tk, 0, 0, 1);
+    
+    // MVIN A: Batched by 2 along the K dimension (cols = 2 * DIM)
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i = 0; i < ti; i++) {
+      for (int k = 0; k < tk; k += 2) {
+        gemmini_extended_mvin((void*)(((elem_t*)A_in_hw) + i*DIM*MATMUL_K + k*DIM), ab + (i*tk + k)*DIM, 2 * DIM, DIM);
+      }
+    }
+    
+    // MVIN B remains unbatched as B_stride is fixed to 1 in weight-stationary mode
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2);
+    for (int k = 0; k < tk; k++) {
+      for (int j = 0; j < tj; j++) {
+        gemmini_extended_mvin((void*)(((elem_t*)B_in) + k*DIM*(MATMUL_N/2) + j*DIM), bb + (k*tj + j)*DIM, DIM, DIM);
+      }
+    }
+    
+    gemmini_loop_ws_spad(ti, tj, tk, 0, 0, 0, ab, BANK_NUM * BANK_ROWS, 0, SDST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&C_hw[0][0], SDST * 16, MATMUL_M * MATMUL_N);
+    gemmini_fence();
+  }
+}
+```''',
+code='''// AUTO-GENERATED optimized MX matmul kernel (128x128x256, fp4:e2m1).
+void solution(void) {
+  {
+    int ti = MATMUL_M / DIM / 2, tj = MATMUL_N / DIM / 2, tk = MATMUL_K / DIM;
+    uint32_t ab = 0;
+    uint32_t bb = BANK_NUM * BANK_ROWS - tk * tj * DIM;
+    int SDST = 128;
+    
+    // Configure execution with A_stride = 2 to match the batched scratchpad layout
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 2, 0, 0, false, 2, 2, 3, 0);
+    
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti, tj, tk, 0, 0, 1);
+    
+    // MVIN A: Batched by 2 along the K dimension (cols = 2 * DIM)
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i = 0; i < ti; i++) {
+      for (int k = 0; k < tk; k += 2) {
+        gemmini_extended_mvin((void*)(((elem_t*)A_in_hw) + i*DIM*MATMUL_K + k*DIM), ab + (i*tk + k)*DIM, 2 * DIM, DIM);
+      }
+    }
+    
+    // MVIN B remains unbatched as B_stride is fixed to 1 in weight-stationary mode
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2);
+    for (int k = 0; k < tk; k++) {
+      for (int j = 0; j < tj; j++) {
+        gemmini_extended_mvin((void*)(((elem_t*)B_in) + k*DIM*(MATMUL_N/2) + j*DIM), bb + (k*tj + j)*DIM, DIM, DIM);
+      }
+    }
+    
+    gemmini_loop_ws_spad(ti, tj, tk, 0, 0, 0, ab, BANK_NUM * BANK_ROWS, 0, SDST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&C_hw[0][0], SDST * 16, MATMUL_M * MATMUL_N);
+    gemmini_fence();
+  }
+}
+''',
+score=18858,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'Accelerator-bound: compute and data-movement look balanced; tune tiling / scratchpad occupancy for more overlap.'],
+plan_gen_model='gemini-3.5-flash',
+code_gen_model='qwen.qwen3-coder-480b-a35b-v1:0',
+stdout=None,
+stderr=None),
+plan='''An elegant and highly effective optimization strategy to reduce execution time for this MX-Gemmini FP4 kernel focuses on **Host Loop Unrolling and Address Calculation Strength-Reduction for RoCC Command Streaming**, coupled with **Dual DMA Port Parallelism via `mvin2`**.
+
+### Optimization Strategy: Host Loop Unrolling & Dual DMA Parallelism
+
+In the baseline code, the RISC-V host CPU performs complex 2D address calculations (including multiple multiplications and additions) inside nested loops to determine the DRAM pointer and scratchpad address for every single tile load. Since the systolic array relies on the host CPU to stream these RoCC instructions, a slow host loop can starve the Gemmini instruction queue, leading to execution stalls.
+
+We optimize this by:
+1. **Unrolling the inner loops** of both A and B matrix loads. Since $tk = 16$ (8 iterations of `k += 2` for A) and $tj = 4$ (4 iterations for B) are known constants, we can fully unroll them to eliminate loop overhead entirely.
+2. **Replacing multi-dimensional pointer arithmetic with simple sequential pointer updates**, removing all multiplication operations inside the hot path.
+3. **Using the dedicated `mvin2` instruction for B-matrix tiles**, which utilizes Gemmini\'s separate B-side DMA stream to optimize bus bandwidth.
+4. **Ensuring strict programming sequence order** by moving the store/requantizer configurations to occur directly after the `mvin` sequence and right before the compute loop execution.
+
+### Rewritten Program
+
+```c
+// AUTO-GENERATED optimized MX matmul kernel (128x128x256, fp4:e2m1).
+void solution(void) {
+  int ti = MATMUL_M / DIM / 2;
+  int tj = MATMUL_N / DIM / 2;
+  int tk = MATMUL_K / DIM;
+  uint32_t ab = 0;
+  uint32_t bb = BANK_NUM * BANK_ROWS - tk * tj * DIM;
+  int SDST = 128;
+
+  // 1. Configure execution with A_stride = 2 to match the batched scratchpad layout
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 2, 0, 0, false, 2, 2, 3, 0);
+
+  // 2. Load scale factors
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // 3. MVIN A: Batched by 2 along the K dimension (cols = 2 * DIM)
+  // Fully unrolled inner loop with strength-reduced pointer arithmetic
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < ti; i++) {
+    elem_t *a_ptr = ((elem_t*)A_in_hw) + i * DIM * MATMUL_K;
+    uint32_t sp_addr = ab + i * tk * DIM;
+
+    gemmini_extended_mvin(a_ptr,           sp_addr,           2 * DIM, DIM);
+    gemmini_extended_mvin(a_ptr + 2 * DIM,  sp_addr + 2 * DIM,  2 * DIM, DIM);
+    gemmini_extended_mvin(a_ptr + 4 * DIM,  sp_addr + 4 * DIM,  2 * DIM, DIM);
+    gemmini_extended_mvin(a_ptr + 6 * DIM,  sp_addr + 6 * DIM,  2 * DIM, DIM);
+    gemmini_extended_mvin(a_ptr + 8 * DIM,  sp_addr + 8 * DIM,  2 * DIM, DIM);
+    gemmini_extended_mvin(a_ptr + 10 * DIM, sp_addr + 10 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin(a_ptr + 12 * DIM, sp_addr + 12 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin(a_ptr + 14 * DIM, sp_addr + 14 * DIM, 2 * DIM, DIM);
+  }
+
+  // 4. MVIN B: Streamed utilizing dedicated gemmini_extended_mvin2
+  // Fully unrolled inner loop with strength-reduced pointer arithmetic
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2);
+  for (int k = 0; k < tk; k++) {
+    elem_t *b_ptr = ((elem_t*)B_in) + k * DIM * (MATMUL_N / 2);
+    uint32_t sp_addr = bb + k * tj * DIM;
+
+    gemmini_extended_mvin2(b_ptr,           sp_addr,           DIM, DIM);
+    gemmini_extended_mvin2(b_ptr + DIM,     sp_addr + DIM,     DIM, DIM);
+    gemmini_extended_mvin2(b_ptr + 2 * DIM, sp_addr + 2 * DIM, DIM, DIM);
+    gemmini_extended_mvin2(b_ptr + 3 * DIM, sp_addr + 3 * DIM, DIM, DIM);
+  }
+
+  // 5. Configure store and requantizer (placed immediately before compute)
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti, tj, tk, 0, 0, 1);
+
+  // 6. Compute Weight-Stationary Matrix Multiplication
+  gemmini_loop_ws_spad(ti, tj, tk, 0, 0, 0, ab, BANK_NUM * BANK_ROWS, 0, SDST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // 7. Drain output BF16 elements from shared memory to DRAM
+  gemmini_mx_read_smem(&C_hw[0][0], SDST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+### How This Improves Performance
+
+1. **Continuous Coprocessor Command Saturation:** Unrolling the inner loops for $tk$ and $tj$ eliminates all branch execution penalty on the host. More importantly, computing pointers using compile-time constants (such as `a_ptr + 2*DIM` rather than calculating `i*DIM*MATMUL_K + k*DIM` dynamically) reduces complex arithmetic instructions to single additions. This prevents the CPU from falling behind the hardware\'s consumption rate.
+2. **Dedicated DMA Channel Execution:** By employing `gemmini_extended_mvin2` for the $B$ matrix inputs, we isolate $A$ and $B$ streams into their respective scratchpad load interfaces. This enhances bus utilization and increases overlap during the preloading phase.
+3. **Adherence to State Transition Protocols:** Placing `gemmini_mxquant_config_mvout` strictly after the scratchpad data load and immediately before `gemmini_loop_ws_spad` respects Gemmini\'s sequential register configuration pipeline, eliminating speculative bubbles.''',
+code='''// AUTO-GENERATED optimized MX matmul kernel (128x128x256, fp4:e2m1).
+void solution(void) {
+  int ti = MATMUL_M / DIM / 2;
+  int tj = MATMUL_N / DIM / 2;
+  int tk = MATMUL_K / DIM;
+  uint32_t ab = 0;
+  uint32_t bb = BANK_NUM * BANK_ROWS - tk * tj * DIM;
+  int SDST = 128;
+
+  // 1. Configure execution with A_stride = 2 to match the batched scratchpad layout
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 2, 0, 0, false, 2, 2, 3, 0);
+
+  // 2. Load scale factors
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // 3. MVIN A: Batched by 2 along the K dimension (cols = 2 * DIM)
+  // Fully unrolled inner loop with strength-reduced pointer arithmetic
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < ti; i++) {
+    elem_t *a_ptr = ((elem_t*)A_in_hw) + i * DIM * MATMUL_K;
+    uint32_t sp_addr = ab + i * tk * DIM;
+
+    // Unrolled loop for k = 0 to tk-1 with step 2 (tk=16, so 8 iterations)
+    gemmini_extended_mvin(a_ptr, sp_addr, 2 * DIM, DIM);
+    a_ptr += 2 * DIM; sp_addr += 2 * DIM;
+    gemmini_extended_mvin(a_ptr, sp_addr, 2 * DIM, DIM);
+    a_ptr += 2 * DIM; sp_addr += 2 * DIM;
+    gemmini_extended_mvin(a_ptr, sp_addr, 2 * DIM, DIM);
+    a_ptr += 2 * DIM; sp_addr += 2 * DIM;
+    gemmini_extended_mvin(a_ptr, sp_addr, 2 * DIM, DIM);
+    a_ptr += 2 * DIM; sp_addr += 2 * DIM;
+    gemmini_extended_mvin(a_ptr, sp_addr, 2 * DIM, DIM);
+    a_ptr += 2 * DIM; sp_addr += 2 * DIM;
+    gemmini_extended_mvin(a_ptr, sp_addr, 2 * DIM, DIM);
+    a_ptr += 2 * DIM; sp_addr += 2 * DIM;
+    gemmini_extended_mvin(a_ptr, sp_addr, 2 * DIM, DIM);
+    a_ptr += 2 * DIM; sp_addr += 2 * DIM;
+    gemmini_extended_mvin(a_ptr, sp_addr, 2 * DIM, DIM);
+  }
+
+  // 4. MVIN B: Streamed utilizing dedicated gemmini_extended_mvin2
+  // Fully unrolled inner loop with strength-reduced pointer arithmetic
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2);
+  for (int k = 0; k < tk; k++) {
+    elem_t *b_ptr = ((elem_t*)B_in) + k * DIM * (MATMUL_N / 2);
+    uint32_t sp_addr = bb + k * tj * DIM;
+
+    // Unrolled loop for j = 0 to tj-1 (tj=4, so 4 iterations)
+    gemmini_extended_mvin2(b_ptr, sp_addr, DIM, DIM);
+    b_ptr += DIM; sp_addr += DIM;
+    gemmini_extended_mvin2(b_ptr, sp_addr, DIM, DIM);
+    b_ptr += DIM; sp_addr += DIM;
+    gemmini_extended_mvin2(b_ptr, sp_addr, DIM, DIM);
+    b_ptr += DIM; sp_addr += DIM;
+    gemmini_extended_mvin2(b_ptr, sp_addr, DIM, DIM);
+  }
+
+  // 5. Configure store and requantizer (placed immediately before compute)
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti, tj, tk, 0, 0, 1);
+
+  // 6. Compute Weight-Stationary Matrix Multiplication
+  gemmini_loop_ws_spad(ti, tj, tk, 0, 0, 0, ab, BANK_NUM * BANK_ROWS, 0, SDST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // 7. Drain output BF16 elements from shared memory to DRAM
+  gemmini_mx_read_smem(&C_hw[0][0], SDST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+''',
+score=None,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='gemini-3.5-flash',
+code_gen_model='qwen.qwen3-coder-480b-a35b-v1:0',
+stdout=None,
+stderr=None)

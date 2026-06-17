@@ -1,0 +1,105 @@
+### Optimization Plan: Eliminate Redundant Causal-Mask Computations
+
+We will apply **Strategy 1: Eliminate redundant computation** on the host CPU during the integer softmax and quantization phase (Step 2).
+
+#### 1. Inefficiency Analysis
+In the attention kernel, when causal masking is enabled (`ATT_CAUSAL`), elements in the upper-triangular region (where column index $j > \text{row index } i$) represent future tokens and are masked out. Their final attention probabilities are mathematically zero. 
+
+The baseline implementation contains several redundant computations for these masked elements:
+1. **Redundant Memory Loads and Unpacking**: The loop loads `w = S1_hw[i][j / 4]` and performs bit-shifts/unpacking even when the entire 4-element word lies completely in the masked region (i.e., when $j > i$).
+2. **Redundant Exponentiation**: The code calls the expensive approximation function `mx_iexp(q[j] - mq)` for all $j \in [0, \text{ATT\_S})$. For masked elements, $q[j] - mq$ is a very large negative value, meaning `mx_iexp` redundantly performs integer arithmetic only to return `0`.
+3. **Redundant FP8 Quantization**: The code calls `mx_ienc_fp8(p[j], inv_sm, ls, e)` for every column. For masked elements where $p[j] = 0$, it redundantly runs the quantization routine to encode `0`.
+
+#### 2. Optimization Strategy
+We will modify the CPU-side softmax and quantization loop under `#if ATT_CAUSAL` to bypass these redundant operations:
+
+* **Unpacking Phase**: If the current 4-word block index $j$ is strictly greater than the row index $i$ ($j > i$), we can skip reading `S1_hw` entirely. We can directly assign $q[j \dots \text{ATT\_S}-1] = -((int64\_t)1 \ll 62)$ using a fast fill and break early.
+* **Exponentiation Phase**: Within the group loop, if $j > i$, we bypass `mx_iexp` and directly assign $p[j] = 0$.
+* **Quantization Phase**: Within the group loop, if $j > i$, we bypass `mx_ienc_fp8` and directly assign $P\_q[i][j] = 0$.
+
+This eliminates approximately 50% of the scalar arithmetic, function calls, and memory reads in the softmax phase without altering the bit-exact correctness of the final output.
+
+#### 3. Proposed Code Modifications
+
+We will rewrite the second phase of `solution` as follows:
+
+```c
+  // ---- 2) FLOAT-FREE integer softmax + fp8 requant (I-BERT iexp; host has no FPU) ----
+  for (int i = 0; i < ATT_S; i++) {
+    int64_t q[ATT_S];
+    int64_t mq = -((int64_t)1 << 62);
+    
+    // Unpack phase with early termination for causal region
+    for (int j = 0; j < ATT_S; j += 4) {
+#if ATT_CAUSAL
+      if (j > i) {
+        // Remaining elements in this row are completely causal-masked
+        for (int r = j; r < ATT_S; r++) {
+          q[r] = -((int64_t)1 << 62);
+        }
+        break; // Skip loading S1_hw and processing further words
+      }
+#endif
+      uint64_t w = S1_hw[i][j / 4];
+      for (int l = 0; l < 4; l++) {
+#if ATT_CAUSAL
+        if (j + l > i) { 
+          q[j + l] = -((int64_t)1 << 62); 
+          continue; 
+        }
+#endif
+        int64_t qq = mx_ibf16_to_q((uint16_t)((w >> (l * 16)) & 0xFFFF));
+        q[j + l] = qq; 
+        if (qq > mq) mq = qq;
+      }
+    }
+
+    int64_t p[ATT_S];
+    int64_t sm = 0;
+    int64_t gmax_arr[GROUPS_S];
+
+    // Exponentiation phase with bypassed mx_iexp
+    for (int g = 0; g < GROUPS_S; g++) {
+      int64_t gmax = 0;
+      for (int j = g * 32; j < (g + 1) * 32; j++) {
+#if ATT_CAUSAL
+        if (j > i) {
+          p[j] = 0; // Skip mx_iexp for causal-masked elements
+          continue;
+        }
+#endif
+        int64_t pv = mx_iexp(q[j] - mq); 
+        p[j] = pv; 
+        sm += pv; 
+        if (pv > gmax) gmax = pv; 
+      }
+      gmax_arr[g] = gmax;
+    }
+
+    int ls = mx_ilog2((uint64_t)sm);
+    uint64_t inv_sm = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;
+
+    // Quantization phase with bypassed mx_ienc_fp8
+    for (int g = 0; g < GROUPS_S; g++) {
+      int64_t gmax = gmax_arr[g];
+      if (gmax == 0) { 
+        P_scales[g][i] = 0; 
+        for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = 0; 
+        continue; 
+      }
+      
+      int e = mx_ilog2((uint64_t)gmax) - ls - MX_P_TARGET_LOG2;
+      P_scales[g][i] = (uint8_t)(e + 127);
+
+      for (int j = g * 32; j < (g + 1) * 32; j++) {
+#if ATT_CAUSAL
+        if (j > i) {
+          P_q[i][j] = 0; // Skip mx_ienc_fp8 for causal-masked elements
+          continue;
+        }
+#endif
+        P_q[i][j] = mx_ienc_fp8(p[j], inv_sm, ls, e);
+      }
+    }
+  }
+```

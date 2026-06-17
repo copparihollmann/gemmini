@@ -1,0 +1,156 @@
+Looking at the error message, the issue is that `cols=256` overflows the 6-bit hardware field, which means we're trying to load too many columns at once. The maximum is 63 columns (since it's a 6-bit field).
+
+Let me analyze the problematic code:
+
+```c
+gemmini_extended_mvin2(
+  (void*)(((elem_t*)B_in) + j0 * BLK + j * DIM),
+  b_base_j0 + j * tiles_K * DIM,
+  tiles_K * DIM,  // This could be > 63!
+  DIM
+);
+```
+
+And similarly for A:
+
+```c
+gemmini_extended_mvin(
+  (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K),
+  a_base_i0 + i * tiles_K * DIM,
+  tiles_K * DIM,  // This could be > 63!
+  DIM
+);
+```
+
+Since `DIM = 16` and `tiles_K = MATMUL_K / DIM`, if `tiles_K >= 4`, then `tiles_K * DIM >= 64`, which exceeds the 6-bit limit of 63.
+
+We need to break up the transfers into smaller chunks that respect the `MAX_BLOCK_LEN = 4` constraint (which translates to max 4*16 = 64 columns, but since it's 6 bits, the actual limit is 63).
+
+```c
+void solution(void) {
+  int tiles   = BLK / DIM;
+  int tiles_K = MATMUL_K / DIM;
+  int GK      = MATMUL_K / 32;
+
+  static uint8_t A_scales_T[BLOCKS_M][A_S_BYTES];
+  static uint8_t B_scales_T[BLOCKS_N][B_S_BYTES];
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int g = 0; g < GK; g++) {
+      memcpy(&A_scales_T[i0][g * BLK],
+             &A_scales_row[g][i0 * BLK],
+             BLK);
+    }
+  }
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    for (int g = 0; g < GK; g++) {
+      memcpy(&B_scales_T[j0][g * BLK],
+             &B_scales_col[g][j0 * BLK],
+             BLK);
+    }
+  }
+
+  // 1. Hoist the configuration outside all loops
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                              1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // 2. Pre-load all B blocks into partitioned high scratchpad memory
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    uint32_t b_base_j0 = BANK_NUM * BANK_ROWS - (j0 + 1) * tiles * tiles_K * DIM;
+    for (int j = 0; j < tiles; j++) {
+      // Break up large column transfers to respect MAX_BLOCK_LEN=4 (63 column limit)
+      int remaining_cols = tiles_K * DIM;
+      int transferred_cols = 0;
+      
+      while (remaining_cols > 0) {
+        int chunk_cols = (remaining_cols > 63) ? 63 : remaining_cols;
+        int chunk_tiles_k = chunk_cols / DIM;  // Number of K tiles in this chunk
+        
+        gemmini_extended_mvin2(
+          (void*)(((elem_t*)B_in) + j0 * BLK + j * DIM + transferred_cols),
+          b_base_j0 + j * tiles_K * DIM + transferred_cols,
+          chunk_cols,
+          DIM
+        );
+        
+        remaining_cols -= chunk_cols;
+        transferred_cols += chunk_cols;
+      }
+    }
+  }
+
+  // 3. Pre-load all A blocks into partitioned low scratchpad memory
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    uint32_t a_base_i0 = i0 * tiles * tiles_K * DIM;
+    for (int i = 0; i < tiles; i++) {
+      // Break up large column transfers to respect MAX_BLOCK_LEN=4 (63 column limit)
+      int remaining_cols = tiles_K * DIM;
+      int transferred_cols = 0;
+      
+      while (remaining_cols > 0) {
+        int chunk_cols = (remaining_cols > 63) ? 63 : remaining_cols;
+        int chunk_tiles_k = chunk_cols / DIM;  // Number of K tiles in this chunk
+        
+        gemmini_extended_mvin(
+          (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + transferred_cols),
+          a_base_i0 + i * tiles_K * DIM + transferred_cols,
+          chunk_cols,
+          DIM
+        );
+        
+        remaining_cols -= chunk_cols;
+        transferred_cols += chunk_cols;
+      }
+    }
+  }
+
+  // 4. Hoist invariant requantized mvout configurations out of loops
+  gemmini_config_st(BLK_OUTC * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                               tiles, tiles, tiles_K, 0, 0, 1);
+
+  // 5. Execution loops (No MVIN latency during compute!)
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    int ncols = REAL_N - j0 * BLK;
+    if (ncols > BLK) ncols = BLK;
+    if (ncols <= 0) continue;
+
+    uint32_t b_base_j0 = BANK_NUM * BANK_ROWS - (j0 + 1) * tiles * tiles_K * DIM;
+
+    for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+
+      uint32_t a_base_i0 = i0 * tiles * tiles_K * DIM;
+
+      gemmini_flush(0);
+
+      // Load A and B scales
+      gemmini_mx_load_scales((uint64_t)A_scales_T[i0], A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_scales_T[j0], B_S_BYTES, 1);
+
+      int pad_i = BLK - mrows;
+      int pad_j = BLK - ncols;
+
+      // Compute weight-stationary tiled matmul over pre-loaded scratchpad
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0,
+                           a_base_i0, b_base_j0, 0, 128,
+                           false, false, false, false, false,
+                           NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Fast contiguous DMA read (padded to BLK columns)
+      for (int r = 0; r < mrows; r++) {
+        gemmini_mx_read_smem(
+          &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+          128 * 16 + r * BLK, BLK);
+      }
+
+      gemmini_fence();
+    }
+  }
+}
+```

@@ -1,0 +1,119 @@
+## Analysis
+
+Looking at the original code, I need to identify which strategy applies most effectively.
+
+The current code uses:
+- `gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, tiles_K)` with `lut_update_granularity = tiles_K`
+
+The `lut_update_granularity` parameter controls how often the requantizer LUT refreshes during the output write-back. Setting it to `tiles_K` means the LUT refreshes once per (i,j) output tile pair across the full K reduction — this is already well-amortized.
+
+Looking more carefully at the B-tile MVIN loop ordering vs. the A-tile MVIN:
+
+- **A mvin**: outer loop over `i`, inner loop over `k` — for a fixed `i`, the DRAM pointer steps by `DIM` along K (stride = `MATMUL_K * sizeof(elem_t)` = contiguous along K rows). Batching 4 consecutive k-tiles is correct.
+- **B mvin**: currently uses outer loop over `k`, inner over `j` — DRAM pointer = `B_in + k*DIM*MATMUL_N + j*DIM`. Consecutive j-tiles at fixed k are contiguous in DRAM (stride = `MATMUL_N`). Batching is correct here too.
+
+**The key issue**: The B mvin loop uses `gemmini_block_mvin` which stores tiles at `b_base + (k*tiles_J + j)*DIM`. But the expected B layout for `gemmini_loop_ws_spad` is `b_base + (j*tiles_K + k)*DIM`. The current code stores B as `(k, j)` indexed but the hardware expects `(j, k)` indexed. **Wait — let me re-read the original code carefully.**
+
+The original code stores B at `b_base + (k * tiles_J + j) * DIM` but the reference pattern uses `b_base + (j * tiles_K + k) * DIM`. This is a layout mismatch — but the problem says the original code runs and produces output (latency 448), so it must be correct. Let me re-examine: `gemmini_loop_ws_spad` uses `B = BANK_NUM * BANK_ROWS` (the **end** address), so the hardware may index B differently. The hardware knows `b_base` is the end, and indexes backward.
+
+Regardless, **strategy 11** — "reorder I/J/K loop nest to maximize weight-stationary B-tile reuse across I iterations" — directly addresses the B mvin loop order, which currently iterates `k` outer, `j` inner for the B load. The compute in weight-stationary mode reuses B tiles across all `i` iterations, so loading B first (all j,k tiles) and then A is correct. This is already the case.
+
+**Strategy 5 (try new parameter values)** — specifically, the `lut_update_granularity`. Currently set to `tiles_K`. The maximum allowed value would reduce refresh overhead even further, but `tiles_K` is already the maximum meaningful value per output tile.
+
+The most impactful untried strategy is **strategy 13**: issue `gemmini_config_ld` once per DMA port with the correct stride before the entire mvin phase. Currently the code issues `gemmini_config_ld(MATMUL_K * sizeof(elem_t))` for A and then `gemmini_config_ld(MATMUL_N * sizeof(elem_t))` for B — that's already one config per loop. This is already optimal.
+
+**Strategy 5 — try new parameter values**: The `SPAD_DEST = 128` is a fixed choice. Looking at the B mvin: the loop order `(k outer, j inner)` with batching along j is fine. But what about `gemmini_config_ld` stride for B? `MATMUL_N * sizeof(elem_t)` is the row stride of B in DRAM (B is K×N row-major, stride = N bytes per row). This is correct.
+
+The most promising untried strategy is **strategy 5**: changing `lut_update_granularity` to an even larger value — specifically `tiles_I * tiles_J * tiles_K` or the maximum possible — to further amortize requantizer overhead. But it's already `tiles_K`.
+
+Let me re-read the B mvin indexing. For the original reference: `b_base + (j * tiles_K + k) * DIM`. The current code does `b_base + (k * tiles_J + j) * DIM`. These are different layouts! This could cause correctness issues, but since the problem states latency=448 (it runs), presumably the hardware loop handles it.
+
+**I'll apply Strategy 5**: increase `lut_update_granularity` from `tiles_K` to `tiles_I * tiles_J` or `tiles_I * tiles_J * tiles_K` to maximize amortization. Actually, the granularity G means "refresh every G output tiles," so setting G = `tiles_I * tiles_J * tiles_K` (the total number of tile operations) minimizes refreshes to just 1 total.
+
+## Plan
+
+**Strategy 5: Try new parameter values** — specifically, increase `lut_update_granularity` from `tiles_K` to `tiles_I * tiles_J * tiles_K`.
+
+Currently: `gemmini_mxquant_config_mvout(..., tiles_K)` refreshes the requantizer LUT once per (i,j) pair (every `tiles_K` K-steps). Since the entire matmul runs as a single `gemmini_loop_ws_spad` invocation, the LUT can be loaded once for the entire computation. Setting `lut_update_granularity = tiles_I * tiles_J * tiles_K` means the hardware refreshes the output quantization LUT only once for the entire fused loop, eliminating `tiles_I * tiles_J - 1` redundant refresh operations. This is safe because the scale factors and format are invariant across all tiles in this single-shot matmul.
+
+## Implementation
+
+```c
+void solution(void) {
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+#ifdef SPIKE_SIM
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+#else
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
+#endif
+
+  // ---- MVIN A: batch up to MAX_BLOCK_LEN=4 consecutive k-tiles per i-row ----
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+      int batch = (tiles_K - k < MAX_BLOCK_LEN) ? (tiles_K - k) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_block_mvin((void*)dram_ptr, sp_addr, batch);
+    }
+  }
+
+  // ---- MVIN B: batch up to MAX_BLOCK_LEN=4 consecutive j-tiles per k-row ----
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+
+  for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j += MAX_BLOCK_LEN) {
+      int batch = (tiles_J - j < MAX_BLOCK_LEN) ? (tiles_J - j) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+      gemmini_block_mvin((void*)dram_ptr, sp_addr, batch);
+    }
+  }
+
+  // SPAD_DEST = 128 avoids aliasing with a_base = 0 region
+  int SPAD_DEST = 128;
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+
+  // lut_update_granularity = tiles_I * tiles_J * tiles_K:
+  // Refresh the requantizer LUT only once for the entire fused hardware loop.
+  // All tiles share the same scale factors and format, so a single refresh
+  // at the start is sufficient. This eliminates (tiles_I * tiles_J - 1)
+  // redundant LUT refresh operations compared to refreshing every tiles_K steps.
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, tiles_I * tiles_J * tiles_K);
+
+  // ---- Compute ----
+  gemmini_loop_ws_spad(
+      tiles_I, tiles_J, tiles_K,
+      0, 0, 0,
+      a_base,
+      BANK_NUM * BANK_ROWS,
+      0,
+      SPAD_DEST,
+      false, false,
+      false, false, false,
+      NO_ACTIVATION,
+      0, 0,
+      false,
+      0x38);
+
+  gemmini_fence();
+
+#ifdef SPIKE_SIM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+#else
+  printf("Moving out:\n");
+  for (int i = 0; i < tiles_J*tiles_I*2; i++) {
+      gemmini_mvout((void*)((uint64_t*) C_hw + i*2*DIM), SPAD_DEST + i*DIM);
+  }
+  gemmini_fence();
+#endif
+
+  gemmini_fence();
+}
+```

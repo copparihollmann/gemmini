@@ -1,0 +1,44 @@
+## Analysis of the Current Code
+
+Looking at the original code, I need to identify the key inefficiency to address with a single strategy.
+
+The current code:
+1. Loads A tiles in an `i × k` loop
+2. Loads B tiles in a `k × j` loop
+3. Issues a single `gemmini_loop_ws_spad` covering all `tiles_I × tiles_J × tiles_K`
+
+The critical observation: **`gemmini_config_ld` is called once per matrix (outside loops), and then all tiles are mvin'd.** This is already reasonably structured, but the `gemmini_config_ld` for A uses `MATMUL_K * sizeof(elem_t)` as stride, and for B uses `MATMUL_N * sizeof(elem_t)`. These are correct.
+
+However, looking at the mvin loops more carefully:
+
+- **A tiles**: outer loop is `i`, inner is `k` — correct for row-major A
+- **B tiles**: outer loop is `k`, inner is `j` — correct for row-major B
+
+The `gemmini_config_ld` is being called **inside no loop** — it's already hoisted. But wait, looking more carefully at strategy **8: set `ex_accumulate` flag** and strategy **10: reorder I/J/K loop nest to maximize weight-stationary B-tile reuse** — these don't directly apply since we use the fused hardware loop.
+
+The most impactful strategy here is **strategy 6: reuse loaded B (weight) tiles across multiple I-tile iterations without re-mvin**. But since we use `gemmini_loop_ws_spad` which handles the full tiled loop in hardware, B tiles are already reused in hardware.
+
+**The real inefficiency**: The `gemmini_config_ld` for B is set to `MATMUL_N * sizeof(elem_t)` but then A's config is set first and B's second. More importantly, examining the `gemmini_extended_mvin` calls — **there are no `gemmini_fence()` calls between mvins**, which is fine, but the mvin loops themselves could be restructured.
+
+The key issue I see is that **`gemmini_config_ld` is called twice** (once for A, once for B), with all A mvins grouped together and all B mvins grouped together. Strategy **13** directly addresses this: restructure to issue all A mvins, then all B mvins, with proper config sequencing to minimize bubbles.
+
+But actually, the most impactful single strategy given the scratchpad utilization feedback and the note that this is phase 2 is **strategy 8: set `ex_accumulate=true` in `gemmini_loop_ws_spad` to accumulate across K tiles without intermediate mvout**.
+
+Wait — looking again at the existing call: `ex_accumulate` is already `false`. For a single fused loop call covering all K tiles, the hardware accumulates internally. So `ex_accumulate=false` is correct for a single call.
+
+**The clear winner is strategy 13**: restructure the mvin loops to issue all A-tile mvins for a single i-row before issuing B-tile mvins, then configure properly. But more concretely: the current code issues **two separate `gemmini_config_ld` calls** with all A mvins between them, then all B mvins. The B mvins use `mvin` (port 0) just like A. We should use **`gemmini_extended_mvin2`** for B tiles to allow A and B loads to potentially overlap, and restructure to interleave them.
+
+## Selected Strategy: Strategy 13 — Restructure mvin loops to use separate ports and interleave A/B loading
+
+## Plan
+
+**The core change**: Use `gemmini_extended_mvin2` (port 1) for B tile loads instead of `gemmini_extended_mvin` (port 0). This allows A and B tile DMA transfers to proceed concurrently since they use independent ports. Additionally, configure both load ports upfront (A config via port 0, B config via port 1 using `gemmini_extended3_config_ld` with `id=1`), then issue all A mvins via `gemmini_extended_mvin` and all B mvins via `gemmini_extended_mvin2` in an interleaved fashion — issuing the A tile for row `i` immediately followed by the corresponding B tiles, so the systolic array's input buffers receive both operands as soon as possible and DMA bandwidth is shared across both ports simultaneously.
+
+**Concrete steps**:
+
+1. Configure load port 0 for A: `gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), SCALE_IDENTITY, false, 0)` (id=0)
+2. Configure load port 1 for B: `gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), SCALE_IDENTITY, false, 1)` (id=1)
+3. Issue all A mvins via `gemmini_extended_mvin` (uses port 0)
+4. Issue all B mvins via `gemmini_extended_mvin2` (uses port 1)
+
+By configuring both ports once (outside all loops) and using dedicated ports for A vs B, the hardware's two independent DMA engines can service both streams without serialization. The `gemmini_config_ld` (which maps to `gemmini_extended3_config_ld(..., id=0)`) and the id=1 config are both issued before any mvin, eliminating the mid-sequence reconfiguration bubble that currently exists between the A mvin loop and the B mvin loop.

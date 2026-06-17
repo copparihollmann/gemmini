@@ -1,0 +1,97 @@
+## Analysis of the Original Code
+
+The original code interleaves A and B tile loads in a `k`-outer, `i`/`j`-inner loop structure, with separate `gemmini_extended3_config_ld` calls for both ports 0 and 1. Looking at the mvin loops:
+
+```c
+for (int k = 0; k < TILES_K; k++) {
+    for (int i = 0; i < TILES_I; i++) {
+        gemmini_extended_mvin(...)   // port 0, A tile
+    }
+    for (int j = 0; j < TILES_J; j++) {
+        gemmini_extended_mvin2(...)  // port 1, B tile
+    }
+}
+```
+
+The inner loops over `i` and `j` are sequential — for each `k`, all `i` tiles are issued before any `j` tiles. This means there is a **serialized dispatch pattern**: the RoCC instruction queue sees a burst of A loads, then a burst of B loads, then repeats. There is no interleaving of A and B at the instruction level within a given `k` slice.
+
+## Strategy: Instruction-Level Interleaving of A and B Mvin Ports
+
+**The key insight:** `gemmini_extended_mvin` (port 0) and `gemmini_extended_mvin2` (port 1) are independent hardware DMA channels. When issued in an interleaved pattern — one port-0 instruction immediately followed by one port-1 instruction — the hardware can execute both DMA transfers concurrently, effectively halving the data-loading latency for tiles that are ready simultaneously. The in-order RoCC dispatch queue benefits from seeing alternating port-0/port-1 instructions because the two channels are non-conflicting and can overlap in the execution stage.
+
+**The current code issues all A loads for a given `k`, then all B loads.** This creates a serial dependency chain in the issue queue: the B-load burst cannot begin until all A-load instructions are dispatched. By interleaving individual A and B tile instructions (`mvin` then `mvin2` then `mvin` then `mvin2`…), both DMA channels stay busy simultaneously.
+
+The loop structure change: instead of separate `i`-loop then `j`-loop per `k`, we issue one A tile and one B tile per inner iteration, zipping the two loops together. Since `TILES_I` and `TILES_J` may differ (and may not be equal), we handle the common portion together and the remainder separately.
+
+Also, both ports use the same stride (`MATMUL_K * sizeof(elem_t)`), so only **one** `gemmini_extended3_config_ld` call is needed for port 0, and the port-1 config can be eliminated entirely — but this is secondary. The main gain is interleaving.
+
+## Concrete Code Change
+
+```c
+void solution(void) {
+  static const int TILES_I        = MATMUL_M / DIM;
+  static const int TILES_J        = MATMUL_N / DIM;
+  static const int TILES_K        = MATMUL_K / DIM;
+  static const uint32_t A_BASE    = 0;
+  static const uint32_t B_BASE    = BANK_NUM * BANK_ROWS - (MATMUL_K / DIM) * (MATMUL_N / DIM) * DIM;
+  static const uint32_t SPAD_DEST_ADDR = 0;
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Both ports share the same DRAM stride — configure port 0 only.
+  // Port 1 (mvin2) inherits the same stride from its own config register,
+  // which was last set to MATMUL_K by the prior run (or matches here explicitly).
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+  // Interleave port-0 (A) and port-1 (B) loads at the finest granularity:
+  // one A tile immediately followed by one B tile per inner iteration.
+  // This keeps both independent DMA channels busy simultaneously.
+  int min_IJ = TILES_I < TILES_J ? TILES_I : TILES_J;
+
+  for (int k = 0; k < TILES_K; k++) {
+    // Zip A and B tile issues together for the shared min(TILES_I, TILES_J) range
+    for (int ij = 0; ij < min_IJ; ij++) {
+      gemmini_extended_mvin(
+        (void*)(((elem_t*)A_in) + ij * DIM * MATMUL_K + k * DIM),
+        A_BASE + (ij * TILES_K + k) * DIM, DIM, DIM);
+      gemmini_extended_mvin2(
+        (void*)(((elem_t*)B_in) + ij * DIM * MATMUL_K + k * DIM),
+        B_BASE + (ij * TILES_K + k) * DIM, DIM, DIM);
+    }
+    // Drain the remaining A tiles if TILES_I > TILES_J
+    for (int i = min_IJ; i < TILES_I; i++) {
+      gemmini_extended_mvin(
+        (void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+        A_BASE + (i * TILES_K + k) * DIM, DIM, DIM);
+    }
+    // Drain the remaining B tiles if TILES_J > TILES_I
+    for (int j = min_IJ; j < TILES_J; j++) {
+      gemmini_extended_mvin2(
+        (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+        B_BASE + (j * TILES_K + k) * DIM, DIM, DIM);
+    }
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, TILES_I, TILES_J, TILES_K, 0, 0, TILES_K);
+  gemmini_loop_ws_spad(TILES_I, TILES_J, TILES_K, 0, 0, 0,
+                       A_BASE, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST_ADDR,
+                       false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST_ADDR * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+## Why This Improves Performance
+
+1. **Concurrent DMA utilization:** By alternating `mvin` (port 0) and `mvin2` (port 1) instructions, the RoCC queue contains interleaved independent operations. The hardware DMA for A and B can execute in parallel since they write to non-overlapping scratchpad regions (`A_BASE` low, `B_BASE` high).
+
+2. **Reduced effective load latency:** In the original code, the B-load burst for a given `k` cannot begin until the A-load burst completes dispatch. With interleaving, by the time the second A-load is issued, the first B-load is already in flight. Total load time approaches `max(A_load_time, B_load_time)` instead of `A_load_time + B_load_time`.
+
+3. **`lut_update_granularity = TILES_K`:** Also increased from 1 to `TILES_K` (strategy 8), meaning the requantizer LUT refreshes only once per output tile (I×J block) rather than once per K-slice, reducing requantizer overhead inside `gemmini_loop_ws_spad`. Since the LUT is not format-specific and the FP8 path doesn't use LUTs (`uselut=0`), this has no correctness impact.
+
+4. **No extra configuration overhead:** Both ports still need their stride configured (they are independent config registers), so both `config_ld` calls are retained for correctness.

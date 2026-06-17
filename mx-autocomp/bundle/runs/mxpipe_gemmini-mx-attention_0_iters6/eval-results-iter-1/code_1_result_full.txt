@@ -1,0 +1,296 @@
+{'correct': False, 'test_results': {0: False}, 'compiled': True, 'stdout': 'Kernel produced an INCORRECT/illegal result on spike. Diagnostic (fix this before optimizing):
+GEMMINI MVIN ILLEGAL: block mvin with block_stride(0) < rows(16) (cols=32, blocks=2) -- RTL LoadController.scala:138 assert(block_stride>=rows). Configure gemmini_extended4_config_ld(..., block_mvin_stride>=rows, ...).
+Gemmini extension configured with:
+dim = 16'}
+Prev latency: 762147
+New latency: N/A
+Plan: ## Analysis
+
+Looking at the code, I need to identify which strategy is most impactful and applicable.
+
+**Strategy 4** is clearly the most relevant: the softmax loop computes all `ATT_S=128` rows of `P_q[128][128]` (16KB) and `P_scales[4][128]` before mvin, while a blocking approach would compute 16 rows at a time (2KB working set), improving cache utilization. However, the mvin happens in step 3 *after* all of softmax in step 2, so reordering would violate the programming model sequence... but wait — the mvin in step 3 can perfectly interleave with softmax computation row-block by row-block if we restructure step 2 and the mvin loop together. The mvin just needs to happen before `gemmini_loop_ws_spad`, not immediately.
+
+**Strategy 3** is also relevant: `P_q` is written as `P_q[i][j]` where `i` is the row index (S dimension) and `j` is the column index (S dimension), and mvin reads it with stride `ATT_S`. The write order already matches row-major `P_q[i][j]`, so mvin stride `ATT_S * sizeof(elem_t)` is correct. This looks already correct.
+
+**Strategy 4** is the winner: compute softmax row-block (16 rows) → immediately stage those rows into the mvin buffer, so by the time we start the mvin loop, each 16-row block is hot in L1 cache rather than the whole 16KB P_q array.
+
+## Plan for Strategy 4
+
+**Goal:** Reduce cache pressure between the softmax computation (step 2) and the mvin loop (step 3) by computing 16 rows of softmax at a time and immediately writing them into `P_q` (and `P_scales`) while they're hot in cache, rather than writing all 128 rows then reading them back cold during mvin.
+
+**Specific changes:**
+
+1. **Fuse the softmax-write and mvin loops**: Instead of two separate passes (one over all rows for softmax, one over all rows for mvin), restructure as an outer loop over `i` blocks (each block = DIM=16 rows). For each block:
+   - Compute softmax for rows `[i*DIM .. (i+1)*DIM)` → write into a **stack-allocated buffer** `P_q_block[DIM][ATT_S]` and `P_scales_block[GROUPS_S][DIM]` (2KB + small).
+   - Copy block results into the persistent `P_q[i*DIM..(i+1)*DIM][:]` and `P_scales` arrays (needed for the mvin later — or eliminate them entirely).
+   - **Alternatively**, eliminate the persistent arrays entirely: immediately issue the mvin for that block right after computing it, while it's still hot in L1.
+
+2. **Restructure step 3's mvin loop** to be fused into step 2: After computing each DIM-row softmax block, issue `gemmini_extended_mvin` for those DIM rows into the scratchpad. Since all mvin commands can be issued before `gemmini_loop_ws_spad`, this is safe.
+
+3. **Keep the programming model order intact**: The full sequence remains — all mvins complete before `gemmini_loop_ws_spad`. We're just interleaving *when* we compute and issue each mvin, not reordering across the model-sequence barrier. The config_ex, load_scales, config_st, mxquant_config_mvout for step 3 are still issued before loop_ws_spad; only the mvin issuance is fused with softmax computation.
+
+4. **Eliminate the large `P_q[ATT_S][ATT_S]` array** from live state during mvin: by the time mvin for row-block `i` is issued, those rows are still in L1 (just written). The mvin DMA engine reads from DRAM/cache so the data is warm. The full `P_q` array can remain for correctness but its write-then-read distance shrinks from 16KB to 2KB per block.
+
+**Concrete code restructuring for step 2+3:**
+- Move the `gemmini_extended3_config_ex`, `gemmini_mx_load_scales`, `gemmini_config_ld` calls for step 3 to *before* the softmax loop.
+- In the softmax loop, after processing DIM rows, immediately issue `gemmini_extended_mvin` for those rows (with `bb=2` batching where `tiles_K - k_offset` allows).
+- Issue `gemmini_config_st`, `gemmini_mxquant_config_mvout`, `gemmini_loop_ws_spad`, and `gemmini_mx_read_smem` after the fused loop completes.
+
+This reduces the working set touching L1 between write (softmax) and read (mvin DMA) from the full 16KB `P_q` array to 2KB per block, improving data locality and reducing cache misses during the mvin phase.
+
+CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED baseline MX attention kernel (S=128, D=64).
+void solution(void) {
+  // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&Q_scales_row, sizeof(Q_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&KT_scales_col, sizeof(KT_scales_col), 1);
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) { int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM); }
+    gemmini_config_ld(ATT_S * sizeof(elem_t));   // B=KT[D][S] stride N=S -> slot (k*tiles_J+j)
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) { int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM); }
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+    gemmini_fence();
+  }
+
+  // ---- 2) FLOAT-FREE integer softmax + fp8 requant (I-BERT iexp; host has no FPU) ----
+  for (int i = 0; i < ATT_S; i++) {
+    int64_t q[ATT_S];
+    int64_t mq = -((int64_t)1 << 62);
+    for (int j = 0; j < ATT_S; j += 4) {                       // unpack 4 bf16/word -> Q(1/1024) int + max
+      uint64_t w = S1_hw[i][j / 4];
+      for (int l = 0; l < 4; l++) {
+        int64_t qq = mx_ibf16_to_q((uint16_t)((w >> (l * 16)) & 0xFFFF));
+        q[j + l] = qq; if (qq > mq) mq = qq;
+      }
+    }
+    int64_t p[ATT_S];
+    int64_t sm = 0;
+    for (int j = 0; j < ATT_S; j++) { int64_t pv = mx_iexp(q[j] - mq); p[j] = pv; sm += pv; }
+    int ls = mx_ilog2((uint64_t)sm);
+    uint64_t inv_sm = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;   // one rounded reciprocal/row
+    for (int g = 0; g < GROUPS_S; g++) {
+      int64_t gmax = 0;
+      for (int j = g * 32; j < (g + 1) * 32; j++) if (p[j] > gmax) gmax = p[j];
+      if (gmax == 0) { P_scales[g][i] = 0; for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = 0; continue; }
+      // group e8m0 scale so the group-max lands at ~2^MX_P_TARGET_LOG2 (moderate; avoids e4 overflow)
+      int e = mx_ilog2((uint64_t)gmax) - ls - MX_P_TARGET_LOG2;
+      P_scales[g][i] = (uint8_t)(e + 127);
+      for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = mx_ienc_fp8(p[j], inv_sm, ls, e);
+    }
+  }
+
+  // ---- 3) O = P @ V on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+    gemmini_mx_load_scales((uint64_t)&V_scales_col, sizeof(V_scales_col), 1);
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) { int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM); }
+    gemmini_config_ld(ATT_D * sizeof(elem_t));   // B=V[S][D] stride N=D -> slot (k*tiles_J+j)
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) { int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM); }
+    gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+    gemmini_fence();
+  }
+}
+''',
+score=762147,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'Accelerator-bound: compute and data-movement look balanced; tune tiling / scratchpad occupancy for more overlap.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''## Analysis
+
+Looking at the code, I need to identify which strategy is most impactful and applicable.
+
+**Strategy 4** is clearly the most relevant: the softmax loop computes all `ATT_S=128` rows of `P_q[128][128]` (16KB) and `P_scales[4][128]` before mvin, while a blocking approach would compute 16 rows at a time (2KB working set), improving cache utilization. However, the mvin happens in step 3 *after* all of softmax in step 2, so reordering would violate the programming model sequence... but wait — the mvin in step 3 can perfectly interleave with softmax computation row-block by row-block if we restructure step 2 and the mvin loop together. The mvin just needs to happen before `gemmini_loop_ws_spad`, not immediately.
+
+**Strategy 3** is also relevant: `P_q` is written as `P_q[i][j]` where `i` is the row index (S dimension) and `j` is the column index (S dimension), and mvin reads it with stride `ATT_S`. The write order already matches row-major `P_q[i][j]`, so mvin stride `ATT_S * sizeof(elem_t)` is correct. This looks already correct.
+
+**Strategy 4** is the winner: compute softmax row-block (16 rows) → immediately stage those rows into the mvin buffer, so by the time we start the mvin loop, each 16-row block is hot in L1 cache rather than the whole 16KB P_q array.
+
+## Plan for Strategy 4
+
+**Goal:** Reduce cache pressure between the softmax computation (step 2) and the mvin loop (step 3) by computing 16 rows of softmax at a time and immediately writing them into `P_q` (and `P_scales`) while they\'re hot in cache, rather than writing all 128 rows then reading them back cold during mvin.
+
+**Specific changes:**
+
+1. **Fuse the softmax-write and mvin loops**: Instead of two separate passes (one over all rows for softmax, one over all rows for mvin), restructure as an outer loop over `i` blocks (each block = DIM=16 rows). For each block:
+   - Compute softmax for rows `[i*DIM .. (i+1)*DIM)` → write into a **stack-allocated buffer** `P_q_block[DIM][ATT_S]` and `P_scales_block[GROUPS_S][DIM]` (2KB + small).
+   - Copy block results into the persistent `P_q[i*DIM..(i+1)*DIM][:]` and `P_scales` arrays (needed for the mvin later — or eliminate them entirely).
+   - **Alternatively**, eliminate the persistent arrays entirely: immediately issue the mvin for that block right after computing it, while it\'s still hot in L1.
+
+2. **Restructure step 3\'s mvin loop** to be fused into step 2: After computing each DIM-row softmax block, issue `gemmini_extended_mvin` for those DIM rows into the scratchpad. Since all mvin commands can be issued before `gemmini_loop_ws_spad`, this is safe.
+
+3. **Keep the programming model order intact**: The full sequence remains — all mvins complete before `gemmini_loop_ws_spad`. We\'re just interleaving *when* we compute and issue each mvin, not reordering across the model-sequence barrier. The config_ex, load_scales, config_st, mxquant_config_mvout for step 3 are still issued before loop_ws_spad; only the mvin issuance is fused with softmax computation.
+
+4. **Eliminate the large `P_q[ATT_S][ATT_S]` array** from live state during mvin: by the time mvin for row-block `i` is issued, those rows are still in L1 (just written). The mvin DMA engine reads from DRAM/cache so the data is warm. The full `P_q` array can remain for correctness but its write-then-read distance shrinks from 16KB to 2KB per block.
+
+**Concrete code restructuring for step 2+3:**
+- Move the `gemmini_extended3_config_ex`, `gemmini_mx_load_scales`, `gemmini_config_ld` calls for step 3 to *before* the softmax loop.
+- In the softmax loop, after processing DIM rows, immediately issue `gemmini_extended_mvin` for those rows (with `bb=2` batching where `tiles_K - k_offset` allows).
+- Issue `gemmini_config_st`, `gemmini_mxquant_config_mvout`, `gemmini_loop_ws_spad`, and `gemmini_mx_read_smem` after the fused loop completes.
+
+This reduces the working set touching L1 between write (softmax) and read (mvin DMA) from the full 16KB `P_q` array to 2KB per block, improving data locality and reducing cache misses during the mvin phase.''',
+code='''void solution(void) {
+  // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&Q_scales_row, sizeof(Q_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&KT_scales_col, sizeof(KT_scales_col), 1);
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) {
+        int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+      }
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) {
+        int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+      }
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+    gemmini_fence();
+  }
+
+  // ---- 2+3 fused) softmax row-block + immediate mvin for P @ V ----
+  {
+    int tiles_I = ATT_S / DIM;   // = 8
+    int tiles_J = ATT_D / DIM;   // = 4
+    int tiles_K = ATT_S / DIM;   // = 8
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+
+    // Set up step-3 Gemmini config BEFORE the fused loop so all mvins are legal
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+    gemmini_mx_load_scales((uint64_t)&V_scales_col, sizeof(V_scales_col), 1);
+
+    // Load B=V tiles into scratchpad (unchanged from original)
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) {
+        int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin2((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                               b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+      }
+
+    // Configure mvin port for A=P tiles (stride = ATT_S)
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+
+    // Fused loop: compute softmax for one i-block (DIM rows), then immediately
+    // mvin those rows into the scratchpad while they are hot in L1 cache.
+    for (int i = 0; i < tiles_I; i++) {
+      // -- Softmax for rows [i*DIM .. (i+1)*DIM) --
+      for (int row = i * DIM; row < (i + 1) * DIM; row++) {
+        int64_t q[ATT_S];
+        int64_t mq = -((int64_t)1 << 62);
+        for (int j = 0; j < ATT_S; j += 4) {
+          uint64_t w = S1_hw[row][j / 4];
+          for (int l = 0; l < 4; l++) {
+            int64_t qq = mx_ibf16_to_q((uint16_t)((w >> (l * 16)) & 0xFFFF));
+            q[j + l] = qq;
+            if (qq > mq) mq = qq;
+          }
+        }
+        int64_t p[ATT_S];
+        int64_t sm = 0;
+        for (int j = 0; j < ATT_S; j++) {
+          int64_t pv = mx_iexp(q[j] - mq);
+          p[j] = pv;
+          sm += pv;
+        }
+        int ls = mx_ilog2((uint64_t)sm);
+        uint64_t inv_sm = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;
+        for (int g = 0; g < GROUPS_S; g++) {
+          int64_t gmax = 0;
+          for (int j = g * 32; j < (g + 1) * 32; j++)
+            if (p[j] > gmax) gmax = p[j];
+          if (gmax == 0) {
+            P_scales[g][row] = 0;
+            for (int j = g * 32; j < (g + 1) * 32; j++) P_q[row][j] = 0;
+            continue;
+          }
+          int e = mx_ilog2((uint64_t)gmax) - ls - MX_P_TARGET_LOG2;
+          P_scales[g][row] = (uint8_t)(e + 127);
+          for (int j = g * 32; j < (g + 1) * 32; j++)
+            P_q[row][j] = mx_ienc_fp8(p[j], inv_sm, ls, e);
+        }
+      }
+
+      // -- Immediately mvin the DIM rows we just wrote (they are hot in L1) --
+      // Each mvin covers k-tiles of P_q for this i-block; batch by 2 (MAX_BLOCK_LEN=4,
+      // but stride=ATT_S*1=128 bytes and rows=DIM=16, so each issued command covers
+      // bb*DIM cols × DIM rows within the scratchpad row layout).
+      for (int k = 0; k < tiles_K; k += 2) {
+        int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+      }
+    }
+
+    // -- Issue config_st / mxquant_config_mvout AFTER all mvins, BEFORE loop_ws_spad --
+    // P_scales is now fully written (all rows processed above), reload A scales
+    // so the requantizer sees the final values.
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+
+    gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+    gemmini_fence();
+  }
+}
+''',
+score=None,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='us.anthropic.claude-sonnet-4-6',
+code_gen_model='us.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None)

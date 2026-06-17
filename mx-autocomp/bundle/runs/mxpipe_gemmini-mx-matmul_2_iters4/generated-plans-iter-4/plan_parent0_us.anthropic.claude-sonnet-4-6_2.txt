@@ -1,0 +1,96 @@
+## Strategy: Interleave A and B mvin Commands to Maximize DMA Port Utilization
+
+### Analysis of the Current Code
+
+The original code issues all A tile mvins (using port 0 / `mvin`) in one complete loop, then issues all B tile mvins (using port 1 / `mvin2`) in a separate complete loop. While the hardware has **three independent DMA ports** (mvin, mvin2, mvin3), the current code serializes A and B loading sequentially — the B DMA engine sits idle while A tiles are being loaded, and vice versa.
+
+Specifically:
+- Loop 1: All A tiles loaded via port 0 (mvin) — B port idle
+- Loop 2: All B tiles loaded via port 1 (mvin2) — A port idle
+
+### The New Strategy: Interleave A and B mvin Across a Unified Loop
+
+Instead of two separate loops, merge the A and B tile loading into a **single unified loop** that alternates issuing `gemmini_extended_mvin` (port 0) and `gemmini_extended_mvin2` (port 1) within the same iteration. This allows both DMA engines to operate concurrently, effectively halving the total data-movement time since A and B transfers overlap in hardware.
+
+The loop structure becomes: for each `(i, k)` and `(j, k)` pair batched together in a single pass, emit both the A mvin and the B mvin before advancing. Since `tiles_I == tiles_J` is common but not required, we iterate over `max(tiles_I, tiles_J)` iterations, conditionally emitting A or B commands when the respective index is still in range.
+
+### Why This Works
+
+- The MX-Gemmini DMA subsystem has **three independent in-flight mvin ports**. Commands to different ports are queued independently and executed in parallel.
+- Currently, all A commands complete before any B command is even issued. By interleaving, the hardware sees A and B commands in alternating sequence, allowing both DMA channels to be active simultaneously.
+- The total number of RoCC instructions does not change, but the **wall-clock DMA time** is reduced because port 0 and port 1 transfers overlap.
+- No ordering violation occurs: `gemmini_loop_ws_spad` only begins after all mvin commands have been issued and the hardware drains them before compute starts (the fused loop implicitly stalls on pending mvins).
+
+### Implementation
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Configure port 0 (mvin) for A tiles: stride = MATMUL_K bytes per row
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), SCALE_IDENTITY, false, 0);
+  // Configure port 1 (mvin2) for B tiles: stride = MATMUL_K bytes per row
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), SCALE_IDENTITY, false, 1);
+
+  // Issue mxquant config before mvin loops to allow hardware to pipeline
+  // output configuration with data loading (strategy 11)
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+      tiles_I, tiles_J, tiles_K,
+      0, 0, tiles_I * tiles_J);
+
+  // Interleaved A (port 0) and B (port 1) mvin:
+  // Outer loop over the larger of tiles_I and tiles_J.
+  // For each outer index, we drain all k-batches for row i (A) and
+  // column j (B) simultaneously, keeping both DMA ports busy.
+  int max_IJ = tiles_I > tiles_J ? tiles_I : tiles_J;
+
+  for (int ij = 0; ij < max_IJ; ij++) {
+    // --- A tiles for row ij (if in range) ---
+    if (ij < tiles_I) {
+      // Hoist row-invariant base pointer for A row ij
+      elem_t *a_row_ptr = ((elem_t*)A_in) + ij * DIM * MATMUL_K;
+      int k = 0;
+      while (k < tiles_K) {
+        int batch = tiles_K - k;
+        if (batch > MAX_BLOCK_LEN) batch = MAX_BLOCK_LEN;
+        uint32_t sp_addr = a_base + (ij * tiles_K + k) * DIM;
+        gemmini_extended_mvin((void*)(a_row_ptr + k * DIM), sp_addr,
+                              batch * DIM, DIM);
+        k += batch;
+      }
+    }
+
+    // --- B tiles for column ij (if in range) ---
+    if (ij < tiles_J) {
+      // Hoist col-invariant base pointer for B col ij
+      elem_t *b_col_ptr = ((elem_t*)B_in) + ij * DIM * MATMUL_K;
+      int k = 0;
+      while (k < tiles_K) {
+        int batch = tiles_K - k;
+        if (batch > MAX_BLOCK_LEN) batch = MAX_BLOCK_LEN;
+        uint32_t sp_addr = b_base + (ij * tiles_K + k) * DIM;
+        gemmini_extended_mvin2((void*)(b_col_ptr + k * DIM), sp_addr,
+                               batch * DIM, DIM);
+        k += batch;
+      }
+    }
+  }
+
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+                       a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false,
+                       NO_ACTIVATION, 0, 0, false, 0x38);
+
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+### Why This Reduces Latency
+
+The critical insight is that in the original code, the A-load phase and B-load phase are **fully serialized at the instruction-issue level**. Even though ports 0 and 1 are independent, port 1 receives no commands until every port-0 command has been issued. By interleaving, for a matrix with `tiles_I=tiles_J=T` and `ceil(tiles_K/4)=B` batches per row/col, both ports receive commands in round-robin fashion, allowing the DMA hardware to overlap transfers. For the given problem dimensions this roughly halves the effective DMA latency, directly reducing total execution time since DMA loading dominates the non-compute portion of this kernel.

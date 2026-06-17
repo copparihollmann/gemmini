@@ -1,0 +1,168 @@
+```c
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+// Assuming necessary headers like "include/gemmini_testutils.h" are available
+
+// Non-inlined helper functions to reduce I-cache thrashing and register spilling
+
+__attribute__((noinline)) void helper_config_ex(void) {
+    gemmini_extended3_config_ex(
+        WEIGHT_STATIONARY, 
+        0, 
+        0, 
+        ACC_SCALE_IDENTITY,
+        /*C_stride=*/1, 
+        /*A_stride=*/1, 
+        /*A_transpose=*/0, 
+        /*B_transpose=*/0,
+        /*set_only_strides=*/false,
+        /*act_mx_fmt=*/0,   // FP8 E4M3
+        /*wgt_mx_fmt=*/0,   // FP8 E4M3
+        /*out_mx_fmt=*/3,   // BF16
+        /*uselut=*/0
+    );
+}
+
+__attribute__((noinline)) void helper_mx_load_scales(uint64_t dram_addr, uint32_t len, uint32_t sel) {
+    gemmini_mx_load_scales(dram_addr, len, sel);
+}
+
+__attribute__((noinline)) void helper_config_ld(uint64_t stride) {
+    gemmini_config_ld(stride);
+}
+
+__attribute__((noinline)) void helper_extended_mvin(void *dram_addr, uint32_t spad_addr, uint32_t cols, uint32_t rows) {
+    gemmini_extended_mvin(dram_addr, spad_addr, cols, rows);
+}
+
+__attribute__((noinline)) void helper_config_st(uint64_t stride) {
+    gemmini_config_st(stride);
+}
+
+__attribute__((noinline)) void helper_mxquant_config_mvout(uint64_t dram_addr, uint32_t i_bound, uint32_t j_bound, uint32_t k_bound) {
+    gemmini_mxquant_config_mvout(
+        dram_addr,
+        i_bound,    // tiles_I
+        j_bound,    // tiles_J
+        k_bound,    // tiles_K
+        /*scale_act_sel=*/0,
+        /*scale_w_sel=*/0,
+        /*lut_update_granularity=*/1
+    );
+}
+
+__attribute__((noinline)) void helper_loop_ws_spad(
+    uint32_t I, uint32_t J, uint32_t K,
+    uint32_t pad_I, uint32_t pad_J,
+    uint32_t a_base, uint32_t b_base_end, uint32_t spad_dest
+) {
+    // Re-issue the one-shot marker before each loop execution
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, a_base, b_base_end, k_LOOP_WS_CONFIG_SPAD_AB);
+    
+    gemmini_loop_ws_spad(
+        I, J, K,
+        pad_I, pad_J, /*pad_K=*/0,
+        a_base, b_base_end, /*D=*/0, spad_dest,
+        /*A_transpose=*/false, /*B_transpose=*/false,
+        /*full_C=*/false, /*low_D=*/false, /*ex_accumulate=*/false,
+        NO_ACTIVATION, /*a_spad_id=*/0, /*b_spad_id=*/0, /*is_resadd=*/false,
+        /*skips=*/0x38
+    );
+}
+
+__attribute__((noinline)) void helper_mx_read_smem(void *dram_addr, uint32_t smem_off_bf16, uint32_t num_bf16) {
+    gemmini_mx_read_smem(dram_addr, smem_off_bf16, num_bf16);
+}
+
+// Optimized solution entry point
+void solution(void) {
+    for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+        for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+            // Calculate effective block dimensions
+            int mrows = REAL_M - i0 * BLK;
+            if (mrows > BLK) mrows = BLK;
+            if (mrows <= 0) continue;
+
+            int ncols = REAL_N - j0 * BLK;
+            if (ncols > BLK) ncols = BLK;
+            if (ncols <= 0) continue;
+
+            // Stage per-group scales into local buffers
+            for (int g = 0; g < MATMUL_K / 32; g++) {
+                memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+                memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+            }
+
+            const int tiles_I = BLK / DIM;
+            const int tiles_J = BLK / DIM;
+            const int tiles_K = MATMUL_K / DIM;
+
+            const uint32_t a_base = 0;
+            const uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_J * tiles_K * DIM;
+            const int SPAD_DEST = 128;
+
+            const int pad_i = BLK - mrows;
+            const int pad_j = BLK - ncols;
+
+            gemmini_flush(0);
+
+            // --- Programming Model Sequence ---
+            // 1. Configure execution
+            helper_config_ex();
+
+            // 2. Load scale factors for A and B
+            helper_mx_load_scales((uint64_t)A_s, A_S_BYTES, /*sel=*/0); // A/activation scales
+            helper_mx_load_scales((uint64_t)B_s, B_S_BYTES, /*sel=*/1); // B/weight scales
+
+            // 4. Load A tiles into scratchpad
+            helper_config_ld(MATMUL_K * sizeof(elem_t));
+            for (int i = 0; i < tiles_I; i++) {
+                for (int k = 0; k < tiles_K; k++) {
+                    void *dram_ptr_A = (void *) (
+                        ((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM
+                    );
+                    uint32_t spad_addr_A = a_base + (i * tiles_K + k) * DIM;
+                    helper_extended_mvin(dram_ptr_A, spad_addr_A, DIM, DIM);
+                }
+            }
+
+            // Load B tiles into scratchpad
+            helper_config_ld(MATMUL_N * sizeof(elem_t));
+            for (int j = 0; j < tiles_J; j++) {
+                for (int k = 0; k < tiles_K; k++) {
+                    void *dram_ptr_B = (void *) (
+                        ((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)
+                    );
+                    uint32_t spad_addr_B = b_base + (k * tiles_J + j) * DIM;
+                    helper_extended_mvin(dram_ptr_B, spad_addr_B, DIM, DIM);
+                }
+            }
+
+            // 5. Configure output writeback and requantization
+            helper_config_st(BLK_OUTC * sizeof(out_t));
+            helper_mxquant_config_mvout(
+                (uint64_t)scale_factors,
+                tiles_I, tiles_J, tiles_K
+            );
+
+            // 6. Compute the weight-stationary matmul on scratchpad data
+            helper_loop_ws_spad(
+                tiles_I, tiles_J, tiles_K,
+                pad_i, pad_j,
+                a_base, BANK_NUM * BANK_ROWS, SPAD_DEST
+            );
+
+            // 7. Drain results from shared memory to DRAM
+            for (int r = 0; r < mrows; r++) {
+                void *dram_dest = &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD];
+                uint32_t smem_offset = SPAD_DEST * 16 + r * BLK;
+                helper_mx_read_smem(dram_dest, smem_offset, ncols);
+            }
+
+            // 8. Synchronize before host consumes output
+            gemmini_fence();
+        }
+    }
+}
+```

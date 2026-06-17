@@ -1,0 +1,99 @@
+## Analysis of the Current Code
+
+The baseline code has these characteristics for a 32×32×32 fp8 matmul:
+- `tiles_I = 2, tiles_J = 2, tiles_K = 2`
+- Two separate `gemmini_config_ld` calls (one for A with stride K, one for B with stride N)
+- Nested loops for mvin A and mvin B
+- `skips = 0x38` already set
+
+## Selected Strategy: **Strategy 13 — Precompute scratchpad address offsets as compile-time constants**
+
+### Why This Strategy
+
+With `tiles_I=2, tiles_J=2, tiles_K=2` (all known at compile time from `MATMUL_M=32, MATMUL_N=32, MATMUL_K=32, DIM=16`), the nested mvin loops iterate over only 4 A-tiles and 4 B-tiles respectively. Each loop iteration computes:
+- `a_base + (i * tiles_K + k) * DIM` — a multiply-add chain at runtime
+- `b_base + (k * tiles_J + j) * DIM` — another multiply-add chain at runtime
+- DRAM pointer arithmetic with runtime multiplications
+
+By unrolling these loops and replacing all address expressions with compile-time integer constants, we eliminate all loop control overhead, branch mispredictions, and runtime integer multiplications inside the mvin dispatch sequence.
+
+### Concrete Plan
+
+**Compute all constants at compile time:**
+
+- `tiles_I = 32/16 = 2`
+- `tiles_J = 32/16 = 2`  
+- `tiles_K = 32/16 = 2`
+- `a_base = 0`
+- `b_base = 4*2048 - 2*2*16 = 8192 - 64 = 8128`
+- `SPAD_DEST = 0` (accumulator high-bit address = `1 << 31`)
+
+**A-tile spad addresses** (`a_base + (i*tiles_K + k)*DIM`, `a_base=0`, `DIM=16`):
+- (i=0,k=0): `0`
+- (i=0,k=1): `16`
+- (i=1,k=0): `32`
+- (i=1,k=1): `48`
+
+**B-tile spad addresses** (`b_base + (k*tiles_J + j)*DIM`):
+- (k=0,j=0): `8128`
+- (k=0,j=1): `8144`
+- (k=1,j=0): `8160`
+- (k=1,j=1): `8176`
+
+**DRAM pointers** (also compile-time offsets from base pointers):
+- A[i][k]: `A_in + (i*DIM*MATMUL_K + k*DIM)` → offsets 0, 16, 512, 528 bytes
+- B[k][j]: `B_in + (k*DIM*MATMUL_N + j*DIM)` → offsets 0, 16, 512, 528 bytes
+
+**Replace the two nested loops** with 8 fully unrolled `gemmini_extended_mvin` / `gemmini_extended_mvin2` calls using these precomputed constants, eliminating all loop variables, multiplication, and the `gemmini_config_ld` re-issue between A and B groups. Each call becomes a single RoCC instruction with immediate operands the compiler can fold into constants.
+
+The `gemmini_config_ld` calls remain (one for A stride, one for B stride since strides differ: `MATMUL_K=32` vs `MATMUL_N=32` — they are equal here, so actually only **one** `gemmini_config_ld` is needed), and the rest of the sequence (config_ex, load_scales, config_st, mxquant_config_mvout, loop_ws_spad, read_smem, fence) is unchanged.
+
+Since `MATMUL_K == MATMUL_N == 32`, both A and B have the same DRAM row stride of `32 * sizeof(uint8_t) = 32` bytes, so **one `gemmini_config_ld(32)` covers both**, eliminating one configuration instruction (this is a secondary benefit from strategy 12, but it falls naturally out of the constant-folding analysis).
+
+The rewritten `solution()`:
+
+```c
+void solution(void) {
+  // Step 1: configure execution
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // Step 2: load scale factors
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Step 4: mvin tiles — all addresses precomputed as compile-time constants
+  // tiles_I=2, tiles_J=2, tiles_K=2
+  // a_base=0, b_base=8128, DIM=16
+  // A stride = B stride = MATMUL_K = MATMUL_N = 32 bytes → single config_ld
+  gemmini_config_ld(32 * sizeof(elem_t));  // covers both A and B (stride=32)
+
+  // A tiles: spad = (i*2+k)*16, dram = A_in + i*DIM*32 + k*DIM
+  gemmini_extended_mvin((elem_t*)A_in + 0,   0,  DIM, DIM); // i=0,k=0
+  gemmini_extended_mvin((elem_t*)A_in + 16,  16, DIM, DIM); // i=0,k=1
+  gemmini_extended_mvin((elem_t*)A_in + 512, 32, DIM, DIM); // i=1,k=0
+  gemmini_extended_mvin((elem_t*)A_in + 528, 48, DIM, DIM); // i=1,k=1
+
+  // B tiles: spad = 8128 + (k*2+j)*16, dram = B_in + k*DIM*32 + j*DIM
+  gemmini_extended_mvin2((elem_t*)B_in + 0,    8128, DIM, DIM); // k=0,j=0
+  gemmini_extended_mvin2((elem_t*)B_in + 16,   8144, DIM, DIM); // k=0,j=1
+  gemmini_extended_mvin2((elem_t*)B_in + 512,  8160, DIM, DIM); // k=1,j=0
+  gemmini_extended_mvin2((elem_t*)B_in + 528,  8176, DIM, DIM); // k=1,j=1
+
+  // Step 5: configure output
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+      2, 2, 2, 0, 0, 1);
+
+  // Step 6: fused tiled matmul
+  gemmini_loop_ws_spad(2, 2, 2, 0, 0, 0,
+      0, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+      false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // Step 7: drain results
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+This removes all runtime multiplications, loop counters, and branch instructions from the mvin dispatch sequence, replacing them with straight-line RoCC instructions that the compiler emits as immediate constants.

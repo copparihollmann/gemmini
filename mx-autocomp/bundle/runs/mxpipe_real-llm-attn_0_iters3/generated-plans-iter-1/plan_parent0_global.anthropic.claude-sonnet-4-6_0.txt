@@ -1,0 +1,56 @@
+## Analysis of the Current Code
+
+The current code processes each (i0, j0) block independently with a full `gemmini_flush` + configure + load scales + mvin A + mvin B + compute + readout cycle. The key inefficiency relevant to **strategy 3** is:
+
+**B tiles are reloaded for every i0 iteration**, even though B[k][j0] tiles are fixed for all i0 blocks (weight-stationary means B doesn't change as we sweep over M-dimension blocks). The outer loop is `i0` over `j0`, so for each `j0`, B is loaded `BLOCKS_M` times unnecessarily.
+
+## Selected Strategy: 3 — Assign B tiles to fixed high-address scratchpad region to enable weight-stationary reuse across I tiles
+
+### Plan
+
+**Swap the loop order to `j0` outer, `i0` inner.** With `j0` as the outer loop:
+
+1. **Load B tiles once per `j0`** into `b_base = BANK_NUM*BANK_ROWS - tiles_K*tiles*DIM` at the top of the scratchpad. These B tiles remain valid for all `i0` iterations at the same `j0`.
+
+2. **For each `i0` inner iteration**, only reload A tiles (which change per i0) and the A-side scale factors. B-side scale factors and B tiles stay in place.
+
+3. **Scratchpad capacity check**: 
+   - B occupies `tiles * tiles_K * DIM` rows at the top (tiles=BLK/DIM, tiles_K=K/DIM)
+   - A occupies `tiles * tiles_K * DIM` rows at the bottom
+   - Total: `2 * tiles * tiles_K * DIM` rows must be ≤ 8192
+   - With BLK=512/something reasonable and K=512: need to verify this fits
+
+4. **Reload constraint**: B scales (`B_s`) are also fixed per `j0`, so `gemmini_mx_load_scales` for B only happens once per `j0`. A scales (`A_s`) change per `i0` and must be reloaded each inner iteration.
+
+5. **Move `gemmini_flush` and `gemmini_extended3_config_ex` outside both loops** — configuration is the same for every tile. Only re-issue what changes (scale loads, mvins).
+
+6. **Remove the `gemmini_flush` from the inner loop** — flushing every iteration drains the pipeline unnecessarily. One flush at the start suffices since format/configuration don't change.
+
+### Structural Change Summary
+
+```
+Before:
+  for i0:
+    for j0:
+      flush + config_ex
+      load A_scales + B_scales
+      mvin A + mvin B
+      compute + readout
+
+After:
+  flush + config_ex  (once)
+  for j0:
+    copy B_scales for this j0 (once per j0)
+    load B_scales (once per j0)
+    mvin B tiles (once per j0)
+    for i0:
+      copy A_scales for this i0
+      load A_scales
+      mvin A tiles
+      config_st + mxquant_config_mvout
+      loop_ws_spad
+      mx_read_smem per row
+      fence
+```
+
+This eliminates `BLOCKS_M - 1` redundant B-tile mvin operations and `BLOCKS_M - 1` redundant B scale loads per j0 column, directly reducing total data movement proportional to `BLOCKS_M`. Since the programming model requires scales to be loaded before `loop_ws_spad`, and A/B scales are independent buffers, loading B scales once and A scales per-i0 is valid as long as B scale memory is not overwritten between uses.

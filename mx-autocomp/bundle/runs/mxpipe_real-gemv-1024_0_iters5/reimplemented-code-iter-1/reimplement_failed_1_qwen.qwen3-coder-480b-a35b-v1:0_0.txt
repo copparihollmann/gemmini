@@ -1,0 +1,144 @@
+// Optimized outer-tiled MX matmul with pipelined double-buffering and direct scale loading.
+void solution(void) {
+  const int tiles_I = BLK / DIM;
+  const int tiles_J = BLK / DIM;
+  const int tiles_K = MATMUL_K / DIM;
+
+  // Scratchpad double-buffering setup
+  const uint32_t spad_half_rows = (BANK_NUM * BANK_ROWS) / 2; // 4096 rows
+  
+  // Ping-Pong buffer addresses
+  const uint32_t a_base_ping = 0;
+  const uint32_t a_base_pong = spad_half_rows;
+  
+  // B matrix is placed at the top of each half
+  const uint32_t b_base_ping = spad_half_rows - (tiles_K * tiles_J * DIM);
+  const uint32_t b_base_pong = (BANK_NUM * BANK_ROWS) - (tiles_K * tiles_J * DIM);
+
+  // Shared memory destination (must be within mx_smem bounds)
+  const int SPAD_DEST_PING = 0;
+  const int SPAD_DEST_PONG = 128; // Should be within mx_smem bounds
+
+  uint32_t a_base_curr = a_base_ping;
+  uint32_t b_base_curr = b_base_ping;
+  uint32_t a_base_next = a_base_pong;
+  uint32_t b_base_next = b_base_pong;
+  int spad_dest_curr = SPAD_DEST_PING;
+  int spad_dest_next = SPAD_DEST_PONG;
+
+  // Configuration (done once, persists)
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                              /*C_stride*/1, /*A_stride*/1, /*A_transpose*/0, /*B_transpose*/0,
+                              /*set_only_strides*/false,
+                              /*act_mx_fmt*/0, /*wgt_mx_fmt*/0, /*out_mx_fmt*/3, /*uselut*/0);
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t)); // For A
+  gemmini_config_st(BLK * sizeof(out_t));  // For output
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // --- Prologue: Load first block's data ---
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK;
+      if (ncols > BLK) ncols = BLK;
+      if (ncols <= 0) continue;
+      int pad_i = BLK - mrows;
+      int pad_j = BLK - ncols;
+
+      gemmini_flush(0);
+
+      // Load scales for current block
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        gemmini_mx_load_scales((uint64_t)&A_scales_row[g][i0 * BLK], BLK, 0);
+        gemmini_mx_load_scales((uint64_t)&B_scales_col[g][j0 * BLK], BLK, 1);
+      }
+
+      // Preload A and B for current block (0) into current buffer (Ping)
+      for (int i = 0; i < tiles_I; i++) {
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base_curr + (i * tiles_K + k) * DIM, DIM, DIM);
+        }
+      }
+      for (int j = 0; j < tiles_J; j++) {
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin2((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                 b_base_curr + (j * tiles_K + k) * DIM, DIM, DIM);
+        }
+      }
+
+      // Configure mvout for current block
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+      // --- Main Loop: Pipelined Execution ---
+      for (int curr_block = 0; curr_block < BLOCKS_K; curr_block++) {
+        int next_block = curr_block + 1;
+
+        // 1. Compute the currently loaded block (curr_block)
+        gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, pad_i, pad_j, 0,
+                             a_base_curr, BANK_NUM * BANK_ROWS, 0, spad_dest_curr,
+                             false, false, false, false, false, NO_ACTIVATION, 1, 1, false, 0x38);
+
+        // 2. Prefetch data for the *next* block (next_block), if it exists
+        if (next_block < BLOCKS_K) {
+          // Scales for next block
+          for (int g = 0; g < MATMUL_K / 32; g++) {
+            gemmini_mx_load_scales((uint64_t)&A_scales_row[g][(i0 * BLK) + (next_block * 32)], BLK, 0);
+            gemmini_mx_load_scales((uint64_t)&B_scales_col[g][(j0 * BLK) + (next_block * 32)], BLK, 1);
+          }
+
+          // MVIN A and B for next block into the other buffer (Pong)
+          for (int i = 0; i < tiles_I; i++) {
+            for (int k = 0; k < tiles_K; k++) {
+              gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + (next_block * 32 + k * DIM)),
+                                    a_base_next + (i * tiles_K + k) * DIM, DIM, DIM);
+            }
+          }
+          for (int j = 0; j < tiles_J; j++) {
+            for (int k = 0; k < tiles_K; k++) {
+              gemmini_extended_mvin2((void*)(((elem_t*)B_in) + (next_block * 32 + k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                     b_base_next + (j * tiles_K + k) * DIM, DIM, DIM);
+            }
+          }
+        }
+
+        // 3. Drain the result of the *current* block (curr_block) from shared mem to DRAM
+        for (int i = 0; i < tiles_I; i++) {
+          for (int j = 0; j < DIM; j++) {
+            if ((i0 * BLK + i * DIM + j) < REAL_M) {
+              gemmini_mx_read_smem(&C_hw[i0 * BLK + i * DIM + j][(j0 * BLK) / BF16_PER_WORD],
+                                   spad_dest_curr * 16 + (i * DIM + j) * BLK, ncols);
+            }
+          }
+        }
+
+        // 4. Swap buffers for the next iteration
+        uint32_t tmp_a_base = a_base_curr;
+        uint32_t tmp_b_base = b_base_curr;
+        int tmp_spad_dest = spad_dest_curr;
+
+        a_base_curr = a_base_next;
+        b_base_curr = b_base_next;
+        spad_dest_curr = spad_dest_next;
+
+        a_base_next = tmp_a_base;
+        b_base_next = tmp_b_base;
+        spad_dest_next = tmp_spad_dest;
+      }
+
+      // --- Epilogue: Drain result of the last block ---
+      for (int i = 0; i < tiles_I; i++) {
+        for (int j = 0; j < DIM; j++) {
+          if ((i0 * BLK + i * DIM + j) < REAL_M) {
+            gemmini_mx_read_smem(&C_hw[i0 * BLK + i * DIM + j][(j0 * BLK) / BF16_PER_WORD],
+                                 spad_dest_curr * 16 + (i * DIM + j) * BLK, ncols);
+          }
+        }
+      }
+    }
+  }
+
+  // Final fence to ensure all writes are complete before host reads
+  gemmini_fence();
+}

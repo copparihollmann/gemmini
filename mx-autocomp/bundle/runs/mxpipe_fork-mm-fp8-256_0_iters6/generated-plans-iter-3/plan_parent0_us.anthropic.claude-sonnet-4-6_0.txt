@@ -1,0 +1,41 @@
+## Analysis
+
+Looking at the original code, the B-tile mvin loop is:
+
+```c
+for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j++) {
+        elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+        uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+        gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+}
+```
+
+For `MATMUL_N=128, MATMUL_K=256`, `tiles_J=8, tiles_K=16`, this issues **128 individual mvin commands**.
+
+## Plan: Strategy 7 — Batch consecutive B-tile mvin calls using `gemmini_block_mvin`
+
+**Observation:** The B scratchpad layout places tile `(k, j)` at `b_base + (k*tiles_J + j)*DIM`. For a fixed `k`, as `j` runs 0..tiles_J-1, the scratchpad addresses are consecutive: `b_base + k*tiles_J*DIM`, `b_base + k*tiles_J*DIM + DIM`, ..., contiguous in both DRAM and scratchpad.
+
+However, looking more carefully at the DRAM layout: `B_in + k*DIM*MATMUL_N + j*DIM` — for fixed `k`, as `j` increases by 1, the DRAM pointer increases by `DIM` bytes. With stride `gemmini_config_ld(MATMUL_N * sizeof(elem_t))` = 128, this means each successive `j` tile starts exactly one DIM-row stride apart in DRAM. And in the scratchpad, they are also DIM rows apart and contiguous. This is exactly the `gemmini_block_mvin` use case.
+
+**`gemmini_block_mvin(dram_addr, spad_addr, len)`** issues a single mvin command that loads `len` consecutive DIM-column tiles, each `stride` bytes apart in DRAM, into consecutive scratchpad rows. With `len = tiles_J` (up to `MAX_BLOCK_LEN = 4`), we can batch tiles_J tiles per k-row into `tiles_J / MAX_BLOCK_LEN` commands.
+
+**Concrete change:**
+
+For each `k`, instead of `tiles_J` individual mvin calls, issue `ceil(tiles_J / MAX_BLOCK_LEN)` block mvin calls, each transferring up to 4 tiles at once. With `tiles_J = 8` and `MAX_BLOCK_LEN = 4`, this reduces from 8 calls to 2 calls per `k`, reducing total B-load instruction count from 128 to 32 — a 4× reduction in B mvin commands.
+
+The inner loop over `j` becomes:
+```c
+for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j += MAX_BLOCK_LEN) {
+        int batch = (tiles_J - j < MAX_BLOCK_LEN) ? (tiles_J - j) : MAX_BLOCK_LEN;
+        elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+        uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+        gemmini_block_mvin((void*)dram_ptr, sp_addr, batch);
+    }
+}
+```
+
+The B spad layout `b_base + (k*tiles_J + j)*DIM` is unchanged — `gemmini_block_mvin` fills exactly those consecutive rows. The A mvin loop is unchanged. All other steps (config_ex, load_scales, config_st, mxquant_config_mvout, loop_ws_spad, mx_read_smem, fence) are unchanged. This is a drop-in reduction of mvin instruction count with no semantic change.

@@ -1,0 +1,54 @@
+## Analysis of the Current Code
+
+Looking at the code, I need to identify which strategy applies most directly.
+
+The current code uses `lut_update_granularity=1` in the `gemmini_mxquant_config_mvout` call:
+
+```c
+gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+```
+
+However, checking the format configuration:
+```c
+gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+```
+
+The last argument `uselut=0` — so **no LUT is used**. Strategy 3 (raise `lut_update_granularity`) targets the fp6 LUT path, which is not active here.
+
+Strategy 1 — **hoist redundant operations out of loops** — is directly applicable. Looking at the loop:
+
+```c
+for (int i0 = 0; i0 < BLOCKS_M; i0++)
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    ...
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(...);  // ← same every iteration
+    gemmini_mx_load_scales(...A...);   // ← A scales only change with i0
+    gemmini_mx_load_scales(...B...);   // ← B scales only change with j0
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));  // ← constant
+    ...
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));  // ← constant
+    ...
+    gemmini_config_st(...);  // ← constant
+```
+
+The `gemmini_extended3_config_ex` call and `gemmini_flush(0)` are **identical every iteration** and can be hoisted outside both loops. The `gemmini_config_ld` calls for A and B strides are also identical across all iterations and can be hoisted (with a stride-switch between A and B mvin remaining inline).
+
+Additionally, the A scale load only changes when `i0` changes, so it can be hoisted to the outer loop. The B scale load only changes when `j0` changes.
+
+## Plan
+
+**Strategy: Hoist redundant operations out of loops**
+
+1. **Hoist `gemmini_flush(0)` before both loops** — it resets accelerator state once; re-issuing it every (i0,j0) pair is unnecessary overhead since the sequence never leaves a dirty state between iterations when `gemmini_fence()` already drains results.
+
+2. **Hoist `gemmini_extended3_config_ex(...)` before both loops** — the format, dataflow, strides, and all format fields are identical every iteration; this CONFIG_EX state persists until changed and does not need to be re-issued per tile block.
+
+3. **Hoist the A-side `gemmini_config_ld(MATMUL_K * sizeof(elem_t))` and `gemmini_mx_load_scales` for A to the outer `i0` loop** — A scales depend only on `i0` (they index `A_scales_row[g][i0*BLK ...]`), so they are invariant across all `j0` iterations for a fixed `i0`. Moving the A scale load to the outer loop eliminates `BLOCKS_N` redundant reloads of the same A scales per row of blocks.
+
+4. **Keep the B-side `gemmini_mx_load_scales` inside the `j0` loop** (it correctly changes with `j0`), but remove the redundant `gemmini_config_ld` re-issues by noting the stride for B (`MATMUL_N * sizeof(elem_t)`) is also constant — set it once before both loops and only switch strides when moving between A mvin and B mvin within the inner body (using two hoisted config_ld calls — one for A stride before the A mvin block, one for B stride before the B mvin block — but these are still per-iteration since both mvins happen inside the loop; however `gemmini_flush` and `config_ex` are still hoistable).
+
+The concrete changes are:
+- Move `gemmini_flush(0)` and `gemmini_extended3_config_ex(...)` to before the `i0` loop.
+- Move `gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0)` (along with its `memcpy` for A scales and `gemmini_config_ld(MATMUL_K*sizeof(elem_t))`) to the body of the outer `i0` loop, before the `j0` loop, since A scales are constant across all `j0`.
+- Inside the `j0` loop, only the B scale memcpy+load, the B mvin config_ld+loop, the output config, and the compute/readout remain.

@@ -1,0 +1,49 @@
+# Optimization Plan: Strategy 9 — Preload V Matrix During Softmax Computation
+
+## Analysis of the Current Code
+
+The current code has two matmul phases separated by a host-CPU softmax loop:
+
+1. **Phase 1:** Q×KT matmul → S1_hw (BF16 attention scores)
+2. **Host CPU:** Softmax + FP4 requantization → P_hw, P_scales
+3. **Phase 2:** P×V matmul → O_hw (output)
+
+The critical bottleneck is that **Phase 2's `gemmini_config_ld` + mvin loop for V tiles runs sequentially after the softmax completes**, meaning the accelerator is completely idle during the entire softmax computation on the host CPU.
+
+## The Strategy: Preload V Tiles During Softmax
+
+**Strategy 9** says: preload the V matrix (second matmul's B tiles) into the upper scratchpad region *during* the softmax host-CPU computation, so V tiles are already in SRAM when the second `gemmini_loop_ws_spad` begins.
+
+### Why This Works
+
+- The softmax loop is a pure host-CPU computation (integer arithmetic only, no Gemmini instructions). The Gemmini DMA engine is completely idle during this time.
+- V's B-tile layout for Phase 2 is fully determined before softmax begins: `ti2 = ATT_S/DIM/2`, `tj2 = ATT_D/DIM/2`, `tk2 = ATT_S/DIM`, `b_base2 = BANK_NUM*BANK_ROWS - tk2*tj2*DIM`.
+- We can issue all V mvin instructions immediately after Phase 1's `gemmini_fence()` — before entering the softmax loop — and let the DMA engine fill the scratchpad concurrently while the CPU runs softmax.
+
+### Scratchpad Capacity Check
+
+Phase 2 parameters: `ti2 = 4`, `tj2 = 2`, `tk2 = 8`, `DIM = 16`.
+- V tiles needed: `tj2 * tk2 * DIM = 2 * 8 * 16 = 256` rows (top of scratchpad)
+- P tiles needed: `ti2 * tk2 * DIM = 4 * 8 * 16 = 512` rows (bottom of scratchpad)
+- Total: `256 + 512 = 768` rows ≤ 8192 ✓
+
+### Specific Changes
+
+1. **After Phase 1's `gemmini_fence()`**, immediately issue `gemmini_config_ld` for V's stride and mvin all V tiles into `b_base2`. This is safe because Phase 1 is fully complete (fence issued), the scratchpad state from Phase 1 is no longer needed, and V's layout is independent of softmax results.
+
+2. **Remove the V mvin block from Phase 2** (the `gemmini_config_ld(ATT_D*sizeof(elem_t)/2)` and its loop), since V is already loaded.
+
+3. The softmax loop runs on the host CPU while the Gemmini DMA engine concurrently streams V tiles from DRAM into the scratchpad. No synchronization is needed between the host softmax and the V DMA, because Phase 2's `gemmini_loop_ws_spad` implicitly waits for all prior mvin commands to complete before consuming the scratchpad data.
+
+4. Phase 2 then begins with `gemmini_flush(0)` + `gemmini_extended3_config_ex` + `gemmini_mx_load_scales` (for P_scales and V_scales_col — these still require the softmax results for P_scales, so they stay after the softmax loop) + `gemmini_mxquant_config_mvout`, then the P mvin loop, then `gemmini_loop_ws_spad`.
+
+### Ordering Compliance
+
+The programming model sequence is preserved:
+- `gemmini_extended3_config_ex` for Phase 2 still precedes `gemmini_mx_load_scales` for Phase 2.
+- V mvins (issued after Phase 1's fence, before Phase 2's config_ex) use the DMA engine independently and don't violate the config→scales→mvin→compute ordering for Phase 2, because `gemmini_loop_ws_spad` sees a consistent state: config_ex and scales are set before it executes, and mvin data is already in the scratchpad.
+- `gemmini_flush(0)` at the start of Phase 2 will wait for the in-flight V mvins to drain before resetting state, ensuring correctness.
+
+### Expected Benefit
+
+The V matrix has `tk2 * tj2 = 8 * 2 = 16` tiles, each requiring a `gemmini_extended_mvin` call. This entire data movement (16 × 16×16 × 1 byte = 4096 bytes of DMA) is **fully hidden behind the softmax computation**, which iterates over 128 rows × 128 columns of integer arithmetic. The effective latency reduction is the full cost of the V mvin loop.

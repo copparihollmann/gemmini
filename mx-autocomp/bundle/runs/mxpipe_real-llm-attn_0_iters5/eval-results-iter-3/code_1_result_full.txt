@@ -1,0 +1,293 @@
+{'correct': True, 'test_results': {0: True}, 'compiled': True, 'latency_spike_raw': 14149, 'latency': 14149}
+Prev latency: 13965
+New latency: 14149
+Plan: An elegant way to optimize the performance of the provided Gemmini kernel is by implementing **Strategy 1: Ping-pong accumulator destinations (SPAD_DEST)**.
+
+### Plan
+
+1. **Analyze the Loop Structure**:
+   The inner loop iterates over column blocks `j0` (`BLOCKS_N`). In the baseline code, each iteration writes its results to the same shared memory location, `SPAD_DEST = 128`, and immediately stalls the CPU with a `gemmini_fence()` to wait for the data to be read into DRAM via `gemmini_mx_read_smem()`. This prevents any overlap between the computation of the next column block and the memory drain of the current block.
+
+2. **Define Double-Buffer Zones**:
+   To prevent overwriting active accumulator data, we can define two disjoint zones in `mx_smem`.
+   - Zone 0 starting at `128`
+   - Zone 1 starting at `128 + tiles * tiles * DIM` (dynamically sized based on the actual tile counts to prevent any overlap).
+
+3. **Ping-Pong the Destinations**:
+   In each iteration of the `j0` loop, compute the destination `current_spad_dest` based on the loop index parity:
+   ```c
+   int current_spad_dest = (j0 % 2 == 0) ? 128 : (128 + tiles * tiles * DIM);
+   ```
+
+4. **Pipelined Synchronization**:
+   - Remove the immediate `gemmini_fence()` from the end of the `j0` loop. This allows `gemmini_mx_read_smem()` to execute asynchronously while the CPU continues to issue scale loads, MVINs, and the next `gemmini_loop_ws_spad` compute using the alternate `SPAD_DEST` buffer.
+   - Insert a conditional `gemmini_fence()` at the beginning of the `j0` loop (only when `j0 >= 2`). This ensures that before we reuse a `SPAD_DEST` buffer, any outstanding read from two iterations ago has completed.
+   - Insert a final `gemmini_fence()` after the `j0` loop terminates to guarantee all remaining asynchronous read operations are complete before moving to the next row block or returning.
+
+CodeCandidate(parent=CodeCandidate(parent=CodeCandidate(parent=None,
+plan='''prior autocomp winner (mxpipe_real-llm-attn_0_iters6)''',
+code='''void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+
+    // A scales only depend on i0: copy once per i0, reuse across all j0.
+    for (int g = 0; g < MATMUL_K / 32; g++)
+      memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      // B scales depend on j0: copy once per (i0,j0).
+      for (int g = 0; g < MATMUL_K / 32; g++)
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int j = 0; j < tiles; j++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+  }
+}
+''',
+score=14000,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'CPU/host data staging detected (2 memcpy, ~0 scalar copy loops). Host staging is typically the dominant cost on this accelerator and autocomp cannot speed it up directly: mvin tiles STRIDED straight from the source DRAM arrays instead of copying through a host buffer, and keep partial sums in shared memory (bf16 accumulate) rather than accumulating on the CPU.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''Here is a detailed optimization plan to improve the execution time of the matrix multiplication kernel by applying Strategy 4.
+
+### Optimization Plan: Hoist `gemmini_extended3_config_ex` Outside All Loops
+
+**Analysis of the Inefficiency:**
+In the original implementation, the `gemmini_extended3_config_ex` instruction is called inside the nested loops (`i0` and `j0` loop levels). This instruction configures execution settings such as the dataflow mode (`WEIGHT_STATIONARY`), matrix formats, transposes, and scale types. These parameters are invariant throughout the entire execution of the function `solution(void)`. Because Gemmini maintains these configuration parameters in state registers until they are explicitly updated, re-issuing this RoCC instruction inside the innermost loop generates redundant hardware configuration overhead on every block execution. 
+
+**Proposed Changes:**
+1. **Identify the invariant configuration call:** 
+   ```c
+   gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+   ```
+2. **Hoist the call:** Move this instruction out of both loops so it executes exactly once at the very beginning of `solution()`.
+3. **Preserve State:** No other state-altering operations interfere with this configuration, so hoisting it is perfectly safe and maintains bit-exact correctness.
+
+---
+
+### Optimized Code
+
+```c
+void solution(void) {
+  // Hoist invariant configuration outside all loops
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+
+    // A scales only depend on i0: copy once per i0, reuse across all j0.
+    for (int g = 0; g < MATMUL_K / 32; g++)
+      memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      // B scales depend on j0: copy once per (i0,j0).
+      for (int g = 0; g < MATMUL_K / 32; g++)
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      gemmini_flush(0);
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int j = 0; j < tiles; j++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+  }
+}
+```''',
+code='''void solution(void) {
+  // Hoist invariant configuration outside all loops
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+
+    // A scales only depend on i0: copy once per i0, reuse across all j0.
+    for (int g = 0; g < MATMUL_K / 32; g++)
+      memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      // B scales depend on j0: copy once per (i0,j0).
+      for (int g = 0; g < MATMUL_K / 32; g++)
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      gemmini_flush(0);
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int j = 0; j < tiles; j++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+  }
+}
+''',
+score=13965,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'CPU/host data staging detected (2 memcpy, ~0 scalar copy loops). Host staging is typically the dominant cost on this accelerator and autocomp cannot speed it up directly: mvin tiles STRIDED straight from the source DRAM arrays instead of copying through a host buffer, and keep partial sums in shared memory (bf16 accumulate) rather than accumulating on the CPU.'],
+plan_gen_model='gemini-3.5-flash',
+code_gen_model='qwen.qwen3-coder-480b-a35b-v1:0',
+stdout=None,
+stderr=None),
+plan='''An elegant way to optimize the performance of the provided Gemmini kernel is by implementing **Strategy 1: Ping-pong accumulator destinations (SPAD_DEST)**.
+
+### Plan
+
+1. **Analyze the Loop Structure**:
+   The inner loop iterates over column blocks `j0` (`BLOCKS_N`). In the baseline code, each iteration writes its results to the same shared memory location, `SPAD_DEST = 128`, and immediately stalls the CPU with a `gemmini_fence()` to wait for the data to be read into DRAM via `gemmini_mx_read_smem()`. This prevents any overlap between the computation of the next column block and the memory drain of the current block.
+
+2. **Define Double-Buffer Zones**:
+   To prevent overwriting active accumulator data, we can define two disjoint zones in `mx_smem`.
+   - Zone 0 starting at `128`
+   - Zone 1 starting at `128 + tiles * tiles * DIM` (dynamically sized based on the actual tile counts to prevent any overlap).
+
+3. **Ping-Pong the Destinations**:
+   In each iteration of the `j0` loop, compute the destination `current_spad_dest` based on the loop index parity:
+   ```c
+   int current_spad_dest = (j0 % 2 == 0) ? 128 : (128 + tiles * tiles * DIM);
+   ```
+
+4. **Pipelined Synchronization**:
+   - Remove the immediate `gemmini_fence()` from the end of the `j0` loop. This allows `gemmini_mx_read_smem()` to execute asynchronously while the CPU continues to issue scale loads, MVINs, and the next `gemmini_loop_ws_spad` compute using the alternate `SPAD_DEST` buffer.
+   - Insert a conditional `gemmini_fence()` at the beginning of the `j0` loop (only when `j0 >= 2`). This ensures that before we reuse a `SPAD_DEST` buffer, any outstanding read from two iterations ago has completed.
+   - Insert a final `gemmini_fence()` after the `j0` loop terminates to guarantee all remaining asynchronous read operations are complete before moving to the next row block or returning.''',
+code='''void solution(void) {
+  // Hoist invariant configuration outside all loops
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+
+    // A scales only depend on i0: copy once per i0, reuse across all j0.
+    for (int g = 0; g < MATMUL_K / 32; g++)
+      memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Pipelined synchronization: ensure previous reads from two iterations ago are done
+      if (j0 >= 2) {
+        gemmini_fence();
+      }
+
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      // B scales depend on j0: copy once per (i0,j0).
+      for (int g = 0; g < MATMUL_K / 32; g++)
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      // Ping-pong the accumulator destinations in mx_smem
+      int current_spad_dest = (j0 % 2 == 0) ? 128 : (128 + tiles * tiles * DIM);
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      gemmini_flush(0);
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int j = 0; j < tiles; j++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           current_spad_dest, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             current_spad_dest * 16 + r * BLK, ncols);
+      // gemmini_fence() is removed from here to allow pipelining
+    }
+    // Final fence after j0 loop to ensure all pending reads are complete
+    gemmini_fence();
+  }
+}
+''',
+score=None,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='gemini-3.5-flash',
+code_gen_model='qwen.qwen3-coder-480b-a35b-v1:0',
+stdout=None,
+stderr=None)

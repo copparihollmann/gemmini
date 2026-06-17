@@ -1,0 +1,107 @@
+An elegant and effective way to optimize the performance of the baseline implementation is to apply **Strategy 2: Loop reordering and restructuring**.
+
+### Optimization Plan
+
+1. **Loop Swap ($i0$ and $j0$):**
+   We will swap the outer row-block loop (`i0`) with the inner column-block loop (`j0`). This makes the $J$ dimension (columns of $B$ and $C$) the outer loop and the $M$ dimension (rows of $A$ and $C$) the inner loop.
+
+2. **Hoist Weights ($B$) and Weight Scales ($B\_s$) Loading:**
+   By making $j0$ the outer loop, we can load the weights ($B$) and their scale factors ($B\_s$) once per column-block, rather than reloading them for every row-block. Because the weights are stationed in the high-address scratchpad region (`b_base`), they remain preserved and resident in local memory across all iterations of the inner row-block loop ($i0$). 
+
+3. **Retain Local Scratchpad Layout Correctness:**
+   - $A$ tiles are placed at the bottom (`a_base = 0`).
+   - $B$ tiles are placed at the top (`b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM`).
+   - There is no overlap since the total rows used ($512$ rows) is far below the scratchpad limit of $8192$ rows. This guarantees weight-stationary local reuse without data corruption.
+
+### Optimized Code
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+
+// Assuming external symbols are defined elsewhere as in the baseline:
+// BLK, REAL_M, REAL_N, MATMUL_K, DIM, BANK_NUM, BANK_ROWS, BF16_PER_WORD, BLK_OUTC
+// elem_t, out_t, A_s, B_s, A_scales_row, B_scales_col, A_in, B_in, C_hw, scale_factors
+
+void solution(void) {
+  // Hoist invariant Gemmini configuration outside of all loops to prevent redundant command dispatch
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  int tiles = BLK / DIM;
+  int tiles_K = MATMUL_K / DIM;
+  uint32_t a_base = 0;
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+  int SPAD_DEST = 128;
+
+  // Outer loop over columns of B (N dimension)
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    // Partial last N block: compute only the real cols, pad the rest.
+    int ncols = REAL_N - j0 * BLK;
+    if (ncols > BLK) ncols = BLK;
+    if (ncols <= 0) continue;
+
+    // Stage weight scale factors for the current column block once
+    for (int g = 0; g < MATMUL_K / 32; g++) {
+      memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+    }
+
+    gemmini_flush(0);
+    // Load weight scale factors to Gemmini hardware scale memory (sel=1)
+    gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+    // Load B tiles into the scratchpad high-address region once per column block
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t)); // B rows: stride N
+    for (int j = 0; j < tiles; j++) {
+      for (int k = 0; k < tiles_K; k++) {
+        gemmini_extended_mvin(
+            (void *)(((elem_t *)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+            b_base + (k * tiles + j) * DIM, DIM, DIM);
+      }
+    }
+
+    // Inner loop over rows of A (M dimension)
+    for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+      // Partial last M block: compute only the real rows, pad the rest.
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+
+      // Stage activation scale factors once per row block
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+      }
+
+      // Load activation scale factors to Gemmini hardware scale memory (sel=0)
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+
+      // Load A tiles into the low-address region of the scratchpad
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t)); // A rows: stride K
+      for (int i = 0; i < tiles; i++) {
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin(
+              (void *)(((elem_t *)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+              a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+        }
+      }
+
+      int pad_i = BLK - mrows;
+      int pad_j = BLK - ncols;
+
+      // Configure requantizer and execute tiled weight-stationary compute loop
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base,
+                           BANK_NUM * BANK_ROWS, 0, SPAD_DEST, false, false, false, false,
+                           false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Read results back to DRAM
+      for (int r = 0; r < mrows; r++) {
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      }
+      gemmini_fence();
+    }
+  }
+}
+```

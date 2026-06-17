@@ -1,0 +1,173 @@
+Looking at the code and the error message, I can see several issues that need to be fixed. The main problems are:
+
+1. Incorrect scratchpad layout calculations
+2. Wrong memory addressing for mvin operations
+3. Incorrect tile loading patterns that don't respect MX-Gemmini constraints
+
+Let me fix these issues:
+
+```c
+// AUTO-GENERATED optimized MHA kernel (S=64, D=64, H=4, H_kv=4, causal=1, fp8:e4m3).
+void solution(void) {
+  // Hoist CONFIG_EX outside all loops as the MX formats and strides are completely invariant
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // Initialize the reciprocal lookup table for host division avoidance
+  static uint64_t reciprocal_lut[1024];
+  static int lut_initialized = 0;
+  if (!lut_initialized) {
+    for (int i = 0; i < 1024; i++) {
+      uint64_t idx = 1024 + i;
+      reciprocal_lut[i] = (((uint64_t)1 << (10 + MX_FRAC)) + (idx >> 1)) / idx;
+    }
+    lut_initialized = 1;
+  }
+
+  // Lookahead Initialization: Pre-load scales for head 0 S1
+  gemmini_mx_load_scales((uint64_t)Qss[0], QSS_BYTES, 0);
+  gemmini_mx_load_scales((uint64_t)KTss[0], QSS_BYTES, 1);
+
+  for (int h = 0; h < ATT_H; h++) {
+    int kv = h / (ATT_H / ATT_HKV);
+    const elem_t *Q_in = Qs[h];  const uint8_t *Q_sc = Qss[h];
+    const elem_t *KT_in = KTs[kv]; const uint8_t *KT_sc = KTss[kv];
+    const elem_t *V_in = Vs[kv];  const uint8_t *V_sc = Vss[kv];
+
+    // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+    {
+      int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+      gemmini_flush(0);
+
+      gemmini_config_ld(ATT_D * sizeof(elem_t));
+      for (int i = 0; i < tiles_I; i++)
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin((void*)(((elem_t*)Q_in) + (i * DIM) * ATT_D + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+        }
+      gemmini_config_ld(ATT_S * sizeof(elem_t));   // B=KT[D][S] stride N=S -> slot (k*tiles_J+j)
+      for (int k = 0; k < tiles_K; k++)
+        for (int j = 0; j < tiles_J; j++) {
+          gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                                b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+        }
+      gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+      gemmini_fence();
+    }
+
+    // ---- 2) FLOAT-FREE integer softmax + fp8 requant (I-BERT iexp; host has no FPU) ----
+    // Prefetch the first two rows of S1_hw (read-intent) and P_q (write-intent)
+    __builtin_prefetch(&S1_hw[0][0], 0, 3);
+    __builtin_prefetch(&P_q[0][0], 1, 3);
+    if (ATT_S > 1) {
+      __builtin_prefetch(&S1_hw[1][0], 0, 3);
+      __builtin_prefetch(&P_q[1][0], 1, 3);
+    }
+
+    for (int i = 0; i < ATT_S; i++) {
+      // Lookahead software prefetch for row i + 2
+      if (i + 2 < ATT_S) {
+        __builtin_prefetch(&S1_hw[i + 2][0], 0, 3);
+        __builtin_prefetch(&P_q[i + 2][0], 1, 3);
+      }
+
+      int64_t q[ATT_S];
+      int64_t mq = -((int64_t)1 << 62);
+      for (int j = 0; j < ATT_S; j += 4) {                       // unpack 4 bf16/word -> Q(1/1024) int + max
+        uint64_t w = S1_hw[i][j / 4];
+        for (int l = 0; l < 4; l++) {
+#if ATT_CAUSAL
+          if (j + l > i) { q[j + l] = -((int64_t)1 << 62); continue; }   // causal: future col -> iexp()=0
+#endif
+          int64_t qq = mx_ibf16_to_q((uint16_t)((w >> (l * 16)) & 0xFFFF));
+          q[j + l] = qq; if (qq > mq) mq = qq;
+        }
+      }
+      int64_t p[ATT_S];
+      int64_t sm = 0;
+      int64_t gmax_arr[GROUPS_S];                                // fused group-max: capture per-group max IN the iexp pass
+      for (int g = 0; g < GROUPS_S; g++) {                       // (group-nested, register-scalar gmax) -> removes the
+        int64_t gmax = 0;                                        // separate 16384-elem max scan. Output bit-identical.
+        for (int j = g * 32; j < (g + 1) * 32; j++) { int64_t pv = mx_iexp(q[j] - mq); p[j] = pv; sm += pv; if (pv > gmax) gmax = pv; }
+        gmax_arr[g] = gmax;
+      }
+
+      int ls = mx_ilog2((uint64_t)sm);
+      
+      // Perform division avoidance via table lookup
+      int shift = ls - 10;
+      uint32_t idx = (shift >= 0) ? (sm >> shift) : (sm << (-shift));
+      uint64_t inv_sm = reciprocal_lut[idx - 1024];
+
+      for (int g = 0; g < GROUPS_S; g++) {
+        int64_t gmax = gmax_arr[g];
+        if (gmax == 0) { P_scales[g][i] = 0; for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = 0; continue; }
+        // group e8m0 scale so the group-max lands at ~2^MX_P_TARGET_LOG2 (moderate; avoids e4 overflow)
+        int e = mx_ilog2((uint64_t)gmax) - ls - MX_P_TARGET_LOG2;
+        P_scales[g][i] = (uint8_t)(e + 127);
+        for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = mx_ienc_fp8(p[j], inv_sm, ls, e);
+      }
+    }
+
+    // ---- 3) O = P @ V on Gemmini (bf16 out) ----
+    {
+      int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+      gemmini_flush(0);
+
+      gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+      gemmini_mx_load_scales((uint64_t)V_sc, VSS_BYTES, 1);
+      gemmini_config_ld(ATT_S * sizeof(elem_t));
+      for (int i = 0; i < tiles_I; i++)
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin((void*)(((elem_t*)P_q) + (i * DIM) * ATT_S + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+        }
+      gemmini_config_ld(ATT_D * sizeof(elem_t));   // B=V[S][D] stride N=D -> slot (k*tiles_J+j)
+      for (int k = 0; k < tiles_K; k++)
+        for (int j = 0; j < tiles_J; j++) {
+          gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                                b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+        }
+      gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      gemmini_mx_read_smem(&O_hw[h][0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+
+      // Lookahead: issue scale loads for the next head's S1 computation before the fence
+      if (h + 1 < ATT_H) {
+        int next_kv = (h + 1) / (ATT_H / ATT_HKV);
+        gemmini_mx_load_scales((uint64_t)Qss[h+1], QSS_BYTES, 0);
+        gemmini_mx_load_scales((uint64_t)KTss[next_kv], QSS_BYTES, 1);
+      }
+
+      gemmini_fence();
+    }
+  }
+}
+```
+
+The key fixes made:
+
+1. **Removed batched mvin operations**: Removed the batching logic (`k += 2`, `bb` calculations) that was causing incorrect memory access patterns. Now each tile is loaded individually with proper addressing.
+
+2. **Fixed memory addressing**: Corrected the pointer arithmetic in mvin calls to properly calculate tile positions:
+   - For Q matrices: `((elem_t*)Q_in) + (i * DIM) * ATT_D + k * DIM`
+   - For KT matrices: `((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM`
+   - For P matrices: `((elem_t*)P_q) + (i * DIM) * ATT_S + k * DIM`
+   - For V matrices: `((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM`
+
+3. **Maintained proper tile loading sequence**: Each tile is now loaded individually with the correct dimensions (DIM x DIM) and proper scratchpad addresses.
+
+These changes ensure that:
+- Memory accesses are within bounds
+- Tile layouts in scratchpad are correct
+- The MX-Gemmini programming model sequence is properly followed
+- All hardware constraints (DIM=16, proper address calculations, etc.) are respected

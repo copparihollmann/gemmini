@@ -1,0 +1,102 @@
+## Analysis
+
+Looking at the original code, I notice that the mvin loops for A and B are separated, with configuration calls interleaved:
+
+1. `gemmini_config_ld(MATMUL_K * sizeof(elem_t))` — configures LD port 0 for A's stride
+2. Loop: loads all A tiles via `gemmini_extended_mvin` (port 0)
+3. `gemmini_config_ld(MATMUL_N * sizeof(elem_t))` — reconfigures LD port 0 for B's stride
+4. Loop: loads all B tiles via `gemmini_extended_mvin` (port 0)
+
+The key inefficiency here is that **all A loads and all B loads are serialized through a single mvin port (port 0)**. The hardware exposes three independent mvin ports:
+- `gemmini_extended_mvin` (port 0 / `k_MVIN`) — used for A
+- `gemmini_extended_mvin2` (port 1 / `k_MVIN2`) — available for B
+- `gemmini_extended_mvin3` (port 2 / `k_MVIN3`) — available for D/bias
+
+**Strategy 9** applies directly: use `mvin2` for B tiles so that A and B tile loads can be issued in an interleaved fashion within a single loop, allowing the DMA hardware to pipeline them simultaneously rather than completing all A loads before starting any B loads.
+
+## Plan
+
+**Apply Strategy 9: use `mvin2`/`mvin3` ports to parallelize A and B tile loads into scratchpad simultaneously.**
+
+### Specific Changes
+
+1. **Issue a single `gemmini_config_ld` for port 0 (A)** with stride `MATMUL_K * sizeof(elem_t)` and a **separate `gemmini_extended3_config_ld` for port 1 (B)** with stride `MATMUL_N * sizeof(elem_t)` using the `id=1` parameter, both issued once before the combined mvin loop. This eliminates the mid-loop reconfiguration and avoids any pipeline bubble between the two batch loads.
+
+2. **Merge the two separate mvin loops into one combined loop** that iterates over both A and B tiles together. Within each iteration, issue `gemmini_extended_mvin(...)` for the A tile on port 0 and `gemmini_extended_mvin2(...)` for the B tile on port 1. This lets the hardware DMA pipeline both transfers concurrently.
+
+3. **Loop structure**: The outer loop can iterate over `k` (0..tiles_K), and the inner loops handle `i` (for A) and `j` (for B) respectively within the same `k` iteration — or alternatively a flat loop issuing alternating mvin/mvin2 commands. The simplest correct approach is a single `k` outer loop with an inner `i` loop issuing mvin (A) and an inner `j` loop issuing mvin2 (B), all within the same `k` iteration, so that for each K-slice all corresponding A and B tiles are issued back-to-back on different ports.
+
+### Resulting Code
+
+```c
+void solution(void) {
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+#ifdef SPIKE_SIM
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+#else
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
+#endif
+
+  // Configure port 0 (mvin) for A: row stride = MATMUL_K bytes
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+  // Configure port 1 (mvin2) for B: row stride = MATMUL_N bytes
+  gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+  // ---- Interleaved MVIN A (port 0) and B (port 1) per K-slice ----
+  for (int k = 0; k < tiles_K; k++) {
+    // Load all A tiles for this k-slice on port 0
+    for (int i = 0; i < tiles_I; i++) {
+      elem_t *a_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t a_sp  = a_base + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void *) a_ptr, a_sp, DIM, DIM);
+    }
+    // Load all B tiles for this k-slice on port 1
+    for (int j = 0; j < tiles_J; j++) {
+      elem_t *b_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+      uint32_t b_sp  = b_base + (k * tiles_J + j) * DIM;
+      gemmini_extended_mvin2((void *) b_ptr, b_sp, DIM, DIM);
+    }
+  }
+
+  int SPAD_DEST = 0;
+
+  gemmini_config_st(DIM * sizeof(elem_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // ---- Compute ----
+  gemmini_loop_ws_spad(
+      tiles_I, tiles_J, tiles_K,
+      0, 0, 0,
+      a_base,
+      BANK_NUM * BANK_ROWS,
+      0,
+      SPAD_DEST,
+      false, false,
+      false, false, false,
+      NO_ACTIVATION,
+      0, 0,
+      false,
+      0x38);
+
+  gemmini_fence();
+
+#ifdef SPIKE_SIM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+#else
+  for (int i = 0; i < tiles_J*tiles_I*2; i++) {
+      gemmini_mvout((void*)((uint64_t*) C_hw + i*2*DIM), SPAD_DEST + i*DIM);
+  }
+  gemmini_fence();
+#endif
+
+}
+```
+
+### Why This Helps
+
+- **Before**: All A tiles load sequentially on port 0, then all B tiles load sequentially on port 0 — purely serial, with a `config_ld` reconfiguration bubble in between.
+- **After**: Port 0 and port 1 are configured independently once (no mid-loop reconfig). Within each K-slice, A-tile commands go to port 0 and B-tile commands go to port 1 in rapid succession. The hardware DMA can now service both ports concurrently, effectively halving the data-movement latency for the mvin phase and better overlapping with the systolic array compute that follows.

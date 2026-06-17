@@ -1,0 +1,83 @@
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+
+// AUTO-GENERATED optimized MX matmul kernel (128x128x256, fp6:e3m2).
+void solution(void) {
+  int ti = 8;     // 128/16
+  int tj_block = 2; // 32/16 (per block)
+  int tk = 16;    // 256/16
+  int SDST = 128; // Output destination
+  
+  // Double buffering locations for B
+  // Buffer 0: ends at row 8192 (occupies [7680, 8192))
+  // Buffer 1: ends at row 7680 (occupies [7168, 7680))
+  uint32_t b_buffer0_end = BANK_NUM * BANK_ROWS;           // 8192
+  uint32_t b_buffer1_end = b_buffer0_end - tk * tj_block * DIM; // 8192 - 16*2*16 = 7680
+  uint32_t b_buffer0_start = b_buffer1_end - tk * tj_block * DIM; // 7680 - 512 = 7168
+  
+  // 1. Configure MX weight-stationary mode and load scales/LUTs
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 1, 1, 3, 1);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+  gemmini_mx_load_lut((uint64_t)B_lut_p, 1, 0);
+  gemmini_mx_load_lut((uint64_t)A_lut_p, 1, 1);
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti, tj_block, tk, 0, 0, 9);
+
+  // Contiguous DRAM buffer for block output
+  static out_t temp_C[128][32]; // 128x32 temporary buffer
+
+  // Load the entire static A matrix to scratchpad
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < ti; i++) {
+    for (int k = 0; k < tk; k += 2) {
+      elem_t *dram_ptr = ((elem_t*)A_in_hw) + i * DIM * MATMUL_K + k * DIM;
+      gemmini_extended_mvin((void*)dram_ptr, 0 + (i * tk + k) * DIM, 2 * DIM, DIM);
+    }
+  }
+
+  // 2. Cold start: Load first B block
+  int j_block = 0;
+  uint32_t bb_start = b_buffer1_end;
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2);
+  for (int k = 0; k < tk; k++) {
+    for (int j = 0; j < tj_block; j += 2) {
+      elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * (MATMUL_N / 2) + (j_block * tj_block + j) * DIM;
+      gemmini_extended_mvin((void*)dram_ptr, bb_start + (k * tj_block + j) * DIM, 2 * DIM, DIM);
+    }
+  }
+
+  // 3. Pipelined loop over the N dimension (4 blocks of 32 columns each)
+  for (int j_block_iter = 0; j_block_iter < 4; j_block_iter++) {
+    // Determine current B buffer location
+    uint32_t bb_cur = (j_block_iter % 2 == 0) ? b_buffer1_end : b_buffer0_end;
+    
+    // Compute current block in hardware
+    gemmini_loop_ws_spad(ti, tj_block, tk, 0, 0, 0, 0, bb_cur, 0, SDST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+    // Overlap: Pre-load the next B block while computing (if not the last iteration)
+    if (j_block_iter < 3) {
+      uint32_t bb_next = (j_block_iter % 2 == 0) ? b_buffer0_end : b_buffer1_end;
+      int next_j_block = j_block_iter + 1;
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2);
+      for (int k = 0; k < tk; k++) {
+        for (int j = 0; j < tj_block; j += 2) {
+          elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * (MATMUL_N / 2) + (next_j_block * tj_block + j) * DIM;
+          gemmini_extended_mvin((void*)dram_ptr, bb_next + (k * tj_block + j) * DIM, 2 * DIM, DIM);
+        }
+      }
+    }
+
+    // Read outputs to local contiguous buffer
+    gemmini_mx_read_smem(&temp_C[0][0], SDST * 16, 128 * 32); // 128*32 = 4096 elements
+    gemmini_fence();
+
+    // CPU copies contiguous results to strided DRAM output
+    for (int i = 0; i < 128; i++) {
+      for (int j = 0; j < 32; j++) {
+        C_hw[i][j_block_iter * 32 + j] = temp_C[i][j];
+      }
+    }
+  }
+}

@@ -1,0 +1,141 @@
+## Analysis
+
+Looking at the code, the CPU-side softmax/quantization loop is a significant bottleneck, but the most impactful optimization from the given strategies that applies directly to the accelerator usage is **strategy 8: avoid redundant LUT reloads by hoisting `gemmini_mx_load_lut` outside loops when LUT is format-invariant**.
+
+However, examining more carefully: the LUTs `Q_lp`, `KT_lp`, `V_lp`, `P_lp` are loaded inside the `t` loop. `Q_lp` and `V_lp` are format LUTs (they don't change between tiles), so they can be hoisted. But `P_lp` is regenerated from `P_hw` each iteration — wait, looking at the code, `P_lp` is a static LUT pointer, not recomputed. All four LUT loads happen once per `t` iteration.
+
+Actually, the more impactful strategy here is **strategy 11: replace scalar O_acc accumulation with SIMD-style integer operations**. The inner loop:
+```c
+for(int i=0;i<ATT_S;i++)for(int d=0;d<ATT_D;d++){
+  uint16_t b=(uint16_t)((O_hw[i][d/4]>>((d%4)*16))&0xFFFF);
+  O_acc[i][d]+=bf16f(b);
+}
+```
+processes `ATT_S * ATT_D = 128 * 64 = 8192` elements per tile, doing expensive shifts/masks and `bf16f()` conversions inside a tight loop with `NT` iterations. With `NT` tiles this is repeated many times.
+
+## Plan: Strategy 11 — SIMD-style BF16 unpacking for O_acc accumulation
+
+**What to change:**
+
+The inner accumulation loop over `O_hw` currently:
+1. Computes `d/4` and `d%4` (divisions/modulo) per element
+2. Does a 64-bit shift and mask per element  
+3. Calls `bf16f()` per element
+4. Adds to `O_acc[i][d]`
+
+**Optimization:** Restructure the loop to iterate over `j` (word index) in the outer loop and unroll the 4 lanes explicitly. This eliminates the `d/4`/`d%4` integer division, replaces them with sequential shifts of a cached `uint64_t` word, and processes 4 BF16 values per word load. The `uint64_t` word is loaded once and shifted 4 times rather than loading it 4 times with computed offsets.
+
+**Specifically:**
+
+```c
+// Before (per-element, expensive indexing):
+for(int i=0;i<ATT_S;i++)
+  for(int d=0;d<ATT_D;d++){
+    uint16_t b=(uint16_t)((O_hw[i][d/4]>>((d%4)*16))&0xFFFF);
+    O_acc[i][d]+=bf16f(b);
+  }
+
+// After (per-word, 4 lanes unrolled):
+for(int i=0;i<ATT_S;i++){
+  int d=0;
+  for(int w=0;w<ATT_D/4;w++){
+    uint64_t word = O_hw[i][w];
+    O_acc[i][d+0] += bf16f((uint16_t)( word        & 0xFFFF));
+    O_acc[i][d+1] += bf16f((uint16_t)((word >> 16) & 0xFFFF));
+    O_acc[i][d+2] += bf16f((uint16_t)((word >> 32) & 0xFFFF));
+    O_acc[i][d+3] += bf16f((uint16_t)((word >> 48) & 0xFFFF));
+    d += 4;
+  }
+}
+```
+
+This eliminates integer division (`d/4`, `d%4`) inside the inner loop — replacing with sequential bit shifts on a cached word — and removes redundant memory loads (the same `O_hw[i][w]` word was being loaded 4 times in the original via `d/4` indexing). The compiler can now vectorize or pipeline the 4-lane unrolled body more effectively.
+
+Similarly apply the same transformation to the `S1_hw` unpacking in the softmax loop:
+```c
+// Original:
+uint16_t b=(uint16_t)((S1_hw[i][j/4]>>((j%4)*16))&0xFFFF); row[j]=bf16f(b);
+
+// After (restructure to iterate by word):
+for(int w=0;w<BT/4;w++){
+  uint64_t word = S1_hw[i][w];
+  row[w*4+0] = bf16f((uint16_t)( word        & 0xFFFF));
+  row[w*4+1] = bf16f((uint16_t)((word >> 16) & 0xFFFF));
+  row[w*4+2] = bf16f((uint16_t)((word >> 32) & 0xFFFF));
+  row[w*4+3] = bf16f((uint16_t)((word >> 48) & 0xFFFF));
+}
+```
+
+This restructuring reduces loop overhead and eliminates costly integer division in the hottest CPU-side loops, while keeping the accelerator control flow identical.
+
+Here is the complete rewritten solution:
+
+```c
+void solution(void) {
+  for(int i=0;i<ATT_S;i++){Mr[i]=-1e30f;Lr[i]=0.f;for(int d=0;d<ATT_D;d++)O_acc[i][d]=0.f;}
+  for(int t=0;t<NT;t++){
+    { int ti=ATT_S/DIM/2, tj=BT/DIM/2, tk=ATT_D/DIM; uint32_t ab=0,bb=BANK_NUM*BANK_ROWS-tk*tj*DIM;
+      for(int g=0;g<ATT_D/32;g++)for(int n=0;n<BT;n++)KTsc[g*BT+n]=KT_scales_col[g][t*BT+n];
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY,0,0,ACC_SCALE_IDENTITY,1,1,0,0,false,1,1,3,1);
+      gemmini_mx_load_scales((uint64_t)&Q_scales_row,sizeof(Q_scales_row),0);
+      gemmini_mx_load_scales((uint64_t)KTsc,(ATT_D/32)*BT,1);
+      gemmini_mx_load_lut((uint64_t)KT_lp,1,0); gemmini_mx_load_lut((uint64_t)Q_lp,1,1);
+      gemmini_config_ld(ATT_D*sizeof(elem_t));
+      for(int i=0;i<ti;i++)for(int k=0;k<tk;k++) gemmini_extended_mvin((void*)(((elem_t*)Q_hw)+i*DIM*ATT_D+k*DIM),ab+(i*tk+k)*DIM,DIM,DIM);
+      gemmini_config_ld(ATT_S*sizeof(elem_t)/2);
+      for(int k=0;k<tk;k++)for(int j=0;j<tj;j++) gemmini_extended_mvin((void*)(((elem_t*)KT_in)+k*DIM*(ATT_S/2)+(t*BT)/2+j*DIM),bb+(k*tj+j)*DIM,DIM,DIM);
+      gemmini_config_st((BT/BF16_PER_WORD)*sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,ti,tj,tk,0,0,8);
+      gemmini_loop_ws_spad(ti,tj,tk,0,0,0,ab,BANK_NUM*BANK_ROWS,0,128,false,false,false,false,false,NO_ACTIVATION,0,0,false,0x38);
+      gemmini_mx_read_smem(&S1_hw[0][0],128*16,ATT_S*BT); gemmini_fence(); }
+    for(int i=0;i<ATT_S;i++){
+      float row[BT], mn=Mr[i];
+      // Unrolled BF16 unpacking: load each uint64 word once, extract 4 lanes
+      for(int w=0;w<BT/4;w++){
+        uint64_t word = S1_hw[i][w];
+        row[w*4+0] = bf16f((uint16_t)( word        & 0xFFFF));
+        row[w*4+1] = bf16f((uint16_t)((word >> 16) & 0xFFFF));
+        row[w*4+2] = bf16f((uint16_t)((word >> 32) & 0xFFFF));
+        row[w*4+3] = bf16f((uint16_t)((word >> 48) & 0xFFFF));
+        if(row[w*4+0]>mn) mn=row[w*4+0];
+        if(row[w*4+1]>mn) mn=row[w*4+1];
+        if(row[w*4+2]>mn) mn=row[w*4+2];
+        if(row[w*4+3]>mn) mn=row[w*4+3];
+      }
+      float corr=expf2(Mr[i]-mn), ln=Lr[i]*corr;
+      for(int j=0;j<BT;j++){row[j]=expf2(row[j]-mn);ln+=row[j];}
+      for(int d=0;d<ATT_D;d++)O_acc[i][d]*=corr; Mr[i]=mn; Lr[i]=ln;
+      for(int g=0;g<GBT;g++){float gm=0.f;for(int j=g*32;j<g*32+32;j++){float a=fabsf2(row[j]);if(a>gm)gm=a;}
+        int e=0;if(gm>0.f)e=fexp2(gm/0.5f)+1;float isc=pow2i(-e);P_scales[g][i]=(uint8_t)(e+127);
+        for(int j=g*32;j<g*32+32;j++){uint8_t idx=enc(row[j]*isc);
+          if((i&1)==0)P_hw[i>>1][j]=(P_hw[i>>1][j]&0xF0)|idx; else P_hw[i>>1][j]=(P_hw[i>>1][j]&0x0F)|(idx<<4);}}}
+    { int ti=ATT_S/DIM/2, tj=ATT_D/DIM/2, tk=BT/DIM; uint32_t ab=0,bb=BANK_NUM*BANK_ROWS-tk*tj*DIM;
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY,0,0,ACC_SCALE_IDENTITY,1,1,0,0,false,1,1,3,1);
+      gemmini_mx_load_scales((uint64_t)&P_scales,sizeof(P_scales),0);
+      gemmini_mx_load_scales((uint64_t)&V_scales_col[t*GBT][0],GBT*ATT_D,1);
+      gemmini_mx_load_lut((uint64_t)V_lp,1,0); gemmini_mx_load_lut((uint64_t)P_lp,1,1);
+      gemmini_config_ld(BT*sizeof(elem_t));
+      for(int i=0;i<ti;i++)for(int k=0;k<tk;k++) gemmini_extended_mvin((void*)(((elem_t*)P_hw)+i*DIM*BT+k*DIM),ab+(i*tk+k)*DIM,DIM,DIM);
+      gemmini_config_ld(ATT_D*sizeof(elem_t)/2);
+      for(int k=0;k<tk;k++)for(int j=0;j<tj;j++) gemmini_extended_mvin((void*)(((elem_t*)V_in)+(t*BT+k*DIM)*(ATT_D/2)+j*DIM),bb+(k*tj+j)*DIM,DIM,DIM);
+      gemmini_config_st((ATT_D/BF16_PER_WORD)*sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,ti,tj,tk,0,0,8);
+      gemmini_loop_ws_spad(ti,tj,tk,0,0,0,ab,BANK_NUM*BANK_ROWS,0,128,false,false,false,false,false,NO_ACTIVATION,0,0,false,0x38);
+      gemmini_mx_read_smem(&O_hw[0][0],128*16,ATT_S*ATT_D); gemmini_fence();
+      // Unrolled BF16 unpacking: load each uint64 word once, extract 4 lanes without division
+      for(int i=0;i<ATT_S;i++){
+        for(int w=0;w<ATT_D/4;w++){
+          uint64_t word = O_hw[i][w];
+          O_acc[i][w*4+0] += bf16f((uint16_t)( word        & 0xFFFF));
+          O_acc[i][w*4+1] += bf16f((uint16_t)((word >> 16) & 0xFFFF));
+          O_acc[i][w*4+2] += bf16f((uint16_t)((word >> 32) & 0xFFFF));
+          O_acc[i][w*4+3] += bf16f((uint16_t)((word >> 48) & 0xFFFF));
+        }
+      }
+    }
+  }
+  for(int i=0;i<ATT_S;i++){float il=1.f/Lr[i];for(int d=0;d<ATT_D;d++)O_acc[i][d]*=il;}
+}
+```

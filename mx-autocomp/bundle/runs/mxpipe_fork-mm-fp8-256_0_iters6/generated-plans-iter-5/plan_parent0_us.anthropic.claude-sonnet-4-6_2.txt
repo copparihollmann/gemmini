@@ -1,0 +1,123 @@
+## Strategy: Eliminate the Misplaced `gemmini_fence()` Between Compute and `gemmini_mx_read_smem` on the SPIKE Path
+
+### Analysis of the Current Code
+
+Looking at the original code's SPIKE path:
+
+```c
+gemmini_loop_ws_spad(..., 0x38);
+
+gemmini_fence();  // <-- THIS IS THE PROBLEM
+
+#ifdef SPIKE_SIM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+#else
+  ...
+#endif
+```
+
+There is a `gemmini_fence()` issued **between** `gemmini_loop_ws_spad` and `gemmini_mx_read_smem`. On the SPIKE path, `gemmini_mx_read_smem` is the instruction that actually triggers the DMA transfer from `mx_smem` to DRAM — **no DRAM write has been issued yet at the point of the fence**. The fence stalls the host CPU pipeline waiting for all pending accelerator operations to drain, but since the results haven't yet been pushed to DRAM (that happens in `gemmini_mx_read_smem`), this fence is purely wasteful: it adds synchronization overhead without contributing to correctness.
+
+The **only required fence** is the one after `gemmini_mx_read_smem`, which ensures the DMA from `mx_smem` → DRAM has completed before the host reads `C_hw`. Adding an extra fence beforehand forces an unnecessary pipeline stall after the compute loop but before the result drain command is even issued.
+
+### How to Fix It
+
+Remove the `gemmini_fence()` between `gemmini_loop_ws_spad` and `gemmini_mx_read_smem`, keeping only the mandatory fence after `gemmini_mx_read_smem`:
+
+```c
+gemmini_loop_ws_spad(..., 0x38);
+
+// NO fence here — mx_smem hasn't been drained to DRAM yet; fence adds stall with no benefit
+
+#ifdef SPIKE_SIM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+#else
+  ...
+#endif
+
+gemmini_fence();  // Required: ensures mx_smem→DRAM transfer completes before host reads C_hw
+```
+
+This follows the correct programming model sequence prescribed by rule 6 and strategy 9: `gemmini_loop_ws_spad → gemmini_mx_read_smem → gemmini_fence()`.
+
+### Rewritten Solution
+
+```c
+void solution(void) {
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+#ifdef SPIKE_SIM
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+#else
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
+#endif
+
+  // ---- MVIN A: batch up to MAX_BLOCK_LEN=4 consecutive K-tiles per row i ----
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+      int batch = (tiles_K - k < MAX_BLOCK_LEN) ? (tiles_K - k) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void *) dram_ptr, sp_addr, batch * DIM, DIM);
+    }
+  }
+
+  // ---- MVIN B: batch up to MAX_BLOCK_LEN=4 consecutive J-tiles per K-row k ----
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+
+  for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j += MAX_BLOCK_LEN) {
+      int batch = (tiles_J - j < MAX_BLOCK_LEN) ? (tiles_J - j) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+      gemmini_extended_mvin((void *) dram_ptr, sp_addr, batch * DIM, DIM);
+    }
+  }
+
+  int SPAD_DEST = 0;
+
+  gemmini_config_st(DIM * sizeof(elem_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // ---- Compute ----
+  gemmini_loop_ws_spad(
+      tiles_I, tiles_J, tiles_K,
+      0, 0, 0,
+      a_base,
+      BANK_NUM * BANK_ROWS,
+      0,
+      SPAD_DEST,
+      false, false,
+      false, false, false,
+      NO_ACTIVATION,
+      0, 0,
+      false,
+      0x38);
+
+  // No fence here: mx_smem has not been drained to DRAM yet;
+  // the premature fence in the original code added a stall with no correctness benefit.
+
+#ifdef SPIKE_SIM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+#else
+  printf("Moving out:\n");
+  for (int i = 0; i < tiles_J*tiles_I*2; i++) {
+      gemmini_mvout((void*)((uint64_t*) C_hw + i*2*DIM), SPAD_DEST + i*DIM);
+  }
+#endif
+
+  // Required fence: ensures mx_smem->DRAM transfer (or mvout) completes
+  // before host reads C_hw.
+  gemmini_fence();
+
+}
+```
+
+### Why This Improves Performance
+
+By removing the spurious fence, the accelerator's instruction queue is not forcibly drained before `gemmini_mx_read_smem` is issued. This allows the hardware to pipeline the tail end of the compute loop (any pending systolic array drain or requantization passes) directly into the `MX_READ_SMEM` DMA transfer without an artificial synchronization barrier in between. The single `gemmini_fence()` after `gemmini_mx_read_smem` still guarantees correctness — the host waits for the DRAM write to complete before reading `C_hw` — but eliminates the redundant stall that was costing cycles in every invocation of `solution()`.

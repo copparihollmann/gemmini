@@ -1,0 +1,67 @@
+void solution(void) {
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    // Load B scales once per j0 — reused across all i0 iterations
+    for (int g = 0; g < MATMUL_K / 32; g++)
+      memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+
+    int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+    int SPAD_DEST = 128;
+
+    // Configure execution once per j0 (format-invariant across i0)
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+    // Load B scales into hardware once per j0
+    // Must satisfy the programming model: both A and B scales loaded before mvin/compute.
+    // We load B here; A will be loaded inside the i0 loop.
+    // However, per the programming model sequence, both A and B scales must be loaded
+    // before mvin tiles. We therefore load B scales here and A scales inside i0,
+    // but we must reload B scales each iteration to satisfy the required order:
+    // config_ex -> load_scales(A) -> load_scales(B) -> mvin -> mxquant_config -> loop_ws_spad
+    // Since B scales don't change across i0, we load them once outside but must
+    // re-issue gemmini_mx_load_scales for B inside the i0 loop after A scales,
+    // OR load A scales first then B scales inside. We restructure below.
+
+    // Mvin B tiles once per j0 — these are fixed for all i0
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+    for (int j = 0; j < tiles; j++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin2((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                               b_base + (k * tiles + j) * DIM, DIM, DIM);
+
+    for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+      // Stage A scales for this row block
+      for (int g = 0; g < MATMUL_K / 32; g++)
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+
+      // Programming model sequence: config_ex already done above (persists).
+      // Load A scales (sel=0), then B scales (sel=1) — both required before compute.
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      // Mvin A tiles for this i0 block
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));    // A rows: stride K
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+      // Configure output and requantizer
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+
+      // Compute: funct 24 (LOOP_WS_CONFIG_SPAD_AB) is re-issued inside gemmini_loop_ws_spad
+      // on every call via the macro expansion, satisfying the one-shot marker requirement.
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Drain BF16 results from mx_smem to DRAM
+      for (int r = 0; r < BLK; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, BLK);
+      gemmini_fence();
+    }
+  }
+}

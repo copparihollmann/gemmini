@@ -1,0 +1,64 @@
+An elegant and highly effective way to optimize the baseline code is to apply **Strategy 4: Dynamically resize the tiling parameters (`tiles_I`, `tiles_J`) passed to `gemmini_loop_ws_spad` for partial boundary tiles.**
+
+### Inefficiency Analysis
+In the baseline implementation, the boundary blocks (where the remaining rows `mrows` or columns `ncols` are less than `BLK`) are processed using the full block tile count `tiles = BLK / DIM`. Although `pad_i` and `pad_j` are calculated, the hardware systolic array still iterates over the full `tiles` count. This causes:
+1. **Unnecessary DRAM-to-Scratchpad Transfers (MVIN)**: The program loads padding tiles containing no useful data into the scratchpad.
+2. **Wasted Systolic Array Cycles**: The compute unit performs matrix multiplication on dummy padding tiles.
+3. **Suboptimal Scratchpad Partitioning**: Overallocating space for B based on the static `tiles` count limits scratchpad utilization and efficiency.
+
+---
+
+### Detailed Optimization Plan
+
+We will modify the kernel to dynamically compute the exact number of tiles needed for the current block and adjust all scratchpad layouts, DMA loads, execution configurations, and memory readouts accordingly.
+
+1. **Compute Dynamic Tile Counts and Padding**:
+   Replace the static `tiles` count with dynamic tile counts for the $I$ (row) and $J$ (column) dimensions:
+   ```c
+   int tiles_I = (mrows + DIM - 1) / DIM;
+   int tiles_J = (ncols + DIM - 1) / DIM;
+   int tiles_K = MATMUL_K / DIM;
+   ```
+   Recalculate the padding counts based on these dynamic bounds:
+   ```c
+   int pad_i = tiles_I * DIM - mrows;
+   int pad_j = tiles_J * DIM - ncols;
+   ```
+
+2. **Dynamically Position the Scratchpad B-Base**:
+   To prevent overlapping and optimize scratchpad memory footprint, place the B-matrix at the very top of the scratchpad dynamically adjusted for `tiles_J`:
+   ```c
+   uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+   ```
+
+3. **Prune DMA MVIN Operations**:
+   - Update the **A matrix loader** to only load up to `tiles_I` tiles:
+     ```c
+     for (int i = 0; i < tiles_I; i++) {
+       for (int k = 0; k < tiles_K; k++) {
+         gemmini_extended_mvin(..., a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+       }
+     }
+     ```
+   - Update the **B matrix loader** to only load up to `tiles_J` tiles. Additionally, update the scratchpad offset calculations to use the dynamic `tiles_J` instead of the static `tiles`:
+     ```c
+     for (int j = 0; j < tiles_J; j++) {
+       for (int k = 0; k < tiles_K; k++) {
+         gemmini_extended_mvin(..., b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+       }
+     }
+     ```
+
+4. **Reconfigure Requantizer and Compute Loop Bounds**:
+   Pass the dynamic variables `tiles_I` and `tiles_J` to the configuration and hardware loop calls instead of static bounds:
+   - `gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);`
+   - `gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST, ...);`
+
+5. **Adjust SMEM Readout Strides**:
+   Because the computational grid size has changed, the row-stride of the outputs in the shared memory (`mx_smem`) is now `tiles_J * DIM` instead of `BLK`. The readout offset must be updated to maintain correctness:
+   ```c
+   for (int r = 0; r < mrows; r++) {
+     gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                          SPAD_DEST * 16 + r * (tiles_J * DIM), ncols);
+   }
+   ```

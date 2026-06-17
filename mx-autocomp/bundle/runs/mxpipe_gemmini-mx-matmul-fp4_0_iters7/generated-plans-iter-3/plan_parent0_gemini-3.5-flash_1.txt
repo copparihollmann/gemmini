@@ -1,0 +1,74 @@
+An elegant and highly effective optimization plan is to **maximize scratchpad and accumulator utilization** to compute the entire $64 \times 64$ matrix in a single hardware loop invocation, while simultaneously **consolidating and batching the MVIN DMA transfers** (Strategy 1: "reduce data movement").
+
+### Inefficiencies in the Original Code:
+1. **Under-utilization of HW Resources**: The original code artificially divided `ti` and `tj` by 2, resulting in $32 \times 32$ block computations that left the accumulator ($256$ rows maximum) and scratchpad heavily under-utilized.
+2. **High DMA Instruction Overhead**: It used nested loops to issue fine-grained `mvin` calls of size `2 * DIM` or `DIM` elements at a time. This results in high instruction overhead and under-utilizes DRAM burst bandwidth.
+
+### Optimization Plan:
+1. **Full-Grid Tiling**: Remove the `/ 2` factor. Set `ti = MATMUL_M / DIM` ($4$), `tj = MATMUL_N / DIM` ($4$), and `tk = MATMUL_K / DIM` ($4$). This fully utilizes the 256-row accumulator ($4 \times 4 \times 16 = 256$ rows) and perfectly fits within the scratchpad boundaries.
+2. **Contiguous Batched MVINs**:
+   - Since `tk = 4` and the hardware supports loading up to `MAX_BLOCK_LEN = 4` blocks at once, we can load the entire row-tile of A (all `k`-tiles) in a single `mvin` command. This reduces the number of A-loading `mvin` calls from $16$ down to $4$.
+   - Similarly, since `tj = 4`, we can load the entire row of B-tiles (all `j`-tiles) in a single `mvin` of size `tj * DIM = 64`. This reduces B-loading calls from $16$ down to $4$.
+
+---
+
+### Optimized Code
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+#include "include/matmul_fp4_64x64.h"
+
+#define DIM 16
+#define ADDR_LEN 32
+#define BF16_PER_WORD 4
+#define OUT_COLS (MATMUL_M / BF16_PER_WORD)
+
+typedef uint8_t  elem_t;
+typedef uint64_t out_t;
+
+// Optimized MX matmul kernel (64x64x64, fp4:e2m1) with fully utilized HW and batched MVIN.
+void solution(void) {
+  {
+    int ti = MATMUL_M / DIM, tj = MATMUL_N / DIM, tk = MATMUL_K / DIM;
+    uint32_t ab = 0;
+    uint32_t bb = BANK_NUM * BANK_ROWS - tk * tj * DIM; // 8192 - 4 * 4 * 16 = 7936
+    int SDST = 128;
+    
+    // Configure format and execution (FP4 E2M1 mode)
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 2, 2, 3, 0);
+    
+    // Load scale factors for A and B
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+    
+    // Configure store and requantizer
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti, tj, tk, 0, 0, 1);
+    
+    // Batched MVIN for A: Load entire row of K-tiles (64 elements wide) in a single DMA burst
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i = 0; i < ti; i++) {
+      void *dram_ptr = (void*)(((elem_t*)A_in_hw) + i * DIM * MATMUL_K);
+      uint32_t sp_addr = ab + i * tk * DIM;
+      gemmini_extended_mvin(dram_ptr, sp_addr, tk * DIM, DIM);
+    }
+    
+    // Batched MVIN for B: Load entire row of J-tiles (64 elements wide) in a single DMA burst
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2);
+    for (int k = 0; k < tk; k++) {
+      void *dram_ptr = (void*)(((elem_t*)B_in) + k * DIM * (MATMUL_N / 2));
+      uint32_t sp_addr = bb + k * tj * DIM;
+      gemmini_extended_mvin(dram_ptr, sp_addr, tj * DIM, DIM);
+    }
+    
+    // Compute weight-stationary loop in hardware using the optimized full grid
+    gemmini_loop_ws_spad(ti, tj, tk, 0, 0, 0, ab, BANK_NUM * BANK_ROWS, 0, SDST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    
+    // Read BF16 results from SMEM and sync
+    gemmini_mx_read_smem(&C_hw[0][0], SDST * 16, MATMUL_M * MATMUL_N);
+    gemmini_fence();
+  }
+}
+```

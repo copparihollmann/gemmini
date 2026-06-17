@@ -1,0 +1,20 @@
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++)
+    gemmini_block_mvin((void*)(((elem_t*)A_in) + i * DIM * MATMUL_K),
+                       a_base + i * tiles_K * DIM, tiles_K);
+  for (int j = 0; j < tiles_J; j++)
+    gemmini_block_mvin((void*)(((elem_t*)B_in) + j * DIM * MATMUL_K),
+                       b_base + j * tiles_K * DIM, tiles_K);
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       0, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], 0, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}

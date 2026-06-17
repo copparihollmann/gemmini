@@ -1,0 +1,155 @@
+## Strategy: Fuse the Two-Pass Softmax into a Single-Pass Loop
+
+### Analysis of the Current Bottleneck
+
+The softmax step (section 2) currently performs **two separate passes** over each row of `ATT_S=128` elements:
+
+**Pass 1** (lines in the first `for (int j ...)` loop):
+- Unpacks 4 BF16 values per word from `S1_hw`
+- Converts each to a fixed-point integer via `mx_ibf16_to_q`
+- Stores all 128 values into a temporary `int64_t q[ATT_S]` array on the stack
+- Simultaneously finds the row maximum `mq`
+
+**Pass 2** (the second loop):
+- Reads back all 128 values from `q[]`
+- Computes `mx_iexp(q[j] - mq)` for each element
+- Accumulates the sum `sm`
+
+**Pass 3** (the quantization loop):
+- Iterates over groups of 32 to find group max and encode fp8
+
+This means each row's 128 values are written to the `q[]` stack array then read back, causing **unnecessary L1 cache traffic**. The `q[]` array is 128 × 8 = 1024 bytes per row. With 128 rows, that's 128 KB of intermediate traffic through the stack/L1.
+
+### The Fused Single-Pass Strategy (Strategy #9)
+
+**Core idea:** The two-pass structure exists because `mx_iexp` needs `mq` (the row maximum), which is only known after scanning all elements. However, we can eliminate the intermediate `q[]` array by doing the BF16 unpack and max-finding in Pass 1 (keeping `mq`), then doing a **single fused pass** that re-unpacks the BF16 words from the *already-in-cache* `S1_hw` row and immediately computes `iexp`. Since `S1_hw[i]` is only `128/4 * 8 = 256 bytes` per row (32 × uint64), it fits comfortably in L1 cache after Pass 1. Re-reading 256 bytes from L1 cache is far cheaper than writing and reading back 1024 bytes from a stack-allocated `q[]` array.
+
+**Changes:**
+1. **Eliminate `int64_t q[ATT_S]`** — the 1024-byte stack allocation is removed entirely.
+2. **Pass 1** scans `S1_hw[i]` (32 words × 4 BF16) to compute `mq` only, storing nothing.
+3. **Pass 2** (now the only compute pass) iterates over the same `S1_hw[i]` row again (which is hot in L1 cache), unpacks each BF16, calls `mx_ibf16_to_q`, immediately subtracts `mq`, calls `mx_iexp`, stores directly into `p[j]`, and accumulates `sm`.
+4. The group-scale and fp8-encoding pass (Pass 3) is unchanged.
+
+This halves the memory traffic through L1 for the softmax step and removes the stack spill/reload of 1024 bytes per row.
+
+### Resulting Code
+
+```c
+void solution(void) {
+  // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&Q_scales_row, sizeof(Q_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&KT_scales_col, sizeof(KT_scales_col), 1);
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) {
+        int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+      }
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) {
+        int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin2((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                               b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+      }
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+    gemmini_fence();
+  }
+
+  // ---- 2) FLOAT-FREE integer softmax + fp8 requant (fused single-pass) ----
+  for (int i = 0; i < ATT_S; i++) {
+    // Pass 1: find row max mq by unpacking BF16 words (no q[] storage)
+    int64_t mq = -((int64_t)1 << 62);
+    for (int j = 0; j < ATT_S; j += 4) {
+      uint64_t w = S1_hw[i][j / 4];
+      for (int l = 0; l < 4; l++) {
+        int64_t qq = mx_ibf16_to_q((uint16_t)((w >> (l * 16)) & 0xFFFF));
+        if (qq > mq) mq = qq;
+      }
+    }
+
+    // Pass 2 (fused): re-unpack from S1_hw (hot in L1), compute iexp, accumulate sum
+    // No q[] array needed: S1_hw[i] is 256 bytes (32 x uint64), fits in L1 cache
+    int64_t p[ATT_S];
+    int64_t sm = 0;
+    for (int j = 0; j < ATT_S; j += 4) {
+      uint64_t w = S1_hw[i][j / 4];
+      for (int l = 0; l < 4; l++) {
+        int64_t qq = mx_ibf16_to_q((uint16_t)((w >> (l * 16)) & 0xFFFF));
+        int64_t pv = mx_iexp(qq - mq);
+        p[j + l] = pv;
+        sm += pv;
+      }
+    }
+
+    // Pass 3: group scale + fp8 encode (unchanged)
+    int ls = mx_ilog2((uint64_t)sm);
+    uint64_t inv_sm = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;
+    for (int g = 0; g < GROUPS_S; g++) {
+      int64_t gmax = 0;
+      for (int j = g * 32; j < (g + 1) * 32; j++) if (p[j] > gmax) gmax = p[j];
+      if (gmax == 0) {
+        P_scales[g][i] = 0;
+        for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = 0;
+        continue;
+      }
+      int e = mx_ilog2((uint64_t)gmax) - ls - MX_P_TARGET_LOG2;
+      P_scales[g][i] = (uint8_t)(e + 127);
+      for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = mx_ienc_fp8(p[j], inv_sm, ls, e);
+    }
+  }
+
+  // ---- 3) O = P @ V on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+    gemmini_mx_load_scales((uint64_t)&V_scales_col, sizeof(V_scales_col), 1);
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) {
+        int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+      }
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) {
+        int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin2((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                               b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+      }
+    gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+    gemmini_fence();
+  }
+}
+```
+
+### Why This Improves Performance
+
+| Metric | Before | After |
+|--------|--------|-------|
+| Stack allocation per row | 1024 bytes (`q[128]`) | 0 bytes |
+| L1 cache writes per row | 1024 bytes (store `q[]`) | 0 bytes |
+| L1 cache reads per row (iexp phase) | 1024 bytes (reload `q[]`) | 256 bytes (reload `S1_hw[i]`) |
+| BF16 unpack calls per row | 128 (Pass 1) + 128 (Pass 2) | 128 (Pass 1) + 128 (Pass 2, same count but from smaller, hotter source) |
+
+The key saving is **768 bytes fewer L1 reads per row** (256 bytes from `S1_hw` vs 1024 bytes from `q[]`). Over 128 rows, that is 128 × 768 = **96 KB** of eliminated L1 cache traffic in the softmax. The `S1_hw[i]` row (256 bytes) fits in L1 cache lines after Pass 1, so Pass 2 sees only cache hits. The eliminated `q[]` array also reduces register pressure and stack frame size, benefiting the RISC-V scalar pipeline between the two Gemmini kernel calls.

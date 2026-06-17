@@ -1,0 +1,160 @@
+Looking at the optimization plan and the provided optimized code, I can see several issues that violate the hardware constraints and programming model. Let me provide a corrected version that properly optimizes the code while maintaining correctness:
+
+```c
+// AUTO-GENERATED optimized MHA kernel (S=64, D=64, H=4, H_kv=4, causal=1, fp8:e4m3).
+void solution(void) {
+  // Hoist CONFIG_EX outside all loops as the MX formats and strides are completely invariant
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // Lookahead Initialization: Pre-load scales for head 0 S1
+  gemmini_mx_load_scales((uint64_t)Qss[0], QSS_BYTES, 0);
+  gemmini_mx_load_scales((uint64_t)KTss[0], QSS_BYTES, 1);
+
+  for (int h = 0; h < ATT_H; h++) {
+    int kv = h / (ATT_H / ATT_HKV);
+    const elem_t *Q_in = Qs[h];  const uint8_t *Q_sc = Qss[h];
+    const elem_t *KT_in = KTs[kv]; const uint8_t *KT_sc = KTss[kv];
+    const elem_t *V_in = Vs[kv];  const uint8_t *V_sc = Vss[kv];
+
+    // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+    {
+      int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+      
+      // Scale factors are already loaded via lookahead (from the previous head or initialization)
+
+      gemmini_config_ld(ATT_D * sizeof(elem_t));
+      for (int i = 0; i < tiles_I; i++)
+        for (int k = 0; k < tiles_K; k += 2) { int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM); }
+      gemmini_config_ld(ATT_S * sizeof(elem_t));   // B=KT[D][S] stride N=S -> slot (k*tiles_J+j)
+      for (int k = 0; k < tiles_K; k++)
+        for (int j = 0; j < tiles_J; j += 2) { int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                                b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM); }
+      
+      // Configure requantizer for S1 computation
+      gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+      
+      gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+      gemmini_fence(); // Ensure S1_hw is in DRAM before CPU reads
+    }
+
+    // ---- Overlap S2 weight loading with the CPU Softmax compute ----
+    {
+      int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+      
+      gemmini_mx_load_scales((uint64_t)V_sc, VSS_BYTES, 1);
+      gemmini_config_ld(ATT_D * sizeof(elem_t));   // B=V[S][D] stride N=D -> slot (k*tiles_J+j)
+      for (int k = 0; k < tiles_K; k++)
+        for (int j = 0; j < tiles_J; j += 2) { int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                                b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM); }
+    }
+
+    // ---- 2) FLOAT-FREE integer softmax + fp8 requant (I-BERT iexp; host has no FPU) ----
+    // Prefetch the first two rows of S1_hw (read-intent) and P_q (write-intent)
+    __builtin_prefetch(&S1_hw[0][0], 0, 3);
+    __builtin_prefetch(&P_q[0][0], 1, 3);
+    if (ATT_S > 1) {
+      __builtin_prefetch(&S1_hw[1][0], 0, 3);
+      __builtin_prefetch(&P_q[1][0], 1, 3);
+    }
+
+    for (int i = 0; i < ATT_S; i++) {
+      // Lookahead software prefetch for row i + 2
+      if (i + 2 < ATT_S) {
+        __builtin_prefetch(&S1_hw[i + 2][0], 0, 3);
+        __builtin_prefetch(&P_q[i + 2][0], 1, 3);
+      }
+
+      int64_t q[ATT_S];
+      int64_t mq = -((int64_t)1 << 62);
+      for (int j = 0; j < ATT_S; j += 4) {                       // unpack 4 bf16/word -> Q(1/1024) int + max
+        uint64_t w = S1_hw[i][j / 4];
+        for (int l = 0; l < 4; l++) {
+#if ATT_CAUSAL
+          if (j + l > i) { q[j + l] = -((int64_t)1 << 62); continue; }   // causal: future col -> iexp()=0
+#endif
+          int64_t qq = mx_ibf16_to_q((uint16_t)((w >> (l * 16)) & 0xFFFF));
+          q[j + l] = qq; if (qq > mq) mq = qq;
+        }
+      }
+      int64_t p[ATT_S];
+      int64_t sm = 0;
+      int64_t gmax_arr[GROUPS_S];                                // fused group-max: capture per-group max IN the iexp pass
+      for (int g = 0; g < GROUPS_S; g++) {                       // (group-nested, register-scalar gmax) -> removes the
+        int64_t gmax = 0;                                        // separate 16384-elem max scan. Output bit-identical.
+        for (int j = g * 32; j < (g + 1) * 32; j++) { int64_t pv = mx_iexp(q[j] - mq); p[j] = pv; sm += pv; if (pv > gmax) gmax = pv; }
+        gmax_arr[g] = gmax;
+      }
+      int ls = mx_ilog2((uint64_t)sm);
+      uint64_t inv_sm = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;   // one rounded reciprocal/row
+      for (int g = 0; g < GROUPS_S; g++) {
+        int64_t gmax = gmax_arr[g];
+        if (gmax == 0) { P_scales[g][i] = 0; for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = 0; continue; }
+        // group e8m0 scale so the group-max lands at ~2^MX_P_TARGET_LOG2 (moderate; avoids e4 overflow)
+        int e = mx_ilog2((uint64_t)gmax) - ls - MX_P_TARGET_LOG2;
+        P_scales[g][i] = (uint8_t)(e + 127);
+        for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = mx_ienc_fp8(p[j], inv_sm, ls, e);
+      }
+    }
+
+    // ---- 3) O = P @ V on Gemmini (bf16 out) ----
+    {
+      int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+      
+      gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+      gemmini_config_ld(ATT_S * sizeof(elem_t));
+      for (int i = 0; i < tiles_I; i++)
+        for (int k = 0; k < tiles_K; k += 2) { int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM); }
+      
+      // Configure requantizer for O computation
+      gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+      
+      gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      gemmini_mx_read_smem(&O_hw[h][0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+
+      // Lookahead: issue scale loads for the next head's S1 computation before the fence
+      if (h + 1 < ATT_H) {
+        int next_kv = (h + 1) / (ATT_H / ATT_HKV);
+        gemmini_mx_load_scales((uint64_t)Qss[h+1], QSS_BYTES, 0);
+        gemmini_mx_load_scales((uint64_t)KTss[next_kv], QSS_BYTES, 1);
+      }
+
+      gemmini_fence();
+    }
+  }
+}
+```
+
+Key improvements made while respecting hardware constraints:
+
+1. **Maintained proper programming model sequence**: Each matmul operation follows the required sequence with proper configuration calls before data loading.
+
+2. **Preserved tile dimensions and memory layout calculations**: All DIM-based calculations remain intact and correct.
+
+3. **Removed redundant flushes**: Eliminated `gemmini_flush(0)` calls while maintaining proper synchronization with fences.
+
+4. **Implemented background loading**: Started loading V matrix tiles immediately after S1 computation while CPU performs softmax, overlapping DMA with computation.
+
+5. **Proper scale management**: Maintained correct scale loading sequence with proper selector values (0 for activations, 1 for weights).
+
+6. **Preserved fences where needed**: Kept essential fences after `gemmini_mx_read_smem` operations to ensure data consistency.
+
+7. **Maintained correct data types**: Preserved `elem_t` as `uint8_t` and proper pointer arithmetic throughout.
+
+The optimization achieves better CPU-coprocessor overlap while strictly adhering to the hardware programming model and constraints.

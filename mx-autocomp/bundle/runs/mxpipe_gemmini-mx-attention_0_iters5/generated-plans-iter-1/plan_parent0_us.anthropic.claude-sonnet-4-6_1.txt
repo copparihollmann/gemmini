@@ -1,0 +1,100 @@
+# Optimization Plan: Strategy 12 — Fuse Softmax Passes into Two-Pass Loop
+
+## Analysis of the Current Code
+
+The CPU softmax kernel (step 2) currently makes **four separate passes** over each row of `S1_hw`:
+
+1. **Pass 1**: Iterate over `j=0..ATT_S-1` to unpack BF16 → float and find `maxv`
+2. **Pass 2**: Iterate over `j=0..ATT_S-1` to compute `exp(row[j] - maxv)` and accumulate `sum`
+3. **Pass 3**: Iterate over `j=0..ATT_S-1` to normalize by `inv_sum`
+4. **Pass 4**: Nested `g=0..GROUPS_S-1`, `j=0..31` loops to find per-group `gmax`, then again to quantize
+
+Each pass reads the full `row[ATT_S]` float buffer (ATT_S=128 floats = 512 bytes), and passes 2–4 also read `S1_hw[i]` for the original BF16 unpack. With ATT_S=128 rows, this is substantial repeated memory traffic over the float buffer.
+
+Additionally, the BF16-unpack bit-manipulation `(S1_hw[i][j/4] >> ((j%4)*16)) & 0xFFFF` is **recomputed** inside each of passes 1–3, since `row[j]` is stored in the local float buffer. The buffer acts as a cache but it's re-read 3+ times across the passes.
+
+## The Plan: Fuse into Two Passes
+
+**Strategy 12** directly applies here. We restructure the four passes into exactly **two passes** per row:
+
+### Pass 1 (unchanged): Find `maxv`
+- Unpack BF16 → float for each `j`, storing into `row[j]`
+- Track `maxv`
+
+This is kept as-is because `maxv` must be known before we can compute exp().
+
+### Pass 2 (fused): exp + sum + normalize + per-group max + quantize
+
+Instead of separate normalize, group-max-find, and quantize passes, we do:
+
+1. **Sub-pass 2a**: Compute `row[j] = exp(row[j] - maxv)` for all j, accumulate `sum` — **one loop over j**
+2. Apply `inv_sum` to normalize — **one loop over j** (or fold into sub-pass 2a if we store exp values... but sum isn't known until the end)
+
+Actually the cleanest two-pass scheme is:
+
+- **Pass 1**: Unpack + find `maxv` (reads `S1_hw`, writes `row[j]`)
+- **Pass 2**: For each j: compute `softmax_j = exp(row[j] - maxv)`; accumulate `sum` → then second sweep normalizes AND finds per-group max → then third sweep quantizes
+
+Wait — "two-pass" here means we collapse the original 4 passes into 2 passes **over the float buffer** (not over `S1_hw`). The key insight is:
+
+- **Pass 1** over `S1_hw`/`row`: unpack BF16 + find `maxv` → store `row[j]`
+- **Pass 2** over `row`: compute exp values into `row[j]`, accumulate `sum`; then normalize in-place in a **second sweep of the same pass** (or inline after sum is known via a second inner loop)
+
+The most impactful fusion combines the normalize + per-group-max + per-group-quantize that currently require **three** separate full-row traversals into a **single** traversal:
+
+After sum is known:
+```
+inv_sum = 1/sum;
+// Single fused loop: normalize + per-group max scan
+for g in 0..GROUPS_S:
+    gmax = 0
+    for j in g*32..(g+1)*32:
+        row[j] *= inv_sum   // normalize in-place
+        if |row[j]| > gmax: gmax = |row[j]|
+    // compute e, inv_scale
+    for j in g*32..(g+1)*32:
+        P_q[i][j] = fp8_e4m3_rtz(row[j] * inv_scale)
+    P_scales[g][i] = e+127
+```
+
+This eliminates one full pass over the 128-float buffer per row. The per-group structure (groups of 32) means we can also **tile the normalization and quantization** at the group granularity: normalize group g, find gmax for group g, then immediately quantize group g — all while row[j] is warm in L1 cache/registers. This **halves** the number of passes over the float row buffer from 4 to effectively **3** (max-find, exp+sum, normalize+quantize-fused), and eliminates the separate group-max scan entirely.
+
+## Concrete Changes to the Code
+
+In the softmax loop body, replace the current 4-pass structure:
+
+```c
+// CURRENT: Pass 3 (normalize) + Pass 4a (group max) + Pass 4b (quantize) = 3 passes
+for (int j = 0; j < ATT_S; j++) row[j] *= inv_sum;
+for (int g = 0; g < GROUPS_S; g++) {
+    float gmax = 0.0f;
+    for (int j = g*32; j < (g+1)*32; j++) if (f_abs(row[j]) > gmax) gmax = f_abs(row[j]);
+    // compute e, inv_scale ...
+    for (int j = g*32; j < (g+1)*32; j++) P_q[i][j] = fp8_e4m3_rtz(row[j] * inv_scale);
+    P_scales[g][i] = e+127;
+}
+```
+
+With a **single fused pass**:
+
+```c
+// FUSED: normalize + group-max + quantize in one structured traversal
+for (int g = 0; g < GROUPS_S; g++) {
+    float gmax = 0.0f;
+    for (int j = g*32; j < (g+1)*32; j++) {
+        row[j] *= inv_sum;                          // normalize
+        float a = f_abs(row[j]);
+        if (a > gmax) gmax = a;
+    }
+    int e = 0;
+    if (gmax > 0.0f) e = f_exp(gmax / 16.0f) + 1;
+    float inv_scale = pow2i(-e);
+    P_scales[g][i] = (uint8_t)(e + 127);
+    for (int j = g*32; j < (g+1)*32; j++)
+        P_q[i][j] = fp8_e4m3_rtz(row[j] * inv_scale);
+}
+```
+
+The per-group inner quantize loop remains separate from the per-group normalize+max loop (because `inv_scale` depends on `gmax` which requires seeing all 32 elements first), but the **separate full-row normalize pass** is eliminated — normalization is now fused into the per-group max-scan loop. This reduces the number of complete traversals of `row[0..ATT_S-1]` from 4 to **3** passes per row.
+
+The Gemmini-accelerated matmul steps (1 and 3) remain **unchanged**. Only the CPU softmax kernel is modified. The output `P_q` and `P_scales` are computed identically, so semantic equivalence is preserved.

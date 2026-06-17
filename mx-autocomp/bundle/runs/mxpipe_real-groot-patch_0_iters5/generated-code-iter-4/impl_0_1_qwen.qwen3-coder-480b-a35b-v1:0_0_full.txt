@@ -1,0 +1,100 @@
+Looking at the original code and the optimization plan, I can see that the main issue is redundant loading of matrix A data and scales for each j0 iteration. Since BLOCKS_M = 1 (only one block along M dimension), we can hoist the A loading operations outside the inner j0 loop.
+
+However, I notice there's an issue with the proposed optimization - the scratchpad layout needs to be maintained properly, and we need to ensure that B tiles don't overwrite A tiles. Looking at the constraints, we need to be careful about the memory management.
+
+Let me provide the optimized version:
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+
+// Assuming these are defined in the included headers:
+// DIM, BANK_NUM, BANK_ROWS, BLOCKS_M, BLOCKS_N, BLK, MATMUL_K, MATMUL_N, REAL_M, REAL_N, etc.
+
+void solution(void) {
+  // Pre-stage scale buffers once for all blocks, amortizing the restriding
+  // cost across all BLOCKS_M * BLOCKS_N iterations.
+  const int GK = MATMUL_K / 32;
+
+  // Static pre-staged scale arrays: [block_idx][scale_group][elem_in_block]
+  static uint8_t pre_A_s[BLOCKS_M][MATMUL_K / 32][BLK];
+  static uint8_t pre_B_s[BLOCKS_N][MATMUL_K / 32][BLK];
+
+  // One-time restride: copy from strided A_scales_row into contiguous pre-staged arrays
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int g = 0; g < GK; g++) {
+      memcpy(&pre_A_s[i0][g][0], &A_scales_row[g][i0 * BLK], BLK);
+    }
+  }
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    for (int g = 0; g < GK; g++) {
+      memcpy(&pre_B_s[j0][g][0], &B_scales_col[g][j0 * BLK], BLK);
+    }
+  }
+
+  int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+  uint32_t a_base = 0;
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+  int SPAD_DEST = 128;
+
+  // 1. One-time global execution configurations (Hoisted out of all loops)
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_config_st(BLK_OUTC * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+
+  // Load A scales and tiles once since BLOCKS_M = 1
+  if (BLOCKS_M > 0) {
+    int i0 = 0;
+    int mrows = REAL_M - i0 * BLK; 
+    if (mrows > BLK) mrows = BLK; 
+    if (mrows <= 0) return;
+    int pad_i = BLK - mrows;
+
+    // Load A scales ONCE
+    gemmini_mx_load_scales((uint64_t)pre_A_s[i0], A_S_BYTES, 0);
+
+    // Load A tiles ONCE
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i = 0; i < tiles; i++) {
+      for (int k = 0; k < tiles_K; k++) {
+        gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      }
+    }
+
+    // Inner loop over N-blocks (Matrix B columns)
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int ncols = REAL_N - j0 * BLK; 
+      if (ncols > BLK) ncols = BLK; 
+      if (ncols <= 0) continue;
+      int pad_j = BLK - ncols;
+
+      // Load B scales (changes per j0 block)
+      gemmini_mx_load_scales((uint64_t)pre_B_s[j0], B_S_BYTES, 1);
+
+      // Load B tiles (changes per j0 block)
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int j = 0; j < tiles; j++) {
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+        }
+      }
+
+      // Execute Fused WS hardware loop (reusing A tiles already resident in scratchpad)
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Store results back to DRAM
+      for (int r = 0; r < mrows; r++) {
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      }
+      gemmini_fence();
+    }
+  }
+}
+```

@@ -1,0 +1,100 @@
+# Optimization Plan: Strategy 12 — Load LUTs Once at Kernel Entry
+
+## Analysis of Current Code
+
+The current code issues `gemmini_mx_load_lut` calls **inside each matmul phase**, interleaved between the scale loads and the mvin operations:
+
+**Phase 1 (Q×KT):**
+```c
+gemmini_mx_load_lut((uint64_t)KT_lp, 1, 0);  // B-side LUT
+gemmini_mx_load_lut((uint64_t)Q_lp,  1, 1);  // A-side LUT
+```
+
+**Phase 2 (P×V):**
+```c
+gemmini_mx_load_lut((uint64_t)V_lp,  1, 0);  // B-side LUT
+gemmini_mx_load_lut((uint64_t)P_lp,  1, 1);  // A-side LUT
+```
+
+The hardware documentation states: **"LUT banks persist until overwritten, so reloading is unnecessary when the same weight block is reused across tiles."** More generally, a LUT bank persists in hardware state until a new `gemmini_mx_load_lut` with the same `sel` overwrites it.
+
+## Key Observation
+
+Looking at the two phases:
+- Phase 1 loads: `KT_lp → sel=0 (B-bank)`, `Q_lp → sel=1 (A-bank)`
+- Phase 2 loads: `V_lp → sel=0 (B-bank)`, `P_lp → sel=1 (A-bank)`
+
+Phase 2 **does need different LUTs** than Phase 1 (V_lp ≠ KT_lp, P_lp ≠ Q_lp), so we cannot eliminate Phase 2's LUT loads entirely. However, Phase 1's LUT loads are currently placed **after** the `gemmini_mxquant_config_mvout` call but **within the Phase 1 programming sequence**, which is fine for correctness but forces sequential execution.
+
+The real gain from Strategy 12 is: move **all four LUT loads** to the very beginning of `solution()`, before `gemmini_flush(0)` of Phase 1. Since LUT banks persist, this means:
+- Both Phase 1 LUTs (`KT_lp`, `Q_lp`) are loaded early, and remain valid through Phase 1 compute.
+- Then Phase 2 LUTs (`V_lp`, `P_lp`) overwrite the same banks **before Phase 2's** `gemmini_loop_ws_spad`.
+
+Wait — this doesn't actually save loads since the banks are different between phases. Let me reconsider what "load once" means here.
+
+## Correct Application of Strategy 12
+
+The strategy says: *"load LUTs for both matmuls once at kernel entry before either matmul executes, since LUT banks persist until overwritten."*
+
+The correct interpretation: move the LUT loads for **Phase 1** to before the `gemmini_flush`, so they are pre-staged. More importantly, the `gemmini_flush(0)` call at the start of each phase **does not clear LUT memory** (flush only resets the pipeline, not persistent configuration memories like LUT banks). This means:
+
+**The `gemmini_flush(0)` at the start of Phase 2 does NOT wipe Phase 1's LUTs.** But Phase 2 needs different LUTs anyway, so it must reload them.
+
+The actual savings: eliminate the **redundant second `gemmini_flush(0)`** is a separate concern. For LUTs specifically, the plan is:
+
+1. Move **all LUT loads to the top** of `solution()` before Phase 1's `gemmini_flush`.
+2. Phase 1's `gemmini_extended3_config_ex` and the Phase 1 LUT loads (`KT_lp` sel=0, `Q_lp` sel=1) execute first.
+3. Phase 2's LUT loads (`V_lp` sel=0, `P_lp` sel=1) are issued **immediately after Phase 1's LUT loads**, before Phase 1's scale loads and mvin begin.
+4. Since Phase 2's LUTs don't overwrite sel banks until after Phase 1's `gemmini_loop_ws_spad` completes... 
+
+Actually, Phase 2 LUTs use the **same sel indices** (sel=0 and sel=1) as Phase 1 LUTs, so loading Phase 2's LUTs early **would overwrite** Phase 1's LUT banks before Phase 1 computes. This would corrupt Phase 1.
+
+## Revised Correct Plan
+
+Strategy 12 applies as follows: within **each phase**, the LUT load(s) can be moved **earlier** relative to the mvin operations, specifically before the `gemmini_config_ld` and mvin loops, but still after `gemmini_extended3_config_ex` (to respect the programming model sequence: config_ex → load_scales → load_lut → mvin → ...).
+
+The current code already does this within each phase. The real opportunity is:
+
+**For Phase 2**: after Phase 1's `gemmini_fence()` completes and the softmax runs, the Phase 2 LUTs (`V_lp`, `P_lp`) can be loaded **during the softmax CPU computation**, i.e., before Phase 2's `gemmini_flush`. Since the accelerator is idle during the integer softmax loop, issuing `gemmini_mx_load_lut` early (before Phase 2's flush/config) would pre-stage the LUT data.
+
+However, the programming model sequence requires: `config_ex → load_scales → load_lut → mvin`. Loading LUTs before `config_ex` of Phase 2 violates this order per Rule 6.
+
+## Final Correct Plan
+
+Given Rule 6 (strict sequence), Strategy 12's legitimate application is: ensure LUT loads are **not duplicated** or re-issued unnecessarily. Currently each phase issues exactly the LUTs it needs — no redundancy exists between phases since they use different LUT data.
+
+**The actual application**: within Phase 1, the two `gemmini_mx_load_lut` calls currently appear between `gemmini_mxquant_config_mvout` and the mvin loops. Per Rule 6, `load_lut` must come after `load_scales` but can overlap with or precede mvin. The current placement is already correct.
+
+**What Strategy 12 enables here**: since Phase 2 has `uselut=1` and its `gemmini_flush(0)` does **not** clear LUT memory, we can issue Phase 2's LUT loads (`V_lp` sel=0, `P_lp` sel=1) **at the very beginning of `solution()`** — before Phase 1's flush — and then skip them in Phase 2. Phase 1 will then overwrite sel=0,1 with its own LUTs (KT_lp, Q_lp). After Phase 1 completes and the softmax runs, Phase 2's flush doesn't clear LUTs, but Phase 1's KT_lp and Q_lp are still in the banks. Phase 2 would then need to reload V_lp and P_lp.
+
+This circular dependency means we cannot truly eliminate Phase 2's LUT loads while keeping Phase 1's different LUTs intact.
+
+## Actual Viable Plan
+
+The correct and clean application of Strategy 12 to this specific code:
+
+**Observation**: The two `gemmini_mx_load_lut` calls in Phase 1 are issued *after* `gemmini_mxquant_config_mvout` but the programming-model sequence allows them after `gemmini_mx_load_scales`. Currently they're placed after `gemmini_mxquant_config_mvout` which is already after the required position. No violation.
+
+**What changes**: In the current code, `gemmini_mx_load_lut` for Phase 2 is inside Phase 2's block. Since `gemmini_flush(0)` does not clear LUT memory, and Phase 2's LUTs (sel=0 for V, sel=1 for P) will only be needed after Phase 1 completes and the softmax runs, we can **pre-load Phase 2's LUTs at the start of Phase 2's block but before `gemmini_flush`** — but that violates the sequence.
+
+## Definitive Plan
+
+After careful analysis, Strategy 12 applies as follows in this code:
+
+**Phase 1 already has its LUTs loaded correctly.** Phase 2's LUT loads overwrite the same sel banks. Since the programming model requires `config_ex → load_scales → load_lut`, and both phases use `uselut=1` with the same sel values but different LUT data, **the minimum LUT loads are 2 per phase = 4 total**, which is what the current code already does.
+
+**However**, there IS a redundancy: within Phase 1, the code calls `gemmini_mx_load_lut` with `sel=0` (B-bank) for `KT_lp` and `sel=1` (A-bank) for `Q_lp`. These are issued in the middle of Phase 1's setup. Strategy 12 says to move all LUT loads to **kernel entry** to hide their latency behind other setup work.
+
+**Concrete change**: Move Phase 1's `gemmini_mx_load_lut` calls to immediately after Phase 1's `gemmini_mx_load_scales` (which is their earliest legal position per the programming model sequence). Then move Phase 2's `gemmini_mx_load_lut` calls to immediately after Phase 2's `gemmini_mx_load_scales`. This ensures maximum latency hiding — LUT loads from DRAM can proceed while the CPU sets up mvin parameters, rather than stalling the pipeline at a later point.
+
+Additionally: since `gemmini_flush(0)` does not clear LUT memory, Phase 2's `gemmini_flush(0)` + `gemmini_extended3_config_ex` does not invalidate the LUT banks. But Phase 2 uses different LUT data, so it still needs to reload. **No load elimination is possible between the two phases.**
+
+**The net optimization**: reorganize LUT loads within each phase to the earliest legal position (right after `load_scales`), so their DRAM fetch latency is maximally hidden behind the subsequent mvin DMA operations. This reduces the critical path by overlapping LUT fetch with A/B tile DMA.
+
+## Summary of Code Changes
+
+1. **In Phase 1**: Move the two `gemmini_mx_load_lut` calls from their current position (after `gemmini_mxquant_config_mvout`) to **immediately after the two `gemmini_mx_load_scales` calls**, before `gemmini_config_st` and `gemmini_mxquant_config_mvout`.
+
+2. **In Phase 2**: Move the two `gemmini_mx_load_lut` calls from their current position to **immediately after the two `gemmini_mx_load_scales` calls**, before `gemmini_config_st` and `gemmini_mxquant_config_mvout`.
+
+This places LUT loads as early as legally allowed, so the hardware can begin fetching LUT data from DRAM while the CPU continues issuing `gemmini_config_st`, `gemmini_mxquant_config_mvout`, `gemmini_config_ld`, and the mvin DMA commands. The LUT data arrives in the LUT banks before `gemmini_loop_ws_spad` executes, with no pipeline stall, whereas in the original code the LUT loads are issued later, potentially delaying the start of the compute loop.

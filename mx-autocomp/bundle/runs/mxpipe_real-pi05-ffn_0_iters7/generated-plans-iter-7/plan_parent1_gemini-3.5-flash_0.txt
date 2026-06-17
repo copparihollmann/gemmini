@@ -1,0 +1,157 @@
+An elegant and highly effective way to optimize this MX-Gemmini kernel is **Strength Reduction of Host Pointer Arithmetic** (Strategy 6). 
+
+### Optimization Plan
+
+1. **Eliminate Multi-Dimensional Array Multiplications**: In the original code, multi-dimensional array lookups like `&A_scales_perf[i0][0][0]`, `&B_scales_perf[j0][0][0]`, and complex pointer calculations like `(i0 * BLK * MATMUL_K)` are performed inside the hot loops. We will replace these with iteratively updated pointer registers.
+2. **Strength-Reduce Matrix A Pointer Arithmetic**: 
+   - Maintain `A_row_base` starting at `A_in` and increment it by `BLK * MATMUL_K` at the end of each `i0` block iteration.
+   - For tile loading, maintain `A_tile_ptr` starting at `A_row_base` and increment it by `DIM * MATMUL_K` inside the `i` loop.
+   - Maintain `A_tile_ptr_inner` inside the `k` loop, incrementing it by `2 * DIM` on each step.
+3. **Strength-Reduce Matrix B Pointer Arithmetic**:
+   - Initialize `B_col_base` to `B_in` at the start of the `j0` loop and increment it by `BLK` at the end of each `j0` iteration.
+   - Inside the loop, maintain `B_tile_ptr` incremented by `DIM * MATMUL_N` per `k` iteration, and `B_tile_ptr_inner` incremented by `2 * DIM` per `j` iteration.
+4. **Strength-Reduce Scale Memory Loading**:
+   - Track `A_scale_ptr` starting at the base of `A_scales_perf` and increment by `(MATMUL_K / 32) * BLK` on each `i0` iteration.
+   - Track `B_scale_ptr` starting at the base of `B_scales_perf` and increment by `(MATMUL_K / 32) * BLK` on each `j0` iteration.
+5. **Strength-Reduce Matrix C DRAM Storing**:
+   - Track `C_row_block_base` initialized to `&C_hw[0][0]` and incremented by `BLK * (MATMUL_N / BF16_PER_WORD)` on each `i0` step.
+   - Maintain `C_col_offset` starting at `0` and incremented by `BLK / BF16_PER_WORD` on each `j0` step.
+   - For draining, iterate `C_drain_ptr` by adding the stride `MATMUL_N / BF16_PER_WORD` per row `r`, and increment `smem_offset` by `BLK` iteratively.
+
+This reduces the host CPU cycle overhead drastically by removing all costly multiplications and divisions from the inner loops.
+
+### Optimized Code
+
+```c
+// AUTO-GENERATED outer-tiled MX matmul optimized via Strength Reduction of Host Pointer Arithmetic.
+void solution(void) {
+  // Pre-format scale factor matrices to eliminate CPU-side staging in the hot loop
+  static uint8_t A_scales_perf[BLOCKS_M][MATMUL_K / 32][BLK];
+  static uint8_t B_scales_perf[BLOCKS_N][MATMUL_K / 32][BLK];
+
+  // One-time pre-formatting before main loops start
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int g = 0; g < MATMUL_K / 32; g++) {
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+      
+      // Only copy actual data, handle partial blocks correctly
+      for (int i = 0; i < mrows; i++) {
+        A_scales_perf[i0][g][i] = A_scales_row[g][i0 * BLK + i];
+      }
+      // Pad with zeros for partial blocks if needed
+      for (int i = mrows; i < BLK; i++) {
+        A_scales_perf[i0][g][i] = 0;
+      }
+    }
+  }
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    for (int g = 0; g < MATMUL_K / 32; g++) {
+      int ncols = REAL_N - j0 * BLK;
+      if (ncols > BLK) ncols = BLK;
+      if (ncols <= 0) continue;
+      
+      // Only copy actual data, handle partial blocks correctly
+      for (int j = 0; j < ncols; j++) {
+        B_scales_perf[j0][g][j] = B_scales_col[g][j0 * BLK + j];
+      }
+      // Pad with zeros for partial blocks if needed
+      for (int j = ncols; j < BLK; j++) {
+        B_scales_perf[j0][g][j] = 0;
+      }
+    }
+  }
+
+  // Hoist invariant Gemmini execution configuration outside all loops
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  const elem_t *A_row_base = (const elem_t*)A_in;
+  const uint8_t *A_scale_ptr = &A_scales_perf[0][0][0];
+  uint64_t *C_row_block_base = &C_hw[0][0];
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    int mrows = REAL_M - i0 * BLK; 
+    if (mrows > BLK) mrows = BLK; 
+    if (mrows <= 0) continue;
+
+    int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+    uint32_t a_base = 0;
+
+    // Load stationary A scale factors once per row block
+    gemmini_mx_load_scales((uint64_t)A_scale_ptr, A_S_BYTES, 0);
+
+    // Keep A tiles stationary in the lower half of the scratchpad
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t)); // A rows: stride K
+    const elem_t *A_tile_ptr = A_row_base;
+    for (int i = 0; i < tiles; i++) {
+      const elem_t *A_tile_ptr_inner = A_tile_ptr;
+      for (int k = 0; k < tiles_K; k += 2) {
+        gemmini_extended_mvin((void*)A_tile_ptr_inner,
+                              a_base + (i * tiles_K + k) * DIM, 2 * DIM, DIM);
+        A_tile_ptr_inner += 2 * DIM;
+      }
+      A_tile_ptr += DIM * MATMUL_K;
+    }
+
+    const elem_t *B_col_base = (const elem_t*)B_in;
+    const uint8_t *B_scale_ptr = &B_scales_perf[0][0][0];
+    int C_col_offset = 0;
+
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int ncols = REAL_N - j0 * BLK; 
+      if (ncols > BLK) ncols = BLK; 
+      if (ncols <= 0) continue;
+
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      // Flush to synchronize state
+      gemmini_flush(0);
+
+      // Load dynamic B scale factors
+      gemmini_mx_load_scales((uint64_t)B_scale_ptr, B_S_BYTES, 1);
+
+      // Load dynamic B tiles into the upper half of the scratchpad
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t)); // B rows: stride N
+      const elem_t *B_tile_ptr = B_col_base;
+      for (int k = 0; k < tiles_K; k++) {
+        const elem_t *B_tile_ptr_inner = B_tile_ptr;
+        for (int j = 0; j < tiles; j += 2) {
+          gemmini_extended_mvin((void*)B_tile_ptr_inner,
+                                b_base + (k * tiles + j) * DIM, 2 * DIM, DIM);
+          B_tile_ptr_inner += 2 * DIM;
+        }
+        B_tile_ptr += DIM * MATMUL_N;
+      }
+
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      
+      // Perform computation utilizing the stationary A tiles and new B tiles
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Drain results to DRAM using strength-reduced pointer arithmetic
+      uint64_t *C_drain_ptr = C_row_block_base + C_col_offset;
+      uint32_t smem_offset = SPAD_DEST * 16;
+      for (int r = 0; r < mrows; r++) {
+        gemmini_mx_read_smem(C_drain_ptr, smem_offset, ncols);
+        C_drain_ptr += (MATMUL_N / BF16_PER_WORD);
+        smem_offset += BLK;
+      }
+      gemmini_fence();
+
+      B_col_base += BLK;
+      B_scale_ptr += (MATMUL_K / 32) * BLK;
+      C_col_offset += BLK / BF16_PER_WORD;
+    }
+
+    A_row_base += BLK * MATMUL_K;
+    A_scale_ptr += (MATMUL_K / 32) * BLK;
+    C_row_block_base += BLK * (MATMUL_N / BF16_PER_WORD);
+  }
+}
+```

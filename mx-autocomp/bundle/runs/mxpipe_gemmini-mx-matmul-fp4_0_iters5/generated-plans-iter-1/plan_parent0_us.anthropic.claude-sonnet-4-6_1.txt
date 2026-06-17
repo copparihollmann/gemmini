@@ -1,0 +1,72 @@
+## Analysis of the Current Code
+
+The baseline code issues A and B tile mvins sequentially using a single DMA port (`gemmini_extended_mvin`) with a `gemmini_config_ld` reconfiguration between the A loop and the B loop. This means:
+
+1. A tiles are loaded one by one through port 0 (mvin)
+2. Then `gemmini_config_ld` is re-issued to change the stride for B
+3. B tiles are loaded one by one through port 0 (mvin) again
+
+This is strictly sequential and wastes the opportunity to use the two independent DMA ports simultaneously.
+
+## Selected Strategy
+
+**Strategy 11**: Eliminate the `gemmini_config_ld` re-issue between A and B mvin loops by pre-configuring both strides once using `gemmini_extended3_config_ld` with the appropriate `id` parameter for each port (id=0 for mvin, id=1 for mvin2), avoiding full reconfiguration between A and B loads.
+
+Combined with **Strategy 9**: Issue A-tile mvins using `gemmini_extended_mvin` and B-tile mvins using `gemmini_extended_mvin2` concurrently on separate DMA ports to overlap A and B scratchpad loads.
+
+## Plan
+
+### Step 1: Pre-configure both DMA port strides upfront
+
+Instead of:
+```c
+gemmini_config_ld(MATMUL_K * sizeof(elem_t));       // sets port 0 stride
+// ... A mvin loop ...
+gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2);   // re-configures port 0 stride
+// ... B mvin loop ...
+```
+
+Issue both port configurations once before any mvin:
+```c
+gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), 1.0, false, 0);       // port 0 (id=0) for A
+gemmini_extended3_config_ld((MATMUL_N / 2) * sizeof(elem_t), 1.0, false, 1); // port 1 (id=1) for B
+```
+
+This eliminates the mid-loop `gemmini_config_ld` reconfiguration.
+
+### Step 2: Interleave A and B mvins using separate ports
+
+Instead of two separate sequential loops, merge them into a single loop body that issues an A tile load via `gemmini_extended_mvin` (port 0) and a B tile load via `gemmini_extended_mvin2` (port 1) in the same iteration. Since the A loop is over `(i, k)` and the B loop is over `(k, j)`, and both have `tiles_K * tiles_I` and `tiles_K * tiles_J` iterations respectively, we iterate over the larger count and guard the smaller one:
+
+```c
+int total_a = ti * tk;   // tiles_I * tiles_K
+int total_b = tj * tk;   // tiles_J * tiles_K
+int total = (total_a > total_b) ? total_a : total_b;
+
+for (int idx = 0; idx < total; idx++) {
+    if (idx < total_a) {
+        int i = idx / tk, k = idx % tk;
+        gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in_hw) + i*DIM*MATMUL_K + k*DIM),
+            ab + (i*tk + k)*DIM, DIM, DIM);
+    }
+    if (idx < total_b) {
+        int k = idx / tj, j = idx % tj;
+        gemmini_extended_mvin2(
+            (void*)(((elem_t*)B_in) + k*DIM*(MATMUL_N/2) + j*DIM),
+            bb + (k*tj + j)*DIM, DIM, DIM);
+    }
+}
+```
+
+This lets the hardware overlap A and B DMA transfers since they use independent port 0 and port 1 pipelines, reducing total mvin latency from `(total_a + total_b)` sequential loads to approximately `max(total_a, total_b)` overlapped loads.
+
+### Why This Is Correct
+
+- Port 0 (`mvin`) stride is set to `MATMUL_K` bytes — correct for A's packed row width
+- Port 1 (`mvin2`) stride is set to `MATMUL_N/2` bytes — correct for B's packed row width (2 fp4 values per byte)
+- A tile addresses: `ab + (i*tk + k)*DIM` — unchanged, matches rule 12
+- B tile addresses: `bb + (k*tj + j)*DIM` — unchanged, matches rule 12
+- No scratchpad layout changes; fits within 8192 rows
+- The `gemmini_mxquant_config_mvout`, `gemmini_loop_ws_spad`, `gemmini_mx_read_smem`, and `gemmini_fence` calls are unchanged
+- The programming model sequence is preserved

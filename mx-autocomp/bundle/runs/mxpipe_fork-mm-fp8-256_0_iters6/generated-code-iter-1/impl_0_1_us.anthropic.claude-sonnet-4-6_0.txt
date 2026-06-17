@@ -1,0 +1,119 @@
+void solution(void) {
+
+  // Tile counts for full matrix
+  // MATMUL_M=128, MATMUL_N=128, MATMUL_K=256 => tiles_I=8, tiles_J=8, tiles_K=16
+  const int full_tiles_I = MATMUL_M / DIM;  // 8
+  const int full_tiles_J = MATMUL_N / DIM;  // 8
+  const int full_tiles_K = MATMUL_K / DIM;  // 16
+
+  // I_BAND: max I tiles per band such that I_BAND * tiles_J * DIM <= ACC_ROWS
+  // ACC_ROWS=256, tiles_J=8, DIM=16 => 256/(8*16)=2
+  const int I_BAND    = ACC_ROWS / (full_tiles_J * DIM); // 2
+  const int num_bands = full_tiles_I / I_BAND;            // 4
+
+  // Scratchpad layout:
+  //   B tiles at top (resident for all bands):
+  //     b_base = BANK_NUM*BANK_ROWS - tiles_K*tiles_J*DIM
+  //            = 8192 - 16*8*16 = 8192 - 2048 = 6144
+  //   A tiles (current band only):
+  //     a_base = 0, uses I_BAND*tiles_K*DIM = 2*16*16 = 512 rows
+  //   No overlap: 512 < 6144 ✓
+  const uint32_t b_base  = BANK_NUM * BANK_ROWS - full_tiles_K * full_tiles_J * DIM; // 6144
+  const uint32_t a_base  = 0;
+  const int      SPAD_DEST = 0; // destination word offset in mx_smem
+
+  // Step 1: Configure execution (FP8 E4M3 inputs, BF16 output)
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false,
+      /*act_mx_fmt*/0, /*wgt_mx_fmt*/0, /*out_mx_fmt*/3, /*uselut*/0);
+
+  // Step 2: Load scale factors (must happen before any compute)
+#ifdef SPIKE_SIM
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0); // sel=0 => A scales
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1); // sel=1 => B scales
+#else
+  load_scale_factors((volatile uint64_t *)GEMMINI_SF_MEM_A,
+                     (uint8_t *)&A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *)GEMMINI_SF_MEM_B,
+                     (uint8_t *)&B_scales_col, MATMUL_N, MATMUL_K);
+#endif
+
+  // Step 3: Load ALL B tiles once into scratchpad (resident across all I-bands)
+  // B is stored at b_base (top of scratchpad), layout: b_base + (k*tiles_J + j)*DIM
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int k = 0; k < full_tiles_K; k++) {
+    for (int j = 0; j < full_tiles_J; j++) {
+      elem_t   *dram_ptr = ((elem_t *)B_in) + k * DIM * MATMUL_N + j * DIM;
+      uint32_t  sp_addr  = b_base + (k * full_tiles_J + j) * DIM;
+      gemmini_extended_mvin2((void *)dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  // Step 4: Process each I-band: load A band, configure mvout, compute, read smem
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+
+  for (int band = 0; band < num_bands; band++) {
+    int i_start = band * I_BAND; // starting I-tile index for this band
+
+    // Load A tiles for this band only (I_BAND * tiles_K tiles)
+    // Layout: a_base + (i * tiles_K + k) * DIM  (i is local to band, 0..I_BAND-1)
+    for (int i = 0; i < I_BAND; i++) {
+      for (int k = 0; k < full_tiles_K; k++) {
+        elem_t   *dram_ptr = ((elem_t *)A_in)
+                             + (i_start + i) * DIM * MATMUL_K + k * DIM;
+        uint32_t  sp_addr  = a_base + (i * full_tiles_K + k) * DIM;
+        gemmini_extended_mvin((void *)dram_ptr, sp_addr, DIM, DIM);
+      }
+    }
+
+    // Step 5: Configure requantized mvout for this band
+    // i_bound=I_BAND, j_bound=full_tiles_J, k_bound=full_tiles_K must match
+    // the gemmini_loop_ws_spad call below exactly (rule 12)
+    gemmini_config_st(MATMUL_N * sizeof(elem_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+        /*i_bound*/I_BAND, /*j_bound*/full_tiles_J, /*k_bound*/full_tiles_K,
+        /*scale_act_sel*/0, /*scale_w_sel*/0, /*lut_update_granularity*/1);
+
+    // Step 6: Compute this band (I_BAND x tiles_J x tiles_K)
+    // Accumulator usage: I_BAND * tiles_J * DIM = 2*8*16 = 256 <= ACC_ROWS=256 ✓
+    // funct 24 (LOOP_WS_CONFIG_SPAD_AB) is re-issued inside gemmini_loop_ws_spad
+    // macro before every LOOP_WS call (one-shot marker, rule 14)
+    gemmini_loop_ws_spad(
+        I_BAND, full_tiles_J, full_tiles_K,
+        0, 0, 0,
+        a_base,
+        BANK_NUM * BANK_ROWS, // b_base end address (top of scratchpad)
+        0,
+        SPAD_DEST,
+        false, false,   // A_transpose, B_transpose
+        false, false, false, // full_C, low_D, ex_accumulate
+        NO_ACTIVATION,
+        0, 0,           // a_spad_id, b_spad_id
+        false,          // is_resadd
+        0x38);          // skips bitmask
+
+    // Step 7: Drain BF16 results from mx_smem to the correct C_hw rows
+    // Results packed 4 BF16 per uint64 word; total BF16 values = I_BAND*DIM*MATMUL_N
+#ifdef SPIKE_SIM
+    gemmini_mx_read_smem((void *)&C_hw[i_start * DIM][0],
+                         SPAD_DEST * 16,
+                         I_BAND * DIM * MATMUL_N);
+#else
+    for (int i = 0; i < I_BAND * DIM; i++) {
+      for (int j = 0; j < MATMUL_N; j++) {
+        // Non-Spike path: read directly from SMEM mapped region
+        // (handled by existing RTL readback path)
+      }
+    }
+    for (int i = 0; i < full_tiles_J * I_BAND * 2; i++) {
+      gemmini_mvout((void *)((uint64_t *)C_hw + i_start * DIM * (MATMUL_N / 4) + i * 2 * DIM),
+                   SPAD_DEST + i * DIM);
+    }
+    gemmini_fence();
+#endif
+
+    // Step 8: Fence ensures all DMA writes to C_hw are visible before next iteration
+    // and before host reads results (rule 9)
+    gemmini_fence();
+  }
+}

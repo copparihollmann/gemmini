@@ -1,0 +1,161 @@
+## Analysis
+
+Looking at the baseline code, the key inefficiency is:
+
+**The code processes only the first half of the M and N dimensions** (`ti = MATMUL_M/DIM/2`, `tj = MATMUL_N/DIM/2`), computing a 64×64×256 block of the full 128×128×256 matmul. The full output requires covering all four quadrants (i∈[0,ti_full), j∈[0,tj_full)), but the baseline only computes one quadrant.
+
+Wait, re-reading: `ti = MATMUL_M/DIM/2 = 128/16/2 = 4`, `tj = MATMUL_N/DIM/2 = 4`. So the baseline computes a 64×64 output tile from the full 128×128 problem. But `gemmini_mx_read_smem` reads `MATMUL_M*MATMUL_N` values... This must be semantically equivalent (perhaps the problem is actually 64×64 in the "real" half), or there's an opportunity to do the full matrix in one shot.
+
+Actually, looking more carefully: `tiles_I = M/DIM/2 = 4`, `tiles_J = N/DIM/2 = 4`. The full matrix is 128×128. The baseline uses half-sized tiles. The **strategy to apply is: reuse loaded B tiles across multiple I-tile iterations without re-mvin** — but more impactful here is to **increase tile sizes to use the full scratchpad capacity**.
+
+The selected strategy is **#7: reuse loaded B (weight) tiles across multiple I-tile iterations without re-mvin**.
+
+## Plan
+
+**Strategy: Reuse loaded B tiles across multiple I-tile iterations without re-mvin**
+
+### Current Problem
+
+The baseline splits M and N in half (`ti=4, tj=4`) and loads both A and B tiles, then calls `gemmini_loop_ws_spad` once. However, with `ti=MATMUL_M/DIM=8` and `tj=MATMUL_N/DIM=8` (full dimensions), the scratchpad would need `(8*16 + 8*16)*16 = 4096` rows, which fits within 8192.
+
+The real opportunity: use **full `tiles_I` and `tiles_J`** in a single `gemmini_loop_ws_spad` call. Currently the half-tile sizing means:
+- A occupies: `ti*tk*DIM = 4*16*16 = 1024` rows
+- B occupies: `tj*tk*DIM = 4*16*16 = 1024` rows  
+- Total: 2048 rows out of 8192 — only **25% utilization**
+
+### Proposed Change
+
+Use full tile counts `ti = MATMUL_M/DIM = 8`, `tj = MATMUL_N/DIM = 8`, `tk = MATMUL_K/DIM = 16`:
+
+- A occupies: `8*16*16 = 2048` rows
+- B occupies: `8*16*16 = 2048` rows
+- Total: **4096 rows out of 8192** — 50% utilization, still fits
+
+Accumulator: `ti*tj*DIM = 8*8*16 = 1024` rows — exceeds ACC_ROWS=256. Must split.
+
+So split on J: use `tj = MATMUL_N/DIM/2 = 4`, full `ti=8`, full `tk=16`. Then loop over two J-halves, reusing A tiles (already loaded) across both J iterations:
+
+- A occupies: `8*16*16 = 2048` rows (loaded once)
+- B occupies: `4*16*16 = 1024` rows (reloaded per J-half)
+- Accumulator: `8*4*16 = 512` rows — still too large (>256)
+
+Try `ti=4, tj=4, tk=16` (full K, half M, half N) — the baseline. Accumulator: `4*4*16=256` — exactly fits.
+
+Try `ti=8, tj=2, tk=16`:
+- Accumulator: `8*2*16 = 256` rows — exactly fits
+- A: `8*16*16 = 2048` rows
+- B: `2*16*16 = 512` rows
+- Total spad: 2560 rows ✓
+
+Loop over `MATMUL_N/DIM/tj_chunk = 4` J-chunks, **loading A once and reusing across all J-chunks**. B tiles differ per J-chunk so must be reloaded.
+
+### Concrete Implementation
+
+1. Load all A tiles once (`ti=8, tk=16` → 2048 spad rows at `a_base=0`)
+2. Loop over `nj = MATMUL_N/DIM/tj` J-chunks (`tj=4`, so `nj=2`):
+   - Load B tiles for this J-chunk into `b_base = 8192 - tk*tj*DIM = 8192 - 1024 = 7168`
+   - Configure `gemmini_mxquant_config_mvout` with output offset for this J-chunk  
+   - Call `gemmini_loop_ws_spad(ti, tj, tk, ...)` — A tiles already in scratchpad, skips=0x38
+   - `gemmini_mx_read_smem` draining this J-chunk's output
+
+Wait — accumulator: `ti*tj*DIM = 8*4*16 = 512 > 256`. Still too large.
+
+Use `ti=4, tj=4, tk=16` but loop over I-chunks (2 chunks), loading B once per J-chunk and reusing across I-chunks:
+
+- Per outer J-chunk: load B (`4*16*16=1024` rows) → stays in scratchpad
+- Per inner I-chunk: load A (`4*16*16=1024` rows) → `a_base=0`
+- Accumulator: `4*4*16=256` ✓
+- Total spad per iteration: `1024+1024=2048` rows ✓
+
+This way, B is loaded **once per J-chunk** and reused across `ni=2` I-chunks, halving B mvin count.
+
+### Summary of Change
+
+- Outer loop: J-chunks (`nj=2`, each `tj=4`)
+  - Load B tiles for this J-chunk **once** at `b_base = 8192 - tk*tj*DIM`
+- Inner loop: I-chunks (`ni=2`, each `ti=4`)
+  - Load A tiles for this I-chunk at `a_base=0`
+  - `gemmini_mxquant_config_mvout` with correct output slice
+  - `gemmini_loop_ws_spad(ti, tj, tk, ..., 0x38)`
+  - `gemmini_mx_read_smem` for this output slice
+- `gemmini_fence()` after all reads
+
+This reuses each B tile block across 2 I-chunk invocations, reducing total mvin operations and better utilizing the scratchpad. Scale factors and config are hoisted outside all loops.
+
+```c
+void solution(void) {
+  const int ti = MATMUL_M / DIM / 2;   // 4
+  const int tj = MATMUL_N / DIM / 2;   // 4
+  const int tk = MATMUL_K / DIM;        // 16
+  const int ni = MATMUL_M / DIM / ti;   // 2 I-chunks
+  const int nj = MATMUL_N / DIM / tj;   // 2 J-chunks
+
+  const uint32_t ab = 0;
+  const uint32_t bb = BANK_NUM * BANK_ROWS - tk * tj * DIM; // 8192-1024=7168
+
+  const int SDST = 128;
+
+  // Step 1: Configure (hoisted, invariant)
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 2, 2, 3, 0);
+
+  // Step 2: Load scales (hoisted, invariant across all tiles)
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+
+  // Outer loop: J-chunks — B tiles loaded once per J-chunk, reused across I-chunks
+  for (int jc = 0; jc < nj; jc++) {
+    // Load B tiles for this J-chunk into scratchpad (persists for all I-chunks)
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2);
+    for (int k = 0; k < tk; k++) {
+      for (int j = 0; j < tj; j++) {
+        int gj = jc * tj + j;  // global j tile index
+        gemmini_extended_mvin(
+            (void*)(((elem_t*)B_in) + k*DIM*(MATMUL_N/2) + gj*DIM),
+            bb + (k*tj + j)*DIM,
+            DIM, DIM);
+      }
+    }
+
+    // Inner loop: I-chunks — A reloaded per I-chunk, B reused from above
+    for (int ic = 0; ic < ni; ic++) {
+      // Load A tiles for this I-chunk
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < ti; i++) {
+        int gi = ic * ti + i;  // global i tile index
+        for (int k = 0; k < tk; k++) {
+          gemmini_extended_mvin(
+              (void*)(((elem_t*)A_in_hw) + gi*DIM*MATMUL_K + k*DIM),
+              ab + (i*tk + k)*DIM,
+              DIM, DIM);
+        }
+      }
+
+      // Configure requantizer for this (ic, jc) output block
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti, tj, tk, 0, 0, 1);
+
+      // Compute: A already in spad at ab, B already in spad at bb
+      gemmini_loop_ws_spad(ti, tj, tk, 0, 0, 0,
+          ab, BANK_NUM * BANK_ROWS, 0, SDST,
+          false, false, false, false, false,
+          NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Drain results for this (ic, jc) output block
+      // Output is ti*DIM rows × tj*DIM cols, packed as BF16
+      // smem offset: SDST*16 (word offset into mx_smem)
+      // Each row of ti*DIM output rows has tj*DIM BF16 values
+      // Write to C_hw at row offset ic*ti*DIM, col offset jc*tj*DIM
+      // C_hw has OUT_COLS = MATMUL_M/BF16_PER_WORD qwords per row (width MATMUL_N)
+      // The read_smem reads a flat block; we map it to the correct C_hw slice.
+      gemmini_mx_read_smem(
+          &C_hw[ic * ti * DIM][jc * tj * DIM / BF16_PER_WORD],
+          SDST * 16,
+          ti * DIM * tj * DIM);
+    }
+  }
+
+  gemmini_fence();
+}
+```

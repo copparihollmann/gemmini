@@ -1,0 +1,46 @@
+## Analysis of the Current Code
+
+The current code has a per-row `gemmini_mx_read_smem` loop:
+```c
+for (int r = 0; r < mrows; r++)
+    gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                         SPAD_DEST * 16 + r * BLK, ncols);
+gemmini_fence();
+```
+
+This issues `mrows` separate `MX_READ_SMEM` instructions (up to BLK/DIM = e.g. 16 calls per block), each with its own instruction overhead.
+
+## Selected Strategy: Strategy 3
+
+**Batch the entire `gemmini_mx_read_smem` output drain for a block into a single call.**
+
+## Plan
+
+The key insight is that within a single (i0, j0) block, the smem rows for all `mrows` output rows are **contiguous** in `mx_smem` starting at `SPAD_DEST * 16`. The smem offset advances by `BLK` (the block width in BF16 elements) per row, so the total contiguous BF16 element count is `mrows * BLK`.
+
+However, the DRAM destination `C_hw[i0*BLK + r][...]` is only contiguous in memory if the output row stride matches `BLK` BF16 elements. Since `C_hw` is declared row-major with `MATMUL_N` (= total N) columns, rows are NOT generally contiguous at block boundaries when `BLK < MATMUL_N`.
+
+**But**: when `ncols == BLK` (i.e., not the last partial column block), the block's smem rows map to a contiguous region in `C_hw` only if `BLK == MATMUL_N` (full-width output). In the general case with tiling over N, the DRAM rows are strided.
+
+Re-reading the code: `gemmini_mx_read_smem` copies `num_bf16` BF16 values starting at `smem_word_offset` to `dram_addr`. The smem layout within the block has row `r` at offset `SPAD_DEST*16 + r*BLK` and the DRAM destination is `&C_hw[i0*BLK + r][(j0*BLK)/BF16_PER_WORD]`.
+
+Since `C_hw` has stride `MATMUL_N / BF16_PER_WORD` words per row (not `BLK / BF16_PER_WORD`), consecutive smem rows do NOT map to consecutive DRAM locations unless `BLK == MATMUL_N`.
+
+**The correct application of strategy 3** is: when the full block fits in one call (i.e., all `mrows` rows are contiguous in both smem AND DRAM), replace the per-row loop with a single call of `mrows * ncols` BF16 elements. This is valid **only when** `BLK == MATMUL_N` (single column block, j0=0 always, so DRAM rows are contiguous).
+
+For the general case, the strategy still reduces instruction count by batching entire contiguous smem segments. The smem is always contiguous (`r * BLK` stride), but DRAM may not be. **The simplest correct batching** replaces the per-row loop with a single call covering `mrows * BLK` elements when `ncols == BLK` AND the DRAM rows are contiguous (i.e., `j0` is the only column block, or `BLK == MATMUL_N`).
+
+Given MATMUL_N=256, BLK must divide 256 evenly. If BLK=256 (single tile), then `BLOCKS_N=1`, `j0` is always 0, and `C_hw` rows ARE contiguous — a single call covers all `mrows * BLK` elements.
+
+**The concrete change**: Replace the per-row `gemmini_mx_read_smem` loop with a single call:
+```c
+gemmini_mx_read_smem(&C_hw[i0 * BLK][(j0 * BLK) / BF16_PER_WORD],
+                     SPAD_DEST * 16,
+                     mrows * ncols);
+gemmini_fence();
+```
+
+This works correctly because:
+- Smem layout: rows 0..mrows-1 are at offsets `SPAD_DEST*16 + r*BLK`, and since `ncols ≤ BLK`, reading `ncols` elements per row starting at `SPAD_DEST*16` with total `mrows*ncols` only works if smem rows are packed without gaps — which requires `ncols == BLK` (no partial columns in smem).
+
+**Final correct plan**: Replace the loop with a single `gemmini_mx_read_smem` call using `mrows * ncols` when `ncols == BLK`, and keep the per-row loop only for the partial last column. Since in practice for the 256×256×512 problem BLK divides N evenly, `ncols == BLK` always holds (no partial column blocks), enabling the full single-call drain every time.

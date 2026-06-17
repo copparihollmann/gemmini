@@ -1,0 +1,79 @@
+## Analysis of the Original Code
+
+The original code for a 32×32×32 fp8 matmul has `tiles_I=2, tiles_J=2, tiles_K=2` (all statically known small constants). The mvin loops are:
+
+```c
+for (int i = 0; i < tiles_I; i++)      // 2 iterations
+  for (int k = 0; k < tiles_K; k++)    // 2 iterations
+    gemmini_extended_mvin(...);         // 4 total calls
+
+for (int j = 0; j < tiles_J; j++)      // 2 iterations
+  for (int k = 0; k < tiles_K; k++)    // 2 iterations
+    gemmini_extended_mvin(...);         // 4 total calls
+```
+
+Each loop iteration requires: a branch comparison, an increment, address computation (`i * DIM * MATMUL_K + k * DIM`, `a_base + (i * tiles_K + k) * DIM`), and a pointer cast — all runtime overhead that the hardware does not need.
+
+## Selected Strategy: #11 — Fully Unroll All Mvin Loops
+
+Since `tiles_I=2, tiles_J=2, tiles_K=2` are **statically known constants** (derived from `MATMUL_M=32, MATMUL_N=32, MATMUL_K=32, DIM=16`), all loop indices and addresses can be computed at compile time. Unrolling eliminates:
+- Loop control instructions (compare, branch, increment: ~6 instructions × 8 iterations = ~48 instructions)
+- Runtime address arithmetic (the pointer expressions become constant offsets)
+- Potential pipeline stalls from loop-carried dependencies
+
+## Plan
+
+Replace both nested mvin loops with 8 fully-unrolled `gemmini_extended_mvin` calls with statically-computed addresses:
+
+**A tiles** (tiles_I=2, tiles_K=2): 4 calls with addresses:
+- (i=0,k=0): dram=`A_in + 0`, spad=`a_base + 0*DIM`
+- (i=0,k=1): dram=`A_in + 1*DIM`, spad=`a_base + 1*DIM`
+- (i=1,k=0): dram=`A_in + 1*DIM*MATMUL_K`, spad=`a_base + 2*DIM`
+- (i=1,k=1): dram=`A_in + 1*DIM*MATMUL_K + 1*DIM`, spad=`a_base + 3*DIM`
+
+**B tiles** (tiles_J=2, tiles_K=2): 4 calls with addresses:
+- (j=0,k=0): dram=`B_in + 0`, spad=`b_base + 0*DIM`
+- (j=0,k=1): dram=`B_in + 1*DIM`, spad=`b_base + 1*DIM`
+- (j=1,k=0): dram=`B_in + 1*DIM*MATMUL_K`, spad=`b_base + 2*DIM`
+- (j=1,k=1): dram=`B_in + 1*DIM*MATMUL_K + 1*DIM`, spad=`b_base + 3*DIM`
+
+All other code (config_ex, load_scales, config_st, mxquant_config_mvout, loop_ws_spad, read_smem, fence) remains unchanged. The single `gemmini_config_ld(MATMUL_K * sizeof(elem_t))` call remains (same stride for both A and B since they share the same MATMUL_K row stride).
+
+## Rewritten Code
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+
+  // A tiles: fully unrolled (tiles_I=2, tiles_K=2)
+  gemmini_extended_mvin((void*)(((elem_t*)A_in) + 0 * DIM * MATMUL_K + 0 * DIM),
+                        a_base + 0 * DIM, DIM, DIM);
+  gemmini_extended_mvin((void*)(((elem_t*)A_in) + 0 * DIM * MATMUL_K + 1 * DIM),
+                        a_base + 1 * DIM, DIM, DIM);
+  gemmini_extended_mvin((void*)(((elem_t*)A_in) + 1 * DIM * MATMUL_K + 0 * DIM),
+                        a_base + 2 * DIM, DIM, DIM);
+  gemmini_extended_mvin((void*)(((elem_t*)A_in) + 1 * DIM * MATMUL_K + 1 * DIM),
+                        a_base + 3 * DIM, DIM, DIM);
+
+  // B tiles: fully unrolled (tiles_J=2, tiles_K=2)
+  gemmini_extended_mvin((void*)(((elem_t*)B_in) + 0 * DIM * MATMUL_K + 0 * DIM),
+                        b_base + 0 * DIM, DIM, DIM);
+  gemmini_extended_mvin((void*)(((elem_t*)B_in) + 0 * DIM * MATMUL_K + 1 * DIM),
+                        b_base + 1 * DIM, DIM, DIM);
+  gemmini_extended_mvin((void*)(((elem_t*)B_in) + 1 * DIM * MATMUL_K + 0 * DIM),
+                        b_base + 2 * DIM, DIM, DIM);
+  gemmini_extended_mvin((void*)(((elem_t*)B_in) + 1 * DIM * MATMUL_K + 1 * DIM),
+                        b_base + 3 * DIM, DIM, DIM);
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```

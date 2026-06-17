@@ -1,0 +1,143 @@
+## Strategy: Hoist B-tile MVIN Outside the Entire Loop Nest (Persistent B Reuse)
+
+### Analysis of the Current Code
+
+In the current code, B tiles are loaded inside the `j0` loop but **outside** the `i0` loop — a partial hoist. However, `gemmini_flush(0)` is called at the start of every `i0` iteration. According to the architecture documentation, `gemmini_flush` discards prefetched state. This means that even though B tiles were DMA'd into the scratchpad before the `i0` loop, the flush at the top of the `i0` loop potentially invalidates/serializes the pipeline each time.
+
+But more critically: **the B mvin is still inside the `j0` loop**, meaning B tiles are re-loaded for every new `j0` block, even though the entire B matrix could be loaded once if scratchpad capacity permits. Let's check:
+
+- `tiles_K = MATMUL_K / DIM = 256 / 16 = 16`
+- `tiles_J_total = MATMUL_N / DIM = 256 / 16 = 16` (all N tiles)
+- B total rows = `tiles_K * tiles_J_total * DIM = 16 * 16 * 16 = 4096` rows
+- A for one i0 block: `tiles * tiles_K * DIM = (BLK/DIM) * 16 * 16`
+
+Given `MATMUL_M=113`, `BLK` is likely 16 or 32. With `BLK=16`: `tiles=1`, A rows per block = `1*16*16 = 256` rows. Total = `4096 + 256 = 4352 ≤ 8192`. ✓
+
+**The key insight**: All B tiles for the entire N dimension fit in the scratchpad simultaneously alongside one i0-block's A tiles. Currently, B is re-loaded on every `j0` iteration (16 times total). Each reload is `tiles_K * tiles_J * DIM = 16 * tiles * DIM` scratchpad row writes — pure redundant DRAM traffic.
+
+### The New Strategy: Hoist All B Tiles Outside Both Loops
+
+**Load all B tiles for the entire matrix once before the `j0/i0` nest.** Then, within the loop, only load A tiles per i0 block and select the appropriate B sub-region by adjusting the `b_base` pointer passed to `gemmini_loop_ws_spad` and the mvin target addresses.
+
+Specifically:
+1. Compute a global `b_base_global = BANK_NUM*BANK_ROWS - tiles_K * tiles_J_total * DIM` where `tiles_J_total = MATMUL_N / DIM` (all N columns).
+2. Load all B tiles once: for each `j0`, for each `j`, for each `k`, mvin B tile `(k, j0*tiles + j)` into `b_base_global + (j0*tiles + j)*tiles_K*DIM + k*DIM` (i.e., `b_base_global + ((j0*tiles + j)*tiles_K + k)*DIM`).
+3. For each `(j0, i0)` block, instead of loading B tiles, compute `b_base_j0 = b_base_global + j0*tiles*tiles_K*DIM` — the start of j0's B tiles within the already-loaded scratchpad region — and pass `b_base_j0 + tiles*tiles_K*DIM` as the "B end" argument to `gemmini_loop_ws_spad` (i.e., pass the appropriate `B` end address so the hardware loop finds the right tiles).
+
+Wait — let me re-examine the B addressing convention. Per the architecture: B tiles at `b_base + (j*tiles_K + k)*DIM`. The hardware loop receives `BANK_NUM*BANK_ROWS` as the B argument (the end of the scratchpad), and internally computes `b_base = B_end - tiles_J * tiles_K * DIM`. So `gemmini_loop_ws_spad` uses `(B - tiles_J*tiles_K*DIM)` as the actual b_base. 
+
+If all B tiles are pre-loaded globally, for a given `j0` block (with `tiles` columns), the relevant B tiles start at `b_base_global + j0 * tiles * tiles_K * DIM`. To make the hardware loop see this as `b_base`, we pass `B = b_base_global + j0*tiles*tiles_K*DIM + tiles*tiles_K*DIM = b_base_global + (j0+1)*tiles*tiles_K*DIM` as the B-end argument.
+
+### Performance Improvement
+
+- **Eliminates redundant B-tile DRAM loads**: B tiles are loaded `BLOCKS_N` times currently (once per j0); with this strategy, they're loaded exactly once. For `BLOCKS_N = MATMUL_N / BLK = 16` j0 iterations, this removes 15/16 of all B mvin traffic.
+- **Reduces total DMA command count**: The `gemmini_extended_mvin` calls for B (`BLOCKS_N * tiles * tiles_K = 16 * 1 * 16 = 256` calls) drop to `tiles_J_total * tiles_K = 16 * 16 = 256` calls total — same count but issued once upfront, allowing the accelerator to overlap B DMA with A DMA and compute for subsequent blocks.
+- **Enables better pipelining**: With B always resident, the `i0` loop's critical path is only `config_ex + load_A_scales + load_B_scales + mvin_A + mxquant_config + loop_ws + read_smem`, with no B mvin serializing it.
+- **Scratchpad fits**: `4096 (all B) + 256 (one A block) = 4352 ≤ 8192` rows. ✓
+
+### Concrete Code Changes
+
+```c
+void solution(void) {
+  int tiles        = BLK / DIM;
+  int tiles_K      = MATMUL_K / DIM;
+  int tiles_J_total = MATMUL_N / DIM;   // all N tiles at once
+  int GK           = MATMUL_K / 32;
+
+  // b_base for ALL N tiles at once (top of scratchpad, growing downward)
+  uint32_t b_base_global = BANK_NUM * BANK_ROWS - tiles_K * tiles_J_total * DIM;
+  uint32_t a_base        = 0;
+  int SPAD_DEST          = 128;
+
+  // --- Pre-transpose scale arrays (unchanged) ---
+  static uint8_t A_scales_T[BLOCKS_M][A_S_BYTES];
+  static uint8_t B_scales_T[BLOCKS_N][B_S_BYTES];
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+    for (int g = 0; g < GK; g++)
+      memcpy(&A_scales_T[i0][g * BLK], &A_scales_row[g][i0 * BLK], BLK);
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++)
+    for (int g = 0; g < GK; g++)
+      memcpy(&B_scales_T[j0][g * BLK], &B_scales_col[g][j0 * BLK], BLK);
+
+  // --- One-time flush and config before entire nest ---
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                              1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // --- Load ALL B tiles once into global b_base region ---
+  // B layout in DRAM: row k*DIM .. (k+1)*DIM-1, col j0*BLK+j*DIM .. +DIM-1
+  // Scratchpad: b_base_global + (global_j * tiles_K + k) * DIM
+  // where global_j = j0*tiles + j
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    for (int j = 0; j < tiles; j++) {
+      int global_j = j0 * tiles + j;
+      for (int k = 0; k < tiles_K; k++) {
+        gemmini_extended_mvin(
+          (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+          b_base_global + (global_j * tiles_K + k) * DIM,
+          DIM, DIM);
+      }
+    }
+  }
+
+  // --- Main loop nest: only A changes per (i0, j0) ---
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    int ncols = REAL_N - j0 * BLK;
+    if (ncols > BLK) ncols = BLK;
+    if (ncols <= 0) continue;
+
+    // B end address for this j0's tiles in the globally-loaded scratchpad.
+    // The hardware computes b_base = B_end - tiles_J * tiles_K * DIM.
+    // We want b_base = b_base_global + j0*tiles*tiles_K*DIM, so:
+    // B_end = b_base_global + j0*tiles*tiles_K*DIM + tiles*tiles_K*DIM
+    //       = b_base_global + (j0+1)*tiles*tiles_K*DIM
+    uint32_t b_end_j0 = b_base_global + (j0 + 1) * tiles * tiles_K * DIM;
+
+    for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      // Step 1: Load A and B scales (no flush needed — config is persistent).
+      gemmini_mx_load_scales((uint64_t)A_scales_T[i0], A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_scales_T[j0], B_S_BYTES, 1);
+
+      // Step 2: Mvin A tiles only (B already in scratchpad).
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+      // Step 3: Configure requantized mvout.
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                   tiles, tiles, tiles_K, 0, 0, 1);
+
+      // Step 4: Fused hardware matmul.
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0,
+                           a_base, b_end_j0, 0, SPAD_DEST,
+                           false, false, false, false, false,
+                           NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Step 5: Drain BF16 results from mx_smem to DRAM.
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(
+          &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+          SPAD_DEST * 16 + r * BLK, ncols);
+
+      gemmini_fence();
+    }
+  }
+}
+```
+
+### Summary
+
+By loading all B tiles a single time before the entire `j0/i0` nest (instead of re-loading per `j0`), the strategy eliminates `(BLOCKS_N - 1) / BLOCKS_N` of B-tile DRAM traffic and removes the B mvin from the inner timed path entirely. The scratchpad capacity check confirms this fits (`4096 + 256 = 4352 ≤ 8192` rows). The `gemmini_flush` and `gemmini_extended3_config_ex` are also hoisted outside both loops since format/dataflow are invariant, removing per-block serialization barriers. The `b_end_j0` pointer arithmetic correctly steers the hardware loop to the pre-loaded sub-region for each `j0` block.

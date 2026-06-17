@@ -1,0 +1,130 @@
+```c
+// AUTO-GENERATED outer-tiled MX matmul baseline (113x256x256).
+// Optimization: double-buffer A tiles to overlap mvin with compute,
+// and move gemmini_flush + gemmini_extended3_config_ex outside all loops.
+void solution(void) {
+  int tiles   = BLK / DIM;
+  int tiles_K = MATMUL_K / DIM;
+
+  // Two A buffers for double-buffering: a_base_0 and a_base_1.
+  // Each A buffer needs tiles * tiles_K * DIM scratchpad rows.
+  uint32_t a_base_0 = 0;
+  uint32_t a_base_1 = tiles * tiles_K * DIM;
+
+  // b_base is fixed: top of scratchpad, growing downward.
+  // Must not overlap with the larger of the two A buffers (a_base_1 + tiles*tiles_K*DIM).
+  // b_base = BANK_NUM*BANK_ROWS - tiles_K*tiles*DIM (unchanged from original).
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+
+  int SPAD_DEST = 128;
+
+  // Flush and configure execution ONCE — format never changes across tiles.
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                               1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    int ncols = REAL_N - j0 * BLK;
+    if (ncols > BLK) ncols = BLK;
+    if (ncols <= 0) continue;
+
+    // --- Stage B scales ONCE per j0 ---
+    for (int g = 0; g < MATMUL_K / 32; g++)
+      memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+
+    // --- Mvin B tiles ONCE per j0 into the top of the scratchpad ---
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+    for (int j = 0; j < tiles; j++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin2(
+          (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+          b_base + (k * tiles + j) * DIM, DIM, DIM);
+
+    // --- Prologue: stage A scales and mvin A tiles for i0=0 ---
+    if (BLOCKS_M > 0) {
+      int mrows0 = REAL_M;
+      if (mrows0 > BLK) mrows0 = BLK;
+
+      for (int g = 0; g < MATMUL_K / 32; g++)
+        memcpy(&A_s[g][0], &A_scales_row[g][0], BLK);
+
+      // Load scales for i0=0 (A into sel=0, B into sel=1).
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      // Mvin A tiles for i0=0 into a_base_0.
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + (0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+            a_base_0 + (i * tiles_K + k) * DIM, DIM, DIM);
+    }
+
+    for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+
+      int pad_i = BLK - mrows;
+      int pad_j = BLK - ncols;
+
+      // Current and next A buffer (ping-pong).
+      uint32_t cur_a_base = (i0 % 2 == 0) ? a_base_0 : a_base_1;
+      uint32_t nxt_a_base = (i0 % 2 == 0) ? a_base_1 : a_base_0;
+
+      // --- Prefetch A tiles for i0+1 (issued before compute to overlap DMA with systolic array) ---
+      // The mvin queues in the RoCC pipeline and runs concurrently with gemmini_loop_ws_spad below.
+      if (i0 + 1 < BLOCKS_M) {
+        int mrows_next = REAL_M - (i0 + 1) * BLK;
+        if (mrows_next > BLK) mrows_next = BLK;
+        if (mrows_next > 0) {
+          gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+          for (int i = 0; i < tiles; i++)
+            for (int k = 0; k < tiles_K; k++)
+              gemmini_extended_mvin(
+                (void*)(((elem_t*)A_in) + ((i0 + 1) * BLK + i * DIM) * MATMUL_K + k * DIM),
+                nxt_a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+        }
+      }
+
+      // --- Configure requantized mvout for current tile ---
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                   tiles, tiles, tiles_K, 0, 0, 1);
+
+      // --- Execute fused hardware matmul using cur_a_base ---
+      // Scale loads for the current tile were done either in the prologue (i0=0)
+      // or at the end of the previous iteration (i0>0).
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0,
+                           cur_a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                           false, false, false, false, false,
+                           NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // --- Drain BF16 results from mx_smem to DRAM, row by row ---
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(
+          &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+          SPAD_DEST * 16 + r * BLK, ncols);
+
+      // --- Fence: ensure all mx_read_smem DMA writes are visible before next use ---
+      gemmini_fence();
+
+      // --- Stage A scales for i0+1 and reload into hardware scale memory ---
+      // Must happen after fence and before the next gemmini_loop_ws_spad.
+      if (i0 + 1 < BLOCKS_M) {
+        int mrows_next = REAL_M - (i0 + 1) * BLK;
+        if (mrows_next > BLK) mrows_next = BLK;
+        if (mrows_next > 0) {
+          for (int g = 0; g < MATMUL_K / 32; g++)
+            memcpy(&A_s[g][0], &A_scales_row[g][(i0 + 1) * BLK], BLK);
+
+          // Load A scales for i0+1 (sel=0) and B scales (sel=1, already staged).
+          gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+          gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+        }
+      }
+    }
+  }
+}
+```

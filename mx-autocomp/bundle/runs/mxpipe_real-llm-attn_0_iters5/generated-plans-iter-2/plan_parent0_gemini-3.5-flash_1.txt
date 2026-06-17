@@ -1,0 +1,77 @@
+An elegant and highly effective optimization plan is to **apply Strategy 1: Reduce Data Movement** by eliminating host CPU-side data staging and increasing scratchpad/accumulator utilization.
+
+### Inefficiency Analysis
+The original code suffers from a massive host-CPU bottleneck:
+1. **Host-Side Data Staging (`memcpy` overhead):** Within the nested loop, the CPU performs `memcpy` operations to extract and pack scale factors into local buffers (`A_s` and `B_s`) before every scale load. This introduces significant scalar overhead and ruins performance because host memory copies are highly expensive on this architecture.
+2. **Sub-optimal Scratchpad and Accumulator Utilization:** The program unnecessarily partitions the computation using small `BLK` blocks, which results in near-zero utilization of the 256KB scratchpad and 64KB accumulator. This leads to redundant scale loads and high DMA call frequencies.
+
+### Optimization Plan (Strategy 1: Reduce Data Movement)
+We will scale up the execution tile sizes to the entire size of the matrix ($64 \times 64$), utilizing the hardware's capacities to their fullest and bypassing the CPU staging completely:
+1. **Fit the Entire Problem in SRAM:** For a $64 \times 64$ matrix multiplication, the total required scratchpad rows for $A$ and $B$ are $(4 \times 4 + 4 \times 4) \times 16 = 512$ rows, which is well below the 8192-row capacity. The accumulator rows needed are $4 \times 4 \times 16 = 256$ rows, matching the maximum accumulator capacity perfectly.
+2. **Eliminate Host copies (`memcpy`):** Since we compute the entire matrix in a single hardware loop, we can stream the scale factors directly from their original DRAM arrays (`A_scales_row` and `B_scales_col`) with `gemmini_mx_load_scales`.
+3. **Stream Inputs directly from source buffers:** Load inputs strided directly from `A_in` and `B_in` and read results directly into `C_hw` in one single operation.
+
+Here is the high-performance optimized code.
+
+```c
+void solution(void) {
+  // Tile dimensions for the full matrix (64x64)
+  int tiles_I = MATMUL_M / DIM;
+  int tiles_J = MATMUL_N / DIM;
+  int tiles_K = MATMUL_K / DIM;
+
+  uint32_t a_base = 0;
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_J * tiles_K * DIM;
+  int SPAD_DEST = 128;
+
+  // 1. Configure execution: Weight-stationary MX, BF16 output format
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // 2. Load scale factors directly from global DRAM arrays (no memcpy staging)
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // 3. MVIN A tiles directly from A_in
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  // 4. MVIN B tiles directly from B_in
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base + (j * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  // 5. Configure store and the requantizer
+  gemmini_config_st((MATMUL_N / BF16_PER_WORD) * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // 6. Run fused Weight-Stationary loop over all tiles
+  gemmini_loop_ws_spad(
+      tiles_I, tiles_J, tiles_K,
+      0, 0, 0,
+      a_base,
+      BANK_NUM * BANK_ROWS,
+      0,
+      SPAD_DEST,
+      false, false,
+      false, false, false,
+      NO_ACTIVATION,
+      0, 0,
+      false,
+      0x38);
+
+  // 7. Read BF16-packed results from shared memory into C_hw
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```

@@ -1,0 +1,98 @@
+An elegant and highly effective optimization plan to reduce the execution time of the matrix multiplication kernel.
+
+### Optimization Plan: Reduce Data Movement via Full-Matrix Single-Tile Execution (Strategy 1)
+
+The original code blocks the 64×64×64 matrix multiplication into smaller blocks of size `BLK` (likely 32), resulting in:
+1. **Redundant Data Movement:** Activation and weight matrices are loaded multiple times across the outer loops.
+2. **CPU Overhead:** Substantial CPU cycles are wasted on pre-formatting scale-factor matrices and orchestrating row-by-row DMA reads.
+3. **Command Overhead:** Dozens of small `mvin` and `gemmini_loop_ws_spad` instructions are dispatched.
+
+#### Why the Entire Matrix Fits on Chip
+By analyzing the hardware capacity constraints, we can fit the **entire** 64×64×64 matrix multiplication on the chip simultaneously:
+* **Scratchpad Capacity:** 
+  * $tiles_I = 4$, $tiles_J = 4$, $tiles_K = 4$.
+  * Total rows needed: $(tiles_I \times tiles_K + tiles_J \times tiles_K) \times \text{DIM} = (16 + 16) \times 16 = 512$ rows.
+  * $512 \text{ rows} \le 8192 \text{ rows}$ (128 KB limit).
+* **Accumulator Capacity:** 
+  * Total rows needed: $tiles_I \times tiles_J \times \text{DIM} = 4 \times 4 \times 16 = 256$ rows.
+  * $256 \text{ rows} \le 256 \text{ rows}$ (64 KB limit).
+
+#### Step-by-Step Implementation Changes
+1. **Eliminate Outer Loops:** Remove the `i0` and `j0` blocking loops. Perform the entire 64×64×64 computation in a single pass.
+2. **Eliminate Scale Pre-Formatting:** Load the original `A_scales_row` and `B_scales_col` directly from DRAM, as their memory layout is already correct for the unblocked matrix.
+3. **Maximize DMA Burst Efficiency:** Issue wider `mvin` instructions. Since $tiles_K = 4$ and $tiles_J = 4$, we can load a full row of 4 tiles (64 elements wide) with a single `mvin` command (fully leveraging `MAX_BLOCK_LEN = 4`). This reduces the number of `mvin` calls for $A$ and $B$ to just 4 each.
+4. **Single-Shot Output Drain:** Read the entire output matrix back with a single `gemmini_mx_read_smem` command, eliminating the slow row-by-row loop.
+
+---
+
+### Optimized C Code
+
+```c
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+#include "include/matmul_fp8_64x64.h"
+
+#define GEMMINI_SF_MEM 0x40088000
+#define GEMMINI_SF_MEM_A (GEMMINI_SF_MEM + 0x2000)
+#define GEMMINI_SF_MEM_B GEMMINI_SF_MEM
+#define SMEM 0x40000000
+
+#define DIM 16
+#define ADDR_LEN 32
+
+// BF16 values packed 4 per uint64_t output word
+#define BF16_PER_WORD 4
+#define OUT_COLS (MATMUL_M / BF16_PER_WORD)
+
+typedef uint8_t  elem_t;   // fp8:e4m3 input elements
+typedef uint8_t  welem_t;  // fp8:e4m3 weight elements
+typedef uint64_t out_t;    // 4x bf16 packed per word
+
+void solution(void) {
+  // 1. Configure execution formats (act=FP8, wgt=FP8, out=BF16, weight-stationary)
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 
+                              1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // 2. Load the entire scale factor matrices directly from DRAM
+  gemmini_mx_load_scales((uint64_t)A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)B_scales_col, sizeof(B_scales_col), 1);
+
+  // 3. Define tile dimensions and scratchpad addresses
+  const int tiles_I = MATMUL_M / DIM; // 4
+  const int tiles_J = MATMUL_N / DIM; // 4
+  const int tiles_K = MATMUL_K / DIM; // 4
+
+  const uint32_t a_base = 0;
+  const uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM; // 7936
+  const int SPAD_DEST = 0;
+
+  // 4. Load Activation (A) tiles: 4 wide rows per mvin
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i * DIM) * MATMUL_K),
+                          a_base + (i * tiles_K) * DIM, tiles_K * DIM, DIM);
+  }
+
+  // 5. Load Weight (B) tiles: 4 wide rows per mvin
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int k = 0; k < tiles_K; k++) {
+    gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N),
+                          b_base + (k * tiles_J) * DIM, tiles_J * DIM, DIM);
+  }
+
+  // 6. Configure the output requantizer stride and bounds
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // 7. Compute the entire matmul on chip via the fused hardware loop
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+                       a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                       false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // 8. Drain the entire output to DRAM and wait for completion
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```

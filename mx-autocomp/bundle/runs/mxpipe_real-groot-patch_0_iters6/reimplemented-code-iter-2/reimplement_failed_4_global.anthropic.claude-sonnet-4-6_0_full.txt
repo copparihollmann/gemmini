@@ -1,0 +1,83 @@
+Looking at the code, I need to identify the bug. The key issue is in the B matrix tile layout.
+
+According to the spec:
+- **A tile layout:** `a_base + (i*tiles_K + k)*DIM`
+- **B tile layout:** `b_base + (j*tiles_K + k)*DIM`
+
+But in the current code, B is being laid out as `b_base + (k * tiles + j) * DIM` — this transposes the k and j indices compared to what `gemmini_loop_ws_spad` expects.
+
+The hardware loop expects B at `b_base + (j*tiles_K + k)*DIM`, but the code is storing it at `b_base + (k*tiles + j)*DIM`. These are different orderings.
+
+Also, `gemmini_config_ld` for B should use stride = `MATMUL_N * sizeof(elem_t)` which matches B's row stride in DRAM (B is stored row-major with N columns), and B[k][j] means row `k*DIM`, col `j0*BLK + j*DIM`.
+
+Let me also check: the B mvin DRAM pointer: `B_in[k*DIM][j0*BLK + j*DIM]` — stride is MATMUL_N which is correct.
+
+The fix: change B's scratchpad address from `(k * tiles + j) * DIM` to `(j * tiles_K + k) * DIM`.
+
+```c
+// AUTO-GENERATED outer-tiled MX matmul baseline (41x512x512).
+void solution(void) {
+  gemmini_flush(0);
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+
+      int tiles = BLK / DIM;
+      int tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows;
+      int pad_j = BLK - ncols;
+
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                  1, 1, 0, 0, false, 0, 0, 3, 0);
+
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      // Mvin A tiles: layout a_base + (i*tiles_K + k)*DIM
+      gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM,
+            DIM, DIM);
+
+      // Mvin B tiles: layout b_base + (j*tiles_K + k)*DIM  <-- fixed ordering
+      gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+      for (int j = 0; j < tiles; j++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin2(
+            (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+            b_base + (j * tiles_K + k) * DIM,
+            DIM, DIM);
+
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                   tiles, tiles, tiles_K,
+                                   0, 0, 1);
+
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K,
+                           pad_i, pad_j, 0,
+                           a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                           false, false, false, false, false,
+                           NO_ACTIVATION, 0, 0, false, 0x38);
+
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(
+          &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+          SPAD_DEST * 16 + r * BLK,
+          ncols);
+
+      gemmini_fence();
+    }
+}
+```

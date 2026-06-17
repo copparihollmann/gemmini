@@ -1,0 +1,419 @@
+{'correct': True, 'test_results': {0: True}, 'compiled': True, 'latency_spike_raw': 15607, 'latency': 15607}
+Prev latency: 15341
+New latency: 15607
+Plan: ### Plan of Action
+We will apply **Strategy 1: Sparsity-Guided Block Bypassing** to address the unnecessary execution of matrix tiles that scale down to zero. 
+
+1. **Host-Side Scale Factor Zero-Checking**:
+   - For each block $(i0, j0)$, we will inspect the pre-staged scale factors for both activation block `pre_A_s[i0]` and weight block `pre_B_s[j0]`.
+   - To make the zero-check highly efficient and minimize CPU overhead, we cast the scale arrays to `uint64_t *` and scan them in 8-byte steps.
+   - If either the activation scale block or the weight scale block consists entirely of zeros, the resulting mathematical output for that entire block is guaranteed to be zero.
+
+2. **DRAM Bandwidth and Compute Bypassing**:
+   - When a zero-scale block is detected, we bypass all hardware operations: we skip configuration, scale loading, scratchpad MVINs, compute loops, and SMEM readbacks.
+   - We instead perform a fast host-side `memset` to fill the corresponding region of the output array `C_hw` with zeros.
+   - If the scale blocks are non-zero, we fall back to the standard hardware execution path.
+
+### Optimized Code
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+
+// AUTO-GENERATED outer-tiled MX matmul optimized with Sparsity-Guided Block Bypassing.
+void solution(void) {
+  // Pre-stage scale buffers once for all blocks, amortizing the restriding
+  // cost across all BLOCKS_M * BLOCKS_N iterations.
+  const int GK = MATMUL_K / 32;
+
+  // Static pre-staged scale arrays: [block_idx][scale_group][elem_in_block]
+  // Sized for the maximum number of blocks along each dimension.
+  static uint8_t pre_A_s[BLOCKS_M][MATMUL_K / 32][BLK];
+  static uint8_t pre_B_s[BLOCKS_N][MATMUL_K / 32][BLK];
+
+  // One-time restride: copy from strided A_scales_row[g][i0*BLK] into
+  // contiguous pre_A_s[i0][g][0..BLK-1], done once before the main loop.
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+    for (int g = 0; g < GK; g++)
+      memcpy(&pre_A_s[i0][g][0], &A_scales_row[g][i0 * BLK], BLK);
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++)
+    for (int g = 0; g < GK; g++)
+      memcpy(&pre_B_s[j0][g][0], &B_scales_col[g][j0 * BLK], BLK);
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Partial last M/N block: compute only the real rows/cols, pad the rest.
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      // 1. Sparsity-Guided Block Bypassing: Fast 64-bit zero-checks on scales
+      int A_is_zero = 1;
+      const uint64_t *pre_A_u64 = (const uint64_t *)pre_A_s[i0];
+      const size_t pre_A_u64_len = sizeof(pre_A_s[i0]) / sizeof(uint64_t);
+      for (size_t u = 0; u < pre_A_u64_len; u++) {
+        if (pre_A_u64[u] != 0) {
+          A_is_zero = 0;
+          break;
+        }
+      }
+
+      int B_is_zero = 1;
+      const uint64_t *pre_B_u64 = (const uint64_t *)pre_B_s[j0];
+      const size_t pre_B_u64_len = sizeof(pre_B_s[j0]) / sizeof(uint64_t);
+      for (size_t u = 0; u < pre_B_u64_len; u++) {
+        if (pre_B_u64[u] != 0) {
+          B_is_zero = 0;
+          break;
+        }
+      }
+
+      // If either activation or weight scale block is zero, we zero out the output and bypass the hardware
+      if (A_is_zero || B_is_zero) {
+        for (int r = 0; r < mrows; r++) {
+          memset(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD], 0, ncols * sizeof(uint16_t));
+        }
+        continue;
+      }
+
+      // 2. Active hardware execution path
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+      // Load scale factors using pre-staged contiguous scale pointers
+      gemmini_mx_load_scales((uint64_t)pre_A_s[i0], A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)pre_B_s[j0], B_S_BYTES, 1);
+
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K (full block-aligned tiles)
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+      for (int j = 0; j < tiles; j++)                    // B[k][j0*BLK+j] -> slot (k*tiles + j)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Readout: per-row hardware DMA from smem straight into the bf16-packed row-major output
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+  }
+}
+```
+
+CodeCandidate(parent=CodeCandidate(parent=None,
+plan='''prior autocomp winner (mxpipe_real-groot-patch_0_iters6)''',
+code='''// AUTO-GENERATED outer-tiled MX matmul baseline (41x512x512).
+void solution(void) {
+  // Pre-stage scale buffers once for all blocks, amortizing the restriding
+  // cost across all BLOCKS_M * BLOCKS_N iterations.
+  const int GK = MATMUL_K / 32;
+
+  // Static pre-staged scale arrays: [block_idx][scale_group][elem_in_block]
+  // Sized for the maximum number of blocks along each dimension.
+  static uint8_t pre_A_s[BLOCKS_M][MATMUL_K / 32][BLK];
+  static uint8_t pre_B_s[BLOCKS_N][MATMUL_K / 32][BLK];
+
+  // One-time restride: copy from strided A_scales_row[g][i0*BLK] into
+  // contiguous pre_A_s[i0][g][0..BLK-1], done once before the main loop.
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+    for (int g = 0; g < GK; g++)
+      memcpy(&pre_A_s[i0][g][0], &A_scales_row[g][i0 * BLK], BLK);
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++)
+    for (int g = 0; g < GK; g++)
+      memcpy(&pre_B_s[j0][g][0], &B_scales_col[g][j0 * BLK], BLK);
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Partial last M/N block: compute only the real rows/cols, pad the rest.
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      // PROF accel
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+      // No per-iteration memcpy: use pre-staged contiguous scale pointers directly.
+      gemmini_mx_load_scales((uint64_t)pre_A_s[i0], A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)pre_B_s[j0], B_S_BYTES, 1);
+
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K (full block-aligned tiles)
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+      for (int j = 0; j < tiles; j++)                    // B[k][j0*BLK+j] -> slot (k*tiles + j)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Accelerator-centric readout: per-row hardware DMA from smem straight into the
+      // bf16-packed row-major output (block-internal smem row stride is BLK).
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+}
+''',
+score=15341,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'CPU/host data staging detected (2 memcpy, ~0 scalar copy loops). Host staging is typically the dominant cost on this accelerator and autocomp cannot speed it up directly: mvin tiles STRIDED straight from the source DRAM arrays instead of copying through a host buffer, and keep partial sums in shared memory (bf16 accumulate) rather than accumulating on the CPU.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''### Plan of Action
+We will apply **Strategy 1: Sparsity-Guided Block Bypassing** to address the unnecessary execution of matrix tiles that scale down to zero. 
+
+1. **Host-Side Scale Factor Zero-Checking**:
+   - For each block $(i0, j0)$, we will inspect the pre-staged scale factors for both activation block `pre_A_s[i0]` and weight block `pre_B_s[j0]`.
+   - To make the zero-check highly efficient and minimize CPU overhead, we cast the scale arrays to `uint64_t *` and scan them in 8-byte steps.
+   - If either the activation scale block or the weight scale block consists entirely of zeros, the resulting mathematical output for that entire block is guaranteed to be zero.
+
+2. **DRAM Bandwidth and Compute Bypassing**:
+   - When a zero-scale block is detected, we bypass all hardware operations: we skip configuration, scale loading, scratchpad MVINs, compute loops, and SMEM readbacks.
+   - We instead perform a fast host-side `memset` to fill the corresponding region of the output array `C_hw` with zeros.
+   - If the scale blocks are non-zero, we fall back to the standard hardware execution path.
+
+### Optimized Code
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+
+// AUTO-GENERATED outer-tiled MX matmul optimized with Sparsity-Guided Block Bypassing.
+void solution(void) {
+  // Pre-stage scale buffers once for all blocks, amortizing the restriding
+  // cost across all BLOCKS_M * BLOCKS_N iterations.
+  const int GK = MATMUL_K / 32;
+
+  // Static pre-staged scale arrays: [block_idx][scale_group][elem_in_block]
+  // Sized for the maximum number of blocks along each dimension.
+  static uint8_t pre_A_s[BLOCKS_M][MATMUL_K / 32][BLK];
+  static uint8_t pre_B_s[BLOCKS_N][MATMUL_K / 32][BLK];
+
+  // One-time restride: copy from strided A_scales_row[g][i0*BLK] into
+  // contiguous pre_A_s[i0][g][0..BLK-1], done once before the main loop.
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+    for (int g = 0; g < GK; g++)
+      memcpy(&pre_A_s[i0][g][0], &A_scales_row[g][i0 * BLK], BLK);
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++)
+    for (int g = 0; g < GK; g++)
+      memcpy(&pre_B_s[j0][g][0], &B_scales_col[g][j0 * BLK], BLK);
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Partial last M/N block: compute only the real rows/cols, pad the rest.
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      // 1. Sparsity-Guided Block Bypassing: Fast 64-bit zero-checks on scales
+      int A_is_zero = 1;
+      const uint64_t *pre_A_u64 = (const uint64_t *)pre_A_s[i0];
+      const size_t pre_A_u64_len = sizeof(pre_A_s[i0]) / sizeof(uint64_t);
+      for (size_t u = 0; u < pre_A_u64_len; u++) {
+        if (pre_A_u64[u] != 0) {
+          A_is_zero = 0;
+          break;
+        }
+      }
+
+      int B_is_zero = 1;
+      const uint64_t *pre_B_u64 = (const uint64_t *)pre_B_s[j0];
+      const size_t pre_B_u64_len = sizeof(pre_B_s[j0]) / sizeof(uint64_t);
+      for (size_t u = 0; u < pre_B_u64_len; u++) {
+        if (pre_B_u64[u] != 0) {
+          B_is_zero = 0;
+          break;
+        }
+      }
+
+      // If either activation or weight scale block is zero, we zero out the output and bypass the hardware
+      if (A_is_zero || B_is_zero) {
+        for (int r = 0; r < mrows; r++) {
+          memset(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD], 0, ncols * sizeof(uint16_t));
+        }
+        continue;
+      }
+
+      // 2. Active hardware execution path
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+      // Load scale factors using pre-staged contiguous scale pointers
+      gemmini_mx_load_scales((uint64_t)pre_A_s[i0], A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)pre_B_s[j0], B_S_BYTES, 1);
+
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K (full block-aligned tiles)
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+      for (int j = 0; j < tiles; j++)                    // B[k][j0*BLK+j] -> slot (k*tiles + j)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Readout: per-row hardware DMA from smem straight into the bf16-packed row-major output
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+  }
+}
+```''',
+code='''#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+
+// AUTO-GENERATED outer-tiled MX matmul optimized with Sparsity-Guided Block Bypassing.
+void solution(void) {
+  // Pre-stage scale buffers once for all blocks, amortizing the restriding
+  // cost across all BLOCKS_M * BLOCKS_N iterations.
+  const int GK = MATMUL_K / 32;
+
+  // Static pre-staged scale arrays: [block_idx][scale_group][elem_in_block]
+  // Sized for the maximum number of blocks along each dimension.
+  static uint8_t pre_A_s[BLOCKS_M][MATMUL_K / 32][BLK];
+  static uint8_t pre_B_s[BLOCKS_N][MATMUL_K / 32][BLK];
+
+  // One-time restride: copy from strided A_scales_row[g][i0*BLK] into
+  // contiguous pre_A_s[i0][g][0..BLK-1], done once before the main loop.
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+    for (int g = 0; g < GK; g++)
+      memcpy(&pre_A_s[i0][g][0], &A_scales_row[g][i0 * BLK], BLK);
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++)
+    for (int g = 0; g < GK; g++)
+      memcpy(&pre_B_s[j0][g][0], &B_scales_col[g][j0 * BLK], BLK);
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Partial last M/N block: compute only the real rows/cols, pad the rest.
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      // 1. Sparsity-Guided Block Bypassing: Fast 64-bit zero-checks on scales
+      int A_is_zero = 1;
+      const uint64_t *pre_A_u64 = (const uint64_t *)pre_A_s[i0];
+      const size_t pre_A_u64_len = sizeof(pre_A_s[i0]) / sizeof(uint64_t);
+      for (size_t u = 0; u < pre_A_u64_len; u++) {
+        if (pre_A_u64[u] != 0) {
+          A_is_zero = 0;
+          break;
+        }
+      }
+
+      int B_is_zero = 1;
+      const uint64_t *pre_B_u64 = (const uint64_t *)pre_B_s[j0];
+      const size_t pre_B_u64_len = sizeof(pre_B_s[j0]) / sizeof(uint64_t);
+      for (size_t u = 0; u < pre_B_u64_len; u++) {
+        if (pre_B_u64[u] != 0) {
+          B_is_zero = 0;
+          break;
+        }
+      }
+
+      // If either activation or weight scale block is zero, we zero out the output and bypass the hardware
+      if (A_is_zero || B_is_zero) {
+        for (int r = 0; r < mrows; r++) {
+          memset(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD], 0, ((ncols + 1) / 2) * sizeof(uint32_t));
+        }
+        continue;
+      }
+
+      // 2. Active hardware execution path
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+      // Load scale factors using pre-staged contiguous scale pointers
+      gemmini_mx_load_scales((uint64_t)pre_A_s[i0], A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)pre_B_s[j0], B_S_BYTES, 1);
+
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K (full block-aligned tiles)
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+      for (int j = 0; j < tiles; j++)                    // B[k][j0*BLK+j] -> slot (k*tiles + j)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Readout: per-row hardware DMA from smem straight into the bf16-packed row-major output
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+  }
+}
+''',
+score=None,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='gemini-3.5-flash',
+code_gen_model='qwen.qwen3-coder-480b-a35b-v1:0',
+stdout=None,
+stderr=None)

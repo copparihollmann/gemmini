@@ -1,0 +1,52 @@
+## Analysis of the Original Code
+
+The original code uses a single `gemmini_extended_mvin` port for **both** A and B tiles, issuing them sequentially in two separate loops:
+
+```c
+// Loop 1: A tiles via mvin (port 1)
+for (int i = 0; i < tiles_I; i++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(...A..., a_base + (i*tiles_K + k)*DIM, DIM, DIM);
+
+// Loop 2: B tiles also via mvin (port 1) -- SERIALIZED with A
+for (int j = 0; j < tiles_J; j++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(...B..., b_base + (j*tiles_K + k)*DIM, DIM, DIM);
+```
+
+Both A and B DMA transfers are serialized on the same `k_MVIN` port. The hardware has **three independent mvin ports** (`k_MVIN`, `k_MVIN2`, `k_MVIN3`), so A and B loads can be issued concurrently to different ports and overlap in the DMA engine.
+
+## Selected Strategy: #12 — Use `gemmini_extended_mvin2` for B tiles while simultaneously issuing `gemmini_extended_mvin` for A tiles
+
+### Plan
+
+**What to change:** Replace all `gemmini_extended_mvin` calls for B tiles with `gemmini_extended_mvin2`. Issue A-tile mvins on port 1 (`k_MVIN`) and B-tile mvins on port 2 (`k_MVIN2`) in an **interleaved** loop so both DMA channels are kept busy simultaneously.
+
+**Concrete steps:**
+
+1. **Merge the two separate A and B mvin loops into a single combined loop** over `k` (and `i`/`j`), interleaving A-side and B-side DMA commands so the hardware can overlap them:
+
+```c
+// Configure stride for both ports (same stride: MATMUL_K * sizeof(elem_t))
+gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0); // id=0 → port A
+gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1); // id=1 → port B (mvin2)
+```
+
+2. **Issue A and B mvins in an interleaved pattern.** For each `(k)` slice, send all A-row tiles on port 1 then all B-column tiles on port 2 (or interleave more tightly). The key is that `k_MVIN` and `k_MVIN2` are independent command queues in hardware, so they proceed in parallel:
+
+```c
+for (int k = 0; k < tiles_K; k++) {
+  // A tiles for all i-rows, this k-slice → port 1
+  for (int i = 0; i < tiles_I; i++)
+    gemmini_extended_mvin(A_ptr(i,k), a_base + (i*tiles_K + k)*DIM, DIM, DIM);
+  // B tiles for all j-columns, this k-slice → port 2 (overlaps with A above)
+  for (int j = 0; j < tiles_J; j++)
+    gemmini_extended_mvin2(B_ptr(j,k), b_base + (j*tiles_K + k)*DIM, DIM, DIM);
+}
+```
+
+3. **Use `gemmini_extended3_config_ld` with `id` parameter** to configure the stride for port 2 (`id=1`) separately before issuing mvin2 commands, since mvin2 reads its own stride register.
+
+4. **Keep everything else unchanged**: `gemmini_extended3_config_ex`, scale loads, `gemmini_mxquant_config_mvout`, `gemmini_loop_ws_spad`, `gemmini_mx_read_smem`, and `gemmini_fence()` all remain in the same order and with the same arguments — only the DMA issue pattern changes.
+
+This transformation is safe because the scratchpad addresses for A and B are disjoint (A occupies `[a_base, a_base + tiles_I*tiles_K*DIM)` and B occupies `[b_base, b_base + tiles_J*tiles_K*DIM)` at the top), so concurrent DMA into separate regions cannot conflict. The `gemmini_loop_ws_spad` waits for all pending mvins before executing, so correctness is preserved.

@@ -1,0 +1,122 @@
+## Analysis
+
+The original code performs a 128×128×256 FP8 matrix multiplication. Let me analyze the key parameters:
+
+- M=128, N=128, K=256
+- tiles_I = 128/16 = 8
+- tiles_J = 128/16 = 8  
+- tiles_K = 256/16 = 16
+
+**Current scratchpad usage:**
+- A tiles: tiles_I × tiles_K × DIM = 8 × 16 × 16 = 2048 rows
+- B tiles: tiles_J × tiles_K × DIM = 8 × 16 × 16 = 2048 rows
+- Total: 4096 rows out of 8192 (50% utilization)
+
+The feedback says "Scratchpad utilization is 0KB" which seems like a reporting artifact, but the structure shows the entire A and B matrices are loaded once into scratchpad before compute — that's actually fine for this size.
+
+## Selected Strategy: **Strategy 10 — Reuse loaded B (weight) tiles across multiple I-tile iterations without re-mvin**
+
+## Plan
+
+The current code loads ALL of A (tiles_I × tiles_K tiles) and ALL of B (tiles_J × tiles_K tiles) into the scratchpad in two separate loops, then calls `gemmini_loop_ws_spad` once for the entire I×J×K matmul. This is already doing the right thing structurally — B tiles are reused across all I iterations by the hardware loop.
+
+However, the scratchpad constraint check reveals the actual problem: with tiles_I=8, tiles_J=8, tiles_K=16, the current layout uses (8×16 + 8×16)×16 = 4096 rows, which is only 50% of 8192. We can double the tile reuse by increasing the tile sizes.
+
+**The real inefficiency**: The entire matrix fits in the scratchpad, so there's no tiling — the hardware loop handles everything in one shot. But the issue is that we're not taking advantage of the fact that we could process **larger blocks** by trying different M/N/K splits or using the available scratchpad space more fully.
+
+Looking more carefully at strategy 10 specifically in context of the current code: the code already loads B once and reuses it. But it uses `gemmini_extended_mvin` (mvin port 0) for **both** A and B tiles. The architecture provides **mvin** and **mvin2** as independent DMA ports. By using `mvin` for A and `mvin2` for B, the two loads can be overlapped by the hardware, reducing total load time.
+
+Additionally, the B mvin currently uses the wrong config stride — it calls `gemmini_config_ld(MATMUL_N * sizeof(elem_t))` and uses `gemmini_extended_mvin` (port 0) for B. It should use `gemmini_extended_mvin2` with its own `gemmini_extended3_config_ld(..., id=1)` configuration so A and B DMA ports operate independently and concurrently.
+
+## Concrete Change
+
+1. Configure mvin port 0 (id=0) for A with stride `MATMUL_K * sizeof(elem_t)` and issue all A tile loads via `gemmini_extended_mvin`.
+2. Configure mvin port 1 (id=1) for B with stride `MATMUL_N * sizeof(elem_t)` and issue all B tile loads via `gemmini_extended_mvin2`.
+3. Interleave the A and B mvin commands — issue one A-tile mvin followed immediately by one B-tile mvin, alternating, so both DMA engines stay busy simultaneously rather than fully draining A then starting B.
+4. The `gemmini_config_ld` (id=0) for A is issued once before the interleaved loop; `gemmini_extended3_config_ld(..., id=1)` for B is also issued once. No redundant reconfiguration inside the loop.
+
+This overlaps A-load DMA bandwidth with B-load DMA bandwidth, reducing total mvin latency before compute begins.
+
+```c
+void solution(void) {
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+#ifdef SPIKE_SIM
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+#else
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
+#endif
+
+  // Configure mvin port 0 (id=0) for A tiles: row stride = MATMUL_K bytes
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+  // Configure mvin port 1 (id=1) for B tiles: row stride = MATMUL_N bytes
+  gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+  // Interleave A and B mvins so both DMA ports stay busy simultaneously.
+  // A tiles: a_base + (i*tiles_K + k)*DIM  via mvin  (port 0)
+  // B tiles: b_base + (j*tiles_K + k)*DIM  via mvin2 (port 1)
+  //
+  // We iterate over a flat index covering all (i,k) and (j,k) pairs.
+  // Total A tiles = tiles_I * tiles_K = 8*16 = 128
+  // Total B tiles = tiles_J * tiles_K = 8*16 = 128
+  // Issue them in lockstep: one A then one B per iteration.
+
+  int total_A = tiles_I * tiles_K;
+  int total_B = tiles_J * tiles_K;
+  int total = total_A > total_B ? total_A : total_B;
+
+  for (int idx = 0; idx < total; idx++) {
+    // Issue A tile if within range
+    if (idx < total_A) {
+      int i = idx / tiles_K;
+      int k = idx % tiles_K;
+      elem_t *a_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t a_sp  = a_base + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void*)a_ptr, a_sp, DIM, DIM);
+    }
+    // Issue B tile if within range
+    if (idx < total_B) {
+      int k = idx / tiles_J;
+      int j = idx % tiles_J;
+      elem_t *b_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+      uint32_t b_sp  = b_base + (j * tiles_K + k) * DIM;
+      gemmini_extended_mvin2((void*)b_ptr, b_sp, DIM, DIM);
+    }
+  }
+
+  int SPAD_DEST = 0;
+
+  gemmini_config_st(DIM * sizeof(elem_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // ---- Compute ----
+  gemmini_loop_ws_spad(
+      tiles_I, tiles_J, tiles_K,
+      0, 0, 0,
+      a_base,
+      BANK_NUM * BANK_ROWS,
+      0,
+      SPAD_DEST,
+      false, false,
+      false, false, false,
+      NO_ACTIVATION,
+      0, 0,
+      false,
+      0x38);
+
+  gemmini_fence();
+
+#ifdef SPIKE_SIM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+#else
+  for (int i = 0; i < tiles_J*tiles_I*2; i++) {
+      gemmini_mvout((void*)((uint64_t*) C_hw + i*2*DIM), SPAD_DEST + i*DIM);
+  }
+  gemmini_fence();
+#endif
+
+}
+```

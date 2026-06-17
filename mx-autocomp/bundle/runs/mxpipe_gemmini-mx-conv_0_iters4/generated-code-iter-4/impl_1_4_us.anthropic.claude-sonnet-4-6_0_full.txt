@@ -1,0 +1,127 @@
+```c
+void solution(void) {
+  // Tile counts
+  const int tiles_I = MATMUL_M / DIM;
+  const int tiles_J = MATMUL_N / DIM;
+  const int tiles_K = MATMUL_K / DIM;
+
+  // Scratchpad base addresses
+  const int a_base   = 0;
+  const int b_base   = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+  // Place SPAD_DEST above A region to avoid aliasing with a_base=0
+  const int SPAD_DEST = tiles_I * tiles_K * DIM;
+
+  // Flush stale pipeline state from any prior kernel
+  gemmini_flush(0);
+
+  // Step 1: Configure execution (MX FP8 -> BF16, weight-stationary)
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // Step 2: Load scale factors (A=sel 0, B=sel 1)
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Step 3: Load B tiles using mvin2 (port 1) — done once, amortized over all I tiles
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+  for (int j = 0; j < tiles_J; j++) {
+    int k = 0;
+    for (; k + 4 <= tiles_K; k += 4) {
+      gemmini_extended_mvin2(
+          (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+          b_base + (j * tiles_K + k) * DIM,
+          4 * DIM, DIM);
+    }
+    for (; k < tiles_K; k++) {
+      gemmini_extended_mvin2(
+          (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+          b_base + (j * tiles_K + k) * DIM,
+          DIM, DIM);
+    }
+  }
+
+  // Step 4: Configure mvin port 0 for A tiles
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+
+  // Step 5: Double-buffered im2col + mvin pipeline for A tiles.
+  //
+  // Two im2col buffers, each holding one i-tile (DIM rows x MATMUL_K cols).
+  // While the accelerator DMAs A_buf[i%2] into the scratchpad for tile i,
+  // the CPU concurrently computes im2col for tile i+1 into A_buf[(i+1)%2].
+  // This overlaps CPU im2col work with accelerator DMA, hiding one latency
+  // behind the other.
+  //
+  // Layout: A_buf[b][row][col], b in {0,1}, row in [0,DIM), col in [0,MATMUL_K)
+  static elem_t A_buf[2][DIM][MATMUL_K];
+
+  // Helper macro: fill one DIM-row im2col tile into buf[b]
+  // for i-tile index `ti`, writing rows [0, DIM).
+  #define DO_IM2COL(ti, b)                                                      \
+    do {                                                                         \
+      for (int li = 0; li < DIM; li++) {                                        \
+        int patch_idx = (ti) * DIM + li;                                        \
+        int pi = patch_idx / PATCHES_X;                                         \
+        int pj = patch_idx % PATCHES_X;                                         \
+        for (int c = 0; c < CONV_C; c++)                                        \
+          for (int dy = 0; dy < CONV_KSZ; dy++)                                 \
+            for (int dx = 0; dx < CONV_KSZ; dx++)                               \
+              A_buf[(b)][li][c * CONV_KSZ * CONV_KSZ + dy * CONV_KSZ + dx] =   \
+                  X_in[c][pi * CONV_KSZ + dy][pj * CONV_KSZ + dx];             \
+      }                                                                          \
+    } while (0)
+
+  // Helper macro: issue all K-tile mvins for i-tile `ti` from buf[b]
+  #define DO_MVIN_A(ti, b)                                                      \
+    do {                                                                         \
+      int _k = 0;                                                                \
+      for (; _k + 4 <= tiles_K; _k += 4) {                                     \
+        gemmini_extended_mvin(                                                   \
+            (void*)(((elem_t*)A_buf[(b)]) + _k * DIM),                         \
+            a_base + ((ti) * tiles_K + _k) * DIM,                              \
+            4 * DIM, DIM);                                                      \
+      }                                                                          \
+      for (; _k < tiles_K; _k++) {                                              \
+        gemmini_extended_mvin(                                                   \
+            (void*)(((elem_t*)A_buf[(b)]) + _k * DIM),                         \
+            a_base + ((ti) * tiles_K + _k) * DIM,                              \
+            DIM, DIM);                                                          \
+      }                                                                          \
+    } while (0)
+
+  if (tiles_I > 0) {
+    // Prologue: compute im2col for tile 0 before the pipeline starts
+    DO_IM2COL(0, 0);
+
+    for (int i = 0; i < tiles_I - 1; i++) {
+      // Issue non-blocking mvin for tile i from buffer i%2
+      DO_MVIN_A(i, i % 2);
+      // Overlap: CPU computes im2col for tile i+1 into buffer (i+1)%2
+      // while the accelerator DMA is transferring tile i in the background
+      DO_IM2COL(i + 1, (i + 1) % 2);
+    }
+
+    // Epilogue: issue mvin for the last tile (no im2col to overlap with)
+    DO_MVIN_A(tiles_I - 1, (tiles_I - 1) % 2);
+  }
+
+  #undef DO_IM2COL
+  #undef DO_MVIN_A
+
+  // Step 6: Configure output stride and requantizer.
+  // i_bound, j_bound, k_bound must match the tile counts used in loop_ws_spad.
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+      tiles_I, tiles_J, tiles_K, 0, 0, tiles_K);
+
+  // Step 7: Execute fused tiled weight-stationary matmul over scratchpad.
+  // funct 24 (LOOP_WS_CONFIG_SPAD_AB) is re-issued inside gemmini_loop_ws_spad
+  // macro before every LOOP_WS — the one-shot mx_loop_spad_marker is satisfied.
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+      a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+      false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // Step 8: Drain BF16 results from mx_smem to DRAM, then fence.
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```

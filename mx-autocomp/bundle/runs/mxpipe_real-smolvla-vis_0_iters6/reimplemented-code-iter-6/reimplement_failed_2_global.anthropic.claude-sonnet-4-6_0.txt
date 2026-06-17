@@ -1,0 +1,140 @@
+void solution(void) {
+  int tiles_K = MATMUL_K / DIM;
+
+  // Step 1: Configure execution ONCE
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                              1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  gemmini_config_st(BLK_OUTC * sizeof(out_t));
+
+  // Find best TI, TJ fitting scratchpad and accumulator constraints
+  // Scratchpad: (TI + TJ) * tiles_K * DIM <= BANK_NUM * BANK_ROWS
+  // Accumulator: TI * TJ * DIM <= ACC_ROWS  =>  TI * TJ <= ACC_ROWS/DIM = 16
+  int TI = 1, TJ = 1;
+  {
+    int best = 0;
+    for (int ti = 1; ti <= 16; ti++) {
+      for (int tj = 1; tj <= 16; tj++) {
+        if ((ti + tj) * tiles_K * DIM > BANK_NUM * BANK_ROWS) continue;
+        if (ti * tj * DIM > ACC_ROWS) continue;
+        if (ti * tj > best) {
+          best = ti * tj;
+          TI = ti;
+          TJ = tj;
+        }
+      }
+    }
+  }
+
+  int TI_BLK = TI * DIM;
+  int TJ_BLK = TJ * DIM;
+
+  // B base: top of scratchpad, growing downward.
+  uint32_t b_base = BANK_NUM * BANK_ROWS - TJ * tiles_K * DIM;
+  uint32_t a_base = 0;
+  // SPAD_DEST in mx_smem: use 0 (word offset for gemmini_mx_read_smem is SPAD_DEST*16)
+  int SPAD_DEST = 0;
+
+  int GK = MATMUL_K / 32; // number of scale groups along K
+
+  for (int j0_elem = 0; j0_elem < REAL_N; j0_elem += TJ_BLK) {
+    int ncols_blk = REAL_N - j0_elem;
+    if (ncols_blk > TJ_BLK) ncols_blk = TJ_BLK;
+    int tj_actual = (ncols_blk + DIM - 1) / DIM;
+    if (tj_actual <= 0) continue;
+
+    int pad_j = TJ * DIM - ncols_blk;
+
+    // Mvin B tiles ONCE per J block (B is weight-stationary across I tiles)
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+    for (int j = 0; j < tj_actual; j++) {
+      int j_col = j0_elem + j * DIM;
+      if (j_col >= REAL_N) break;
+      for (int k = 0; k < tiles_K; k++) {
+        gemmini_extended_mvin2(
+          (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + j_col),
+          b_base + (j * tiles_K + k) * DIM,
+          DIM, DIM);
+      }
+    }
+
+    // Set A-stride config once per J block
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+
+    for (int i0_elem = 0; i0_elem < REAL_M; i0_elem += TI_BLK) {
+      int mrows_blk = REAL_M - i0_elem;
+      if (mrows_blk > TI_BLK) mrows_blk = TI_BLK;
+      int ti_actual = (mrows_blk + DIM - 1) / DIM;
+      if (ti_actual <= 0) continue;
+
+      int pad_i = TI * DIM - mrows_blk;
+
+      // Stage A scales for this I block: A_scales_row[GK][MATMUL_M], need rows [i0_elem..i0_elem+mrows_blk)
+      for (int g = 0; g < GK; g++) {
+        for (int r = 0; r < mrows_blk; r++) {
+          A_s[g][r] = A_scales_row[g][i0_elem + r];
+        }
+        // Pad remaining entries with 0
+        for (int r = mrows_blk; r < TI_BLK; r++) {
+          A_s[g][r] = 0;
+        }
+      }
+
+      // Stage B scales for this J block: B_scales_col[GK][MATMUL_N], need cols [j0_elem..j0_elem+ncols_blk)
+      for (int g = 0; g < GK; g++) {
+        for (int c = 0; c < ncols_blk; c++) {
+          B_s[g][c] = B_scales_col[g][j0_elem + c];
+        }
+        // Pad remaining entries with 0
+        for (int c = ncols_blk; c < TJ_BLK; c++) {
+          B_s[g][c] = 0;
+        }
+      }
+
+      // Step 2: Load scales — sel=0 for A (activation), sel=1 for B (weight)
+      gemmini_mx_load_scales((uint64_t)A_s, (size_t)(GK * TI_BLK * sizeof(A_s[0][0])), 0);
+      gemmini_mx_load_scales((uint64_t)B_s, (size_t)(GK * TJ_BLK * sizeof(B_s[0][0])), 1);
+
+      // Step 3: Mvin A tiles for this I block
+      // gemmini_config_ld already set to MATMUL_K * sizeof(elem_t)
+      for (int i = 0; i < ti_actual; i++) {
+        int i_row = i0_elem + i * DIM;
+        if (i_row >= REAL_M) break;
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + i_row * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM,
+            DIM, DIM);
+        }
+      }
+
+      // Step 4: Configure requantized mvout
+      // scale_factors layout: scale_dram + m*N_blocks + bi
+      // Use a dummy scale_factors pointer (or the actual one if available)
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                   TI, TJ, tiles_K,
+                                   0, 0, 1);
+
+      // Step 5: Execute fused hardware matmul
+      gemmini_loop_ws_spad(TI, TJ, tiles_K, pad_i, pad_j, 0,
+                           a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                           false, false, false, false, false,
+                           NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Step 6: Drain BF16 results from mx_smem to DRAM
+      // BF16 results are packed 4 per uint64 word; mx_smem word offset = SPAD_DEST*16
+      // Each row in mx_smem is TJ*DIM BF16 values wide
+      for (int r = 0; r < mrows_blk; r++) {
+        // smem_off_bf16: SPAD_DEST*16 + r * (TJ * DIM)
+        // dram_addr: pointer to output row i0_elem+r, col j0_elem
+        gemmini_mx_read_smem(
+          (uint64_t)(&C_hw[i0_elem + r][j0_elem]),
+          SPAD_DEST * 16 + r * (TJ * DIM),
+          ncols_blk);
+      }
+
+      // Step 7: Fence
+      gemmini_fence();
+    }
+  }
+}

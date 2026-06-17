@@ -1,0 +1,65 @@
+## Analysis
+
+Looking at the code, I need to identify the most impactful single strategy to apply.
+
+**Current code structure:**
+1. First matmul block (Q×KT → S1): computes attention scores
+2. CPU softmax loop: processes S1_hw row by row
+3. Second matmul block (P×V → O): computes output
+
+**Key observation about the softmax loop:**
+```c
+for(int i=0;i<ATT_S;i++){
+    float row[ATT_S], mx=-1e30f;
+    for(int j=0;j<ATT_S;j++){
+        uint16_t b=(uint16_t)((S1_hw[i][j/4]>>((j%4)*16))&0xFFFF);
+        row[j]=bf16f(b);
+        if(row[j]>mx)mx=row[j];
+    }
+    float sm=0.f; 
+    for(int j=0;j<ATT_S;j++){row[j]=expf2(row[j]-mx);sm+=row[j];}
+    ...
+}
+```
+
+The `expf2` function is called `ATT_S * ATT_S` times total (once per element per row). On an in-order RISC-V core, transcendental functions are extremely expensive. **Strategy 10** (lookup table for `expf2`) is highly applicable here.
+
+## Plan: Apply Strategy 10 — Lookup Table for `expf2`
+
+**What to change:**
+
+The softmax computes `expf2(row[j] - mx)` where the argument is a difference of BF16 values. The argument `(row[j] - mx)` is always ≤ 0 (since `mx` is the row maximum), and typically in the range roughly `[-87, 0]` (beyond which exp underflows to zero).
+
+The key insight: since `row[j]` and `mx` are both BF16 values (8-bit exponent, 7-bit mantissa in BF16), their difference has limited precision. We can build a lookup table indexed by the BF16 bit pattern of the argument to `expf2`.
+
+**Concrete implementation plan:**
+
+1. **Build a static lookup table** `exp_lut[65536]` of type `float` (or a smaller table over the relevant range), where `exp_lut[bits]` = `expf((float)bf16_to_float(bits))` for all BF16 bit patterns. Since BF16 arguments to exp that matter are negative (≤ 0), values with exponent indicating large positive arguments can be clamped to 0 or a large value.
+
+2. **However**, 65536 floats = 256KB which is large. A better approach: since the argument is `(row[j] - mx)` where both are BF16, and negative values with |x| > ~88 give effectively 0, we only need to handle BF16 values in `[-88, 0]`. We can use a 256-entry table indexed by the **exponent byte** of the BF16 (upper 8 bits), interpolating with the lower 8 bits — but this adds complexity.
+
+**Simplest correct approach:** Since the BF16 argument has only 8 bits of mantissa, we can use a compact table indexed by the full 16-bit BF16 pattern, but only allocate entries for the relevant range. Instead, use a **256-entry table indexed by the upper 8 bits of the BF16** (sign + exponent + top 1 mantissa bit effectively), and use the lower bits for linear interpolation. 
+
+Actually the most practical approach for RISC-V: **precompute a table of 512 entries** covering the range of possible `(bf16 - bf16_max)` differences. Since the difference is negative BF16, there are at most ~128 distinct exponent values for negative numbers, and we can quantize the 7-bit mantissa to fewer bits.
+
+**Most practical plan:** Build a `static float exp_lut[256]` table where the index is the upper 8 bits of the negative BF16 argument (capturing sign+exponent+high mantissa bit). For each index, store `expf(bf16_from_upper8(index))`. Then replace `expf2(row[j]-mx)` with a table lookup on the upper 8 bits of the BF16 representation of `(row[j]-mx)`, accepting the small quantization error from ignoring the lower 8 mantissa bits (which is within numerical tolerance).
+
+Wait — we need to be careful about numerical tolerance. A cleaner approach:
+
+**Use a 65536-entry uint16→float table** but only allocate it as a static array initialized at first call. This is 256KB for floats — too large. Use `uint16_t→float` with 32-bit floats = 256KB.
+
+**Best practical plan:** Build a **static `float exp_bf16_lut[65536]`** initialized once at program start (or as a static initializer function). Each entry `exp_bf16_lut[k]` = `expf(bf16_to_float(k))`. This is 256KB of data but avoids all transcendental calls in the hot loop. Given `ATT_S*ATT_S` exp calls dominate, this trades one-time init cost for fast table lookups.
+
+However 256KB static may be too large. **Alternative:** Since the argument is always `≤ 0` (we subtract the max), we only need negative BF16 values. Negative BF16 numbers have bit 15 = 1, so indices 32768–65535. We can store a 32768-entry table for negative values + handle positive/zero separately (exp(0)=1, positive shouldn't occur). This is 128KB.
+
+**Final plan (clean and implementable):**
+
+Replace `expf2(x)` calls in the softmax with a lookup: convert `x` back to its BF16 bit pattern (since `x` was read from BF16 storage, it is exactly representable as BF16), then index into a precomputed `static float exp_lut[65536]` table. Initialize this table once before the softmax loop. The lookup replaces the expensive transcendental with a single array index.
+
+Since `row[j]` is derived directly from `bf16f(b)` where `b` is a uint16_t BF16 bit pattern, and `mx` is also one of these BF16 values, the difference `row[j]-mx` may not be exactly representable as BF16. So we **cannot** simply use the BF16 index of the difference.
+
+**Revised final plan:** Keep `row[j]` as float32, compute `row[j] - mx` as float32, then look up in a table indexed by the **float32 representation** — but that's 4B indices, impractical.
+
+**Actually correct and practical plan:** Use a **piecewise linear approximation table** over fixed intervals. Since the argument to exp is in `[-88, 0]`, divide into 256 equal intervals of width 88/256 ≈ 0.34. For each interval store `exp(midpoint)`. This 256-entry table gives ~1 ULP accuracy for the softmax output (within tolerance). Index = `(int)((-arg) * (256.0f/88.0f))`, clamped to [0,255].
+
+This is the cleanest strategy: **256-entry float LUT for expf2**, indexed linearly over `[-88, 0]`, replacing all `expf2` calls in the softmax hot loop with a multiply + integer cast + array load.

@@ -1,0 +1,31 @@
+## Analysis of the Current Code
+
+The current code has an outer loop over `(i0, j0)` blocks. Inside each iteration, it:
+1. Does `memcpy` to stage scale factors (CPU overhead)
+2. Calls `gemmini_flush(0)` every iteration (expensive full flush)
+3. Loads scales, mvins all tiles, runs compute, reads output — all for one `BLK×BLK` output block
+
+The key inefficiency I'll address is **strategy 2: batch scale factor loads with `gemmini_mx_load_scales` once per K-dimension sweep, not per tile**.
+
+## Identifying the Inefficiency
+
+Currently, for **every** `(i0, j0)` block pair, the code:
+- Does `memcpy` to copy per-block scale slices into staging buffers `A_s` and `B_s`
+- Calls `gemmini_mx_load_scales` twice per block
+- Calls `gemmini_flush(0)` per block (resetting all hardware state)
+
+With `BLOCKS_M × BLOCKS_N` iterations, this means scales are reloaded on every single block, even when the K-dimension scale factors are shared across output tiles.
+
+## The Plan
+
+**Observation:** `A_scales_row` has shape `[MATMUL_K/32][REAL_M]` — A's row scales vary with both K-group `g` and row `i0`. `B_scales_col` has shape `[MATMUL_K/32][REAL_N]` — B's column scales vary with K-group `g` and column `j0`. These are per-tile-specific, so they cannot be trivially shared across different `(i0, j0)` pairs without reloading.
+
+However, the **dominant cost** identified is the `memcpy` CPU staging + per-iteration `gemmini_flush`. The strategy is:
+
+1. **Eliminate `gemmini_flush` from the inner loop** — call it once before the outer loops, since flush resets all hardware state and is only needed once at startup.
+2. **Eliminate the `memcpy` staging** — pass `A_scales_row` and `B_scales_col` DRAM pointers directly to `gemmini_mx_load_scales`, with the correct offset and length for just the rows/columns needed by the current `(i0, j0)` tile. The scale memory layout is `[MATMUL_K/32][REAL_M/N]`, so a single `gemmini_mx_load_scales` call with a strided or full-block pointer can replace the memcpy+load pattern. Since `gemmini_mx_load_scales` streams directly from DRAM, the CPU memcpy is entirely redundant.
+3. **Load full A-row and B-col scale arrays once when possible** — restructure so that if we sweep over `j0` in the inner loop for a fixed `i0`, the A scales for that `i0` block don't change across `j0` iterations. We can load A scales once per `i0` and B scales once per `j0`. Restructure as:
+   - Outer loop: `i0` — load A scales for this row-block once
+   - Inner loop: `j0` — load B scales for this col-block, reusing A scales already loaded
+
+This reduces scale loads from `BLOCKS_M × BLOCKS_N × 2` to `BLOCKS_M × BLOCKS_N + BLOCKS_M` total loads, and eliminates all `memcpy` calls. Specifically, `gemmini_extended3_config_ex` and `gemmini_flush` are hoisted outside all loops since format configuration is invariant. A-scale loading (with the direct DRAM pointer into `A_scales_row[g][i0*BLK]`) is hoisted to the `i0` loop, since A scales only depend on `i0`. B-scale loading remains in the `j0` loop since B scales depend on `j0`. The `gemmini_flush` moves entirely outside both loops.

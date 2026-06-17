@@ -1,0 +1,111 @@
+Looking at the error, the issue is on line 37 of the generated file, which corresponds to the static array declaration with a comment inside the brackets:
+
+```c
+static uint8_t cur_A_s[/* GK */ (MATMUL_K / 32) * BLK]
+```
+
+The comment `/* GK */` inside the array size brackets is causing a parse error. Also, `scale_factors` is being treated as a macro somewhere (the error says "note: in expansion of macro 'scale_factors'"), so we need to rename it. Additionally, the `C_hw` output needs proper addressing.
+
+Let me fix all these issues:
+
+```c
+void solution(void) {
+  const int GK = MATMUL_K / 32;
+
+  static uint8_t cur_A_s[(MATMUL_K / 32) * BLK] __attribute__((aligned(64)));
+  static uint8_t cur_B_s[(MATMUL_K / 32) * BLK] __attribute__((aligned(64)));
+
+  static uint32_t mx_scale_buf[BLK * BLK / 32] __attribute__((aligned(32)));
+
+  const int tiles   = BLK / DIM;
+  const int tiles_K = MATMUL_K / DIM;
+  const uint32_t a_base  = 0;
+  const uint32_t b_base  = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+  const int      SPAD_DEST = 128;
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    int mrows = REAL_M - i0 * BLK;
+    if (mrows > BLK) mrows = BLK;
+    if (mrows <= 0) continue;
+
+    const int pad_i = BLK - mrows;
+
+    for (int g = 0; g < GK; g++)
+      memcpy(&cur_A_s[g * BLK], &A_scales_row[g][i0 * BLK], BLK);
+
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                1, 1, 0, 0, false, 0, 0, 3, 0);
+
+    gemmini_mx_load_scales((uint64_t)cur_A_s, A_S_BYTES, 0);
+
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int ncols = REAL_N - j0 * BLK;
+      if (ncols > BLK) ncols = BLK;
+      if (ncols <= 0) continue;
+
+      const int pad_j = BLK - ncols;
+
+      for (int g = 0; g < GK; g++)
+        memcpy(&cur_B_s[g * BLK], &B_scales_col[g][j0 * BLK], BLK);
+
+      /* Programming model sequence:
+         config_ex → load_A_scales → load_B_scales → mvin A → mvin B
+         → mxquant_config → loop_ws_spad → read_smem → fence */
+
+      /* Step 2b: Load B (weight) scales — sel=1 for B weights */
+      gemmini_mx_load_scales((uint64_t)cur_B_s, B_S_BYTES, 1);
+
+      /* Step 4: MVIN A tiles into scratchpad */
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM,
+            DIM, DIM);
+
+      /* Step 4b: MVIN B tiles into scratchpad */
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int j = 0; j < tiles; j++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin2(
+            (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+            b_base + (k * tiles + j) * DIM,
+            DIM, DIM);
+
+      /* Step 5: Configure requantized mvout */
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)mx_scale_buf,
+                                   tiles, tiles, tiles_K,
+                                   0, 0,
+                                   1);
+
+      /* Step 6: Fused weight-stationary tiled matmul */
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0,
+                           a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                           false, false, false, false, false,
+                           NO_ACTIVATION, 0, 0, false, 0x38);
+
+      /* Step 7: Drain BF16-packed results from mx_smem to DRAM */
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(
+          &C_hw[i0 * BLK + r][j0 * BLK / BF16_PER_WORD],
+          SPAD_DEST * 16 + r * BLK,
+          ncols);
+
+      gemmini_fence();
+
+      /* Re-issue config_ex and reload A scales for next j0 iteration */
+      if (j0 + 1 < BLOCKS_N) {
+        int ncols_next = REAL_N - (j0 + 1) * BLK;
+        if (ncols_next > 0) {
+          gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                      1, 1, 0, 0, false, 0, 0, 3, 0);
+          gemmini_mx_load_scales((uint64_t)cur_A_s, A_S_BYTES, 0);
+        }
+      }
+    }
+  }
+}
+```

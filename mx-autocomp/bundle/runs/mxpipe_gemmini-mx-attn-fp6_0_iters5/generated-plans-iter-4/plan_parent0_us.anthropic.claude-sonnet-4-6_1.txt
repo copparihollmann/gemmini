@@ -1,0 +1,36 @@
+## Analysis
+
+Looking at the code, I need to identify which strategy will have the most impact.
+
+**Current code structure:**
+- Phase 1: Q×KT with `ti=4, tj=4, tk=4`
+- Phase 2: P×V with `ti=4, tj=2, tk=8`
+
+**Strategy 11 analysis:** `uselut=1` is set in both phases, but only A and B LUTs (sel=0 and sel=1) are loaded. The C/output LUT (sel=2) is never loaded. Since `out_mx_fmt=3` (BF16), the output LUT may not be needed for correctness — but the strategy specifically says this "may produce incorrect requantization." However, looking at the reference `matmul_ws_mx_generic.c`, it loads `C_lut` with sel=2. This could affect correctness/performance.
+
+**Strategy 13 analysis:** `lut_update_granularity` is currently 8. For Phase 1: `max(ti,tj) = max(4,4) = 4`. Wait — larger G = fewer refreshes = faster, so we want the *largest* value consistent with correctness. The strategy says to use `max(ti,tj)`. Currently 8 is already larger than `max(4,4)=4`. For Phase 2: `max(4,2)=4`, also less than 8. So 8 is already aggressive.
+
+**Strategy 10 analysis:** The softmax loop has a branch `(i & 1) == 0` for nibble packing with read-modify-write. Pre-zeroing `P_hw` and splitting into even/odd loops eliminates the branch and the read-modify-write pattern. With ATT_S=128 iterations, this is CPU work between the two accelerator phases.
+
+**Strategy 8 analysis:** There are `gemmini_fence()` calls inside the MVIN loops in the original code... wait, looking again at the provided `solution()` code — there are NO intermediate fences in the mvin loops (unlike `matmul_ws_mx_generic.c`). Only one fence at the end of each phase. So this strategy is already applied.
+
+**Strategy 10** is clearly applicable: the softmax loop contains a read-modify-write with a branch `(i & 1) == 0`. Pre-zeroing `P_hw` and separating even/odd row packing eliminates the conditional branch and the read-modify-write overhead on every iteration.
+
+## Plan: Apply Strategy 10
+
+**What to change:** In the softmax CPU loop, replace the conditional nibble-packing:
+```c
+if ((i & 1) == 0)
+  P_hw[i >> 1][j] = (P_hw[i >> 1][j] & 0xF0) | idx;
+else
+  P_hw[i >> 1][j] = (P_hw[i >> 1][j] & 0x0F) | (idx << 4);
+```
+
+With two separate passes:
+1. **Pre-zero `P_hw`** before the softmax loop using `memset(P_hw, 0, sizeof(P_hw))`.
+2. **Even rows (`i` even):** directly OR the low nibble: `P_hw[i >> 1][j] |= idx;` (no mask needed since byte is 0 or only high nibble is set).
+3. **Odd rows (`i` odd):** directly OR the high nibble: `P_hw[i >> 1][j] |= (idx << 4);`
+
+Since `P_hw` is pre-zeroed, we can simplify to `|=` without masking. The branch is eliminated entirely. We can also **separate the single loop into two loops** — one for even `i` (0, 2, 4, ...) and one for odd `i` (1, 3, 5, ...) — making each loop unconditional and enabling better compiler optimization (vectorization, simplified addressing).
+
+**Specifically:** Split the `for (int i = 0; i < ATT_S; i++)` softmax loop's packing section into two separate outer loops over even and odd rows, eliminating the `(i & 1)` branch on every `j` iteration. This reduces branch mispredictions and read-modify-write conflicts across `ATT_S * GKP * 32 = 128 * 4 * 32 = 16384` iterations of the inner packing body.

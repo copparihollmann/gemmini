@@ -1,0 +1,57 @@
+## Strategy: Fuse Both Matmuls (Q×Kᵀ and P×V) into a Single Outer Loop with Shared Scale/LUT Configuration State
+
+### Analysis of the Current Code
+
+Currently, the `solution()` function runs two entirely separate matmul blocks per KV-tile `t`:
+1. **Block 1**: Q×Kᵀ → S scores (fp6 input, BF16 output)
+2. **Block 2**: P×V → O partial sums (fp6 input, BF16 output)
+
+Each block independently calls:
+- `gemmini_flush(0)` (pipeline drain — expensive)
+- `gemmini_extended3_config_ex(...)` with **identical arguments**
+- `gemmini_mx_load_lut(...)` for its LUTs
+- `gemmini_config_ld(...)` / mvin loops
+- `gemmini_mxquant_config_mvout(...)`
+- `gemmini_loop_ws_spad(...)`
+- `gemmini_mx_read_smem(...)` + `gemmini_fence()`
+
+The CPU-side softmax/quantization loop between Block 1 and Block 2 constructs `P_hw` and `P_scales` entirely in scalar code, one element at a time, before Block 2 can proceed.
+
+### The New Strategy: **Software-Pipeline the CPU Quantization Loop Against the Next KV-Tile's Scale Load and Mvin Setup**
+
+**Key observation**: After `gemmini_mx_read_smem(&S1_hw, ...)` + `gemmini_fence()` completes for tile `t`, the CPU must:
+1. Read `S1_hw` row-by-row to compute softmax and fill `P_hw`/`P_scales` (pure scalar work, ~ATT_S×BT iterations)
+2. Then issue Block 2's gemmini setup for P×V
+
+During step 1, the gemmini hardware is **completely idle**. This is a pure CPU bottleneck with zero accelerator utilization.
+
+The strategy is to **interleave the scalar softmax/quantization loop with early gemmini instructions for the P×V matmul** that don't require `P_hw`/`P_scales` to be ready yet:
+
+Specifically, the P×V block's **V tile mvins** (`gemmini_extended_mvin` for `V_in`) do **not** depend on `P_hw` or `P_scales` at all — they only depend on `t`. These mvin commands can be issued **before** the softmax loop finishes, as soon as `gemmini_fence()` completes. The mvin DMA to scratchpad will run in the background while the CPU executes the scalar softmax loop, effectively hiding the V-tile load latency behind CPU work.
+
+### Concrete Change
+
+Reorder the operations within each `t` iteration as follows:
+
+```
+[current order]
+1. Block 1 setup + compute + read_smem + fence
+2. Scalar softmax loop (builds P_hw, P_scales)   ← CPU stalls gemmini
+3. Block 2 setup (config, load_scales, load_lut, mvin P, mvin V) + compute + read_smem + fence
+
+[new order]
+1. Block 1 setup + compute + read_smem + fence
+2. Issue Block 2's config_ex, load_lut (V/P luts, invariant), config_ld, mvin V tiles    ← starts DMA early
+3. Scalar softmax loop (builds P_hw, P_scales)   ← overlaps with V mvin DMA
+4. Issue Block 2's load_scales (P_scales now ready), mvin P tiles, mxquant_config_mvout, loop_ws_spad, read_smem + fence
+```
+
+This is valid because:
+- `gemmini_mx_load_lut` for V and P LUTs does not depend on `P_hw`/`P_scales` (these LUTs are format-invariant and already computed globally).
+- `gemmini_config_ld` and the V mvin commands only depend on `t` and `V_in`, both already known.
+- `gemmini_mx_load_scales` for P (sel=0) must wait until `P_scales` is fully written by the softmax loop — but V scale load (sel=1) only depends on `t` and can be issued immediately after fence.
+- The programming model sequence is preserved: config_ex → load_scales (both A and B) → load_lut → mvin → mxquant_config_mvout → loop_ws_spad — **but** we split the mvin into two phases (V first, P second), issuing V mvins early and P mvins after the softmax loop. The hardware queues mvin commands; they execute in order, and `loop_ws_spad` will not begin until all preceding mvins complete.
+
+### Why This Reduces Latency
+
+The scalar softmax loop over ATT_S=128 rows × BT columns is the dominant CPU bottleneck between the two matmuls. Currently it runs sequentially after the gemmini pipeline drains. With this change, the V-tile DMA (loading `tiles_K × tiles_J` = `(BT/16) × (ATT_D/16/2)` scratchpad rows) overlaps with the softmax computation on the CPU. On the Spike simulator, instruction-level overlap between RoCC DMA and integer/FP scalar instructions directly reduces the wall-clock cycle count of the critical path between Block 1 output and Block 2 compute start.

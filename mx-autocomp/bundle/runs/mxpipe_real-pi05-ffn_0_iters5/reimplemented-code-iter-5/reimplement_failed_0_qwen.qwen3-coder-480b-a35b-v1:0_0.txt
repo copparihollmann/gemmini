@@ -1,0 +1,110 @@
+// AUTO-GENERATED outer-tiled MX matmul optimized via hoisted configuration (256x256x512).
+void solution(void) {
+  // Hoist invariant Gemmini configuration and flush outside all loops
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // Pre-format scale factor matrices to eliminate CPU-side staging in the hot loop
+  static uint8_t A_scales_perf[BLOCKS_M][MATMUL_K / 32][BLK];
+  static uint8_t B_scales_perf[BLOCKS_N][MATMUL_K / 32][BLK];
+
+  // One-time pre-formatting before main loops start
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int g = 0; g < MATMUL_K / 32; g++) {
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+      
+      // Only copy actual data, handle partial blocks correctly
+      for (int i = 0; i < mrows; i++) {
+        A_scales_perf[i0][g][i] = A_scales_row[g][i0 * BLK + i];
+      }
+      // Pad with zeros for partial blocks if needed
+      for (int i = mrows; i < BLK; i++) {
+        A_scales_perf[i0][g][i] = 0;
+      }
+    }
+  }
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    for (int g = 0; g < MATMUL_K / 32; g++) {
+      int ncols = REAL_N - j0 * BLK;
+      if (ncols > BLK) ncols = BLK;
+      if (ncols <= 0) continue;
+      
+      // Only copy actual data, handle partial blocks correctly
+      for (int j = 0; j < ncols; j++) {
+        B_scales_perf[j0][g][j] = B_scales_col[g][j0 * BLK + j];
+      }
+      // Pad with zeros for partial blocks if needed
+      for (int j = ncols; j < BLK; j++) {
+        B_scales_perf[j0][g][j] = 0;
+      }
+    }
+  }
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    int mrows = REAL_M - i0 * BLK; 
+    if (mrows > BLK) mrows = BLK; 
+    if (mrows <= 0) continue;
+
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Partial last M/N block: compute only the real rows/cols, pad the rest.
+      int ncols = REAL_N - j0 * BLK; 
+      if (ncols > BLK) ncols = BLK; 
+      if (ncols <= 0) continue;
+
+      int tiles_I = (mrows + DIM - 1) / DIM;  // Ceiling division
+      int tiles_J = (ncols + DIM - 1) / DIM;  // Ceiling division
+      int tiles_K = MATMUL_K / DIM;
+      
+      // Correct scratchpad layout calculation
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_J * tiles_K * DIM;
+      int SPAD_DEST = 0;  // Use beginning of accumulator
+      
+      int pad_i = tiles_I * DIM - mrows;
+      int pad_j = tiles_J * DIM - ncols;
+
+      // Direct DMA stream from pre-formatted scale matrices in DRAM
+      int a_scale_bytes = ((MATMUL_K / 32) * BLK + 3) & ~3;  // Align to 4 bytes
+      int b_scale_bytes = ((MATMUL_K / 32) * BLK + 3) & ~3;  // Align to 4 bytes
+      gemmini_mx_load_scales((uint64_t)&A_scales_perf[i0][0][0], a_scale_bytes, 0);
+      gemmini_mx_load_scales((uint64_t)&B_scales_perf[j0][0][0], b_scale_bytes, 1);
+
+      // Batched MVIN for A (respecting MAX_BLOCK_LEN=4)
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles_I; i++) {
+        for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+          int block_len = (k + MAX_BLOCK_LEN > tiles_K) ? (tiles_K - k) : MAX_BLOCK_LEN;
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, block_len * DIM, DIM);
+        }
+      }
+
+      // Batched MVIN for B (respecting MAX_BLOCK_LEN=4)
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int k = 0; k < tiles_K; k++) {
+        for (int j = 0; j < tiles_J; j += MAX_BLOCK_LEN) {
+          int block_len = (j + MAX_BLOCK_LEN > tiles_J) ? (tiles_J - j) : MAX_BLOCK_LEN;
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (j * tiles_K + k) * DIM, block_len * DIM, DIM);
+        }
+      }
+
+      gemmini_config_st(ncols * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, pad_i, pad_j, 0, a_base, b_base, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Read results correctly accounting for BF16 packing (4 per uint64)
+      int output_words_per_row = (ncols + BF16_PER_WORD - 1) / BF16_PER_WORD;
+      for (int r = 0; r < mrows; r++) {
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][j0 * BLK / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * tiles_J * DIM, 
+                             ncols);
+      }
+      gemmini_fence();
+    }
+  }
+}

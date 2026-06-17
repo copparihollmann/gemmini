@@ -1,0 +1,100 @@
+## Analysis of Current Code
+
+Looking at the current code, the main inefficiency is the **two-pass approach**: first a full im2col materialization into `A_buf` (all patches × all input channels × kernel elements), then a separate full mvin loop. This creates:
+1. Peak memory traffic to `A_buf` written then read back
+2. Two complete passes over the A data
+
+The key observation is that **strategy 11** (fuse im2col and mvin) directly addresses this: instead of writing the full `A_buf` first and then doing all the mvins, we can compute each row of `A_buf` and immediately issue the mvin for that tile row, without waiting to fill the entire buffer.
+
+## Plan: Strategy 11 — Fuse im2col and mvin
+
+**What to change:**
+
+Instead of the current two-phase approach:
+1. Phase 1: Fill entire `A_buf[PATCHES][MATMUL_K]` via nested loops
+2. Phase 2: Mvin all A tiles, then mvin all B tiles
+
+We restructure to process tile-by-tile:
+
+**New structure:**
+- The outer loops iterate over `(i, k)` tile indices
+- For each `(i, k)` tile, compute only the `DIM × DIM` patch of `A_buf` needed (i.e., the 16 rows of patches × 16 columns of K corresponding to that tile), then immediately issue `gemmini_extended_mvin` for that tile into `a_base + (i*tiles_K + k)*DIM`
+- After all A tiles are issued, do the B mvin loop as before
+- This eliminates the full two-pass: each `A_buf` row is written once and read once immediately, keeping it hot in cache
+
+**Specifically:**
+- Remove the full im2col nested loop at the top
+- Replace with a `for (i) for (k)` loop that:
+  - Fills only rows `[i*DIM .. (i+1)*DIM)` and columns `[k*DIM .. (k+1)*DIM)` of `A_buf` using the im2col index mapping
+  - Immediately calls `gemmini_extended_mvin` for that `DIM×DIM` block
+- The `A_buf` can now be reduced to just `DIM × MATMUL_K` (one row of tiles) or even `DIM × DIM` (one tile at a time), drastically reducing peak buffer size and improving cache utilization
+
+**Index mapping reminder:**  
+Row `r = pi*PATCHES_X + pj` maps to patch `(pi, pj)`.  
+Column `c_idx = c*CONV_KSZ*CONV_KSZ + dy*CONV_KSZ + dx`.  
+Value is `X_in[c][pi*CONV_KSZ + dy][pj*CONV_KSZ + dx]`.
+
+For tile `(i, k)`:
+- Row base: `i*DIM` → patches `[i*DIM .. i*DIM+DIM)`
+- Col base: `k*DIM` → K-columns `[k*DIM .. k*DIM+DIM)`
+
+The im2col for a single `DIM×DIM` tile fills `A_buf[0..DIM][0..DIM]` (using a small scratch buffer), then mvins it.
+
+```c
+void solution(void) {
+    // Use a small tile-sized A buffer (one tile at a time)
+    static elem_t A_tile[DIM][DIM] __attribute__((aligned(64)));
+
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+    // Configure mvin port 0 for A tiles: stride = DIM bytes (tile width)
+    gemmini_extended3_config_ld(DIM * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+
+    // Fused im2col + mvin: compute one DIM×DIM A tile, immediately mvin it
+    for (int i = 0; i < tiles_I; i++) {
+        for (int k = 0; k < tiles_K; k++) {
+            // Fill A_tile[DIM][DIM] with im2col patch for tile (i,k)
+            for (int r = 0; r < DIM; r++) {
+                int row = i * DIM + r;          // global patch row index
+                int pi = row / PATCHES_X;
+                int pj = row % PATCHES_X;
+                for (int s = 0; s < DIM; s++) {
+                    int col = k * DIM + s;      // global K-column index
+                    int c  = col / (CONV_KSZ * CONV_KSZ);
+                    int rem = col % (CONV_KSZ * CONV_KSZ);
+                    int dy = rem / CONV_KSZ;
+                    int dx = rem % CONV_KSZ;
+                    A_tile[r][s] = X_in[c][pi * CONV_KSZ + dy][pj * CONV_KSZ + dx];
+                }
+            }
+            // Immediately mvin this tile into the scratchpad
+            uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+            gemmini_extended_mvin((void*)A_tile, sp_addr, DIM, DIM);
+        }
+    }
+
+    // B mvin loop (unchanged)
+    gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+    for (int k = 0; k < tiles_K; k++)
+        for (int j = 0; j < tiles_J; j++)
+            gemmini_extended_mvin2((void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+                                   b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+                         a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                         false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+    gemmini_fence();
+}
+```
+
+Key benefits:
+- `A_buf` shrinks from `PATCHES × MATMUL_K` bytes to just `DIM × DIM = 256` bytes, fitting entirely in L1 cache
+- Each im2col-computed element is consumed by mvin immediately after being written (no re-read from DRAM/LLC)
+- Reduces total memory traffic to `A_buf` from 2× to 1× (write-then-immediately-DMA vs. write-all then read-all)
+- The mvin stride changes from `MATMUL_K` to `DIM` since we now use the compact `A_tile` buffer

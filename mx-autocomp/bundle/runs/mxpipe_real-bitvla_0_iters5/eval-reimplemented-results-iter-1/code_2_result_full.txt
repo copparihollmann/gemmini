@@ -1,0 +1,210 @@
+{'correct': False}
+Prev latency: 1596
+New latency: N/A
+Plan: An elegant and highly effective optimization plan to address the inefficiencies in the baseline code.
+
+### Optimization Plan
+
+We will apply **Strategy 1: eliminate redundant computation** to significantly reduce CPU execution overhead, instruction dispatch latency, and loop overhead.
+
+1. **Hoist Loop-Invariant Expressions**: 
+   In the nested loops for loading matrices $A$ and $B$, address and offset calculations such as `i * DIM * MATMUL_K`, `i * tiles_K`, `k * DIM * MATMUL_N`, and `k * tiles_J` are recalculated on every inner loop iteration. We will hoist these invariant expressions to the outer loops to eliminate redundant CPU computation.
+
+2. **Utilize Block MVIN (Coalesced DMA Loads)**:
+   The hardware supports loading up to `MAX_BLOCK_LEN = 4` consecutive $16 \times 16$ tiles in a single DMA instruction by setting `cols = 4 * DIM` (64 bytes). 
+   - For Matrix $A$, adjacent tiles along the $K$ dimension are contiguous in both DRAM and the scratchpad layout. Since `tiles_K` (16) is a multiple of 4, we can restructure the loop to step $k$ by 4 and perform a single coalesced `gemmini_extended_mvin` with `cols = 4 * DIM`.
+   - For Matrix $B$, we will swap the loop order to make $j$ the inner loop. Adjacent tiles along the $J$ dimension are contiguous in DRAM and consecutive in the scratchpad layout (`b_base + (k * tiles_J + j) * DIM`). Since `tiles_J` (16) is a multiple of 4, we can step $j$ by 4 and issue a single coalesced `gemmini_extended_mvin` with `cols = 4 * DIM`.
+
+This strategy eliminates 75% of the MVIN instructions and their associated CPU branch and address-calculation overhead, vastly improving overall execution time.
+
+---
+
+### Optimized Code
+
+```c
+// Optimized MX matmul kernel (32x256x256, fp8:e4m3).
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // mvin coalesced block tiles of A (block-aligned 4 * DIM x DIM -> 4x fewer DMA commands)
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K
+  for (int i = 0; i < tiles_I; i++) {
+    int i_dim_matmul_k = i * DIM * MATMUL_K;
+    int i_tiles_k = i * tiles_K;
+    for (int k = 0; k < tiles_K; k += 4) {
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + i_dim_matmul_k + k * DIM),
+                            a_base + (i_tiles_k + k) * DIM, 4 * DIM, DIM);
+    }
+  }
+
+  // mvin coalesced block tiles of B (block-aligned 4 * DIM x DIM -> 4x fewer DMA commands)
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+  for (int k = 0; k < tiles_K; k++) {
+    int k_dim_matmul_n = k * DIM * MATMUL_N;
+    int k_tiles_j = k * tiles_J;
+    for (int j = 0; j < tiles_J; j += 4) {
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + k_dim_matmul_n + j * DIM),
+                            b_base + (k_tiles_j + j) * DIM, 4 * DIM, DIM);
+    }
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, PAD_I, PAD_J, PAD_K, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // read only the REAL rows (smem row stride is the padded MATMUL_N)
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, REAL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED baseline MX matmul kernel (32x256x256, fp8:e4m3).
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // mvin FULL padded tiles (block-aligned DIMxDIM -> 1 cheap DMA/tile; sub-DIM mvin is modeled
+  // as a slow/unaligned path on spike). The header holds padded data; loop_ws pad_I/pad_J/pad_K
+  // then skip the padded rows/cols in COMPUTE, so the real M*N*K result is unaffected.
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K
+  for (int i = 0; i < tiles_I; i++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+  // B tile (k,j) = B_in[k][j] (stride N) into scratchpad slot (k*tiles_J + j) —
+  // the layout gemmini\'s MX loop reads (B_t = B_sp + (k*TJ + j)*DIM). The old
+  // (j*tiles_K + k) slot was a transpose: correct only when N==K, garbage otherwise.
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+  for (int j = 0; j < tiles_J; j++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + j * DIM),
+                            b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, PAD_I, PAD_J, PAD_K, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  // read only the REAL rows (smem row stride is the padded MATMUL_N); padded rows stay 0 (memset).
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, REAL_M * MATMUL_N);
+  gemmini_fence();
+}
+''',
+score=1596,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'Accelerator-bound: compute and data-movement look balanced; tune tiling / scratchpad occupancy for more overlap.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''An elegant and highly effective optimization plan to address the inefficiencies in the baseline code.
+
+### Optimization Plan
+
+We will apply **Strategy 1: eliminate redundant computation** to significantly reduce CPU execution overhead, instruction dispatch latency, and loop overhead.
+
+1. **Hoist Loop-Invariant Expressions**: 
+   In the nested loops for loading matrices $A$ and $B$, address and offset calculations such as `i * DIM * MATMUL_K`, `i * tiles_K`, `k * DIM * MATMUL_N`, and `k * tiles_J` are recalculated on every inner loop iteration. We will hoist these invariant expressions to the outer loops to eliminate redundant CPU computation.
+
+2. **Utilize Block MVIN (Coalesced DMA Loads)**:
+   The hardware supports loading up to `MAX_BLOCK_LEN = 4` consecutive $16 \times 16$ tiles in a single DMA instruction by setting `cols = 4 * DIM` (64 bytes). 
+   - For Matrix $A$, adjacent tiles along the $K$ dimension are contiguous in both DRAM and the scratchpad layout. Since `tiles_K` (16) is a multiple of 4, we can restructure the loop to step $k$ by 4 and perform a single coalesced `gemmini_extended_mvin` with `cols = 4 * DIM`.
+   - For Matrix $B$, we will swap the loop order to make $j$ the inner loop. Adjacent tiles along the $J$ dimension are contiguous in DRAM and consecutive in the scratchpad layout (`b_base + (k * tiles_J + j) * DIM`). Since `tiles_J` (16) is a multiple of 4, we can step $j$ by 4 and issue a single coalesced `gemmini_extended_mvin` with `cols = 4 * DIM`.
+
+This strategy eliminates 75% of the MVIN instructions and their associated CPU branch and address-calculation overhead, vastly improving overall execution time.
+
+---
+
+### Optimized Code
+
+```c
+// Optimized MX matmul kernel (32x256x256, fp8:e4m3).
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // mvin coalesced block tiles of A (block-aligned 4 * DIM x DIM -> 4x fewer DMA commands)
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K
+  for (int i = 0; i < tiles_I; i++) {
+    int i_dim_matmul_k = i * DIM * MATMUL_K;
+    int i_tiles_k = i * tiles_K;
+    for (int k = 0; k < tiles_K; k += 4) {
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + i_dim_matmul_k + k * DIM),
+                            a_base + (i_tiles_k + k) * DIM, 4 * DIM, DIM);
+    }
+  }
+
+  // mvin coalesced block tiles of B (block-aligned 4 * DIM x DIM -> 4x fewer DMA commands)
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+  for (int k = 0; k < tiles_K; k++) {
+    int k_dim_matmul_n = k * DIM * MATMUL_N;
+    int k_tiles_j = k * tiles_J;
+    for (int j = 0; j < tiles_J; j += 4) {
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + k_dim_matmul_n + j * DIM),
+                            b_base + (k_tiles_j + j) * DIM, 4 * DIM, DIM);
+    }
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, PAD_I, PAD_J, PAD_K, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // read only the REAL rows (smem row stride is the padded MATMUL_N)
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, REAL_M * MATMUL_N);
+  gemmini_fence();
+}
+```''',
+code='''// Optimized MX matmul kernel (32x256x256, fp8:e4m3).
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // mvin coalesced block tiles of A (block-aligned 3 * DIM x DIM -> fits within 6-bit field)
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K
+  for (int i = 0; i < tiles_I; i++) {
+    int i_dim_matmul_k = i * DIM * MATMUL_K;
+    int i_tiles_k = i * tiles_K;
+    for (int k = 0; k < tiles_K; k += 3) {
+      int batch_size = (tiles_K - k >= 3) ? 3 : (tiles_K - k);
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + i_dim_matmul_k + k * DIM),
+                            a_base + (i_tiles_k + k) * DIM, batch_size * DIM, DIM);
+    }
+  }
+
+  // mvin coalesced block tiles of B (block-aligned 3 * DIM x DIM -> fits within 6-bit field)
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+  for (int k = 0; k < tiles_K; k++) {
+    int k_dim_matmul_n = k * DIM * MATMUL_N;
+    int k_tiles_j = k * tiles_J;
+    for (int j = 0; j < tiles_J; j += 3) {
+      int batch_size = (tiles_J - j >= 3) ? 3 : (tiles_J - j);
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + k_dim_matmul_n + j * DIM),
+                            b_base + (k_tiles_j + j) * DIM, batch_size * DIM, DIM);
+    }
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, PAD_I, PAD_J, PAD_K, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // read only the REAL rows (smem row stride is the padded MATMUL_N)
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, REAL_M * MATMUL_N);
+  gemmini_fence();
+}
+''',
+score=inf,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='gemini-3.5-flash',
+code_gen_model='qwen.qwen3-coder-480b-a35b-v1:0',
+stdout='Kernel produced an INCORRECT/illegal result on spike. Diagnostic (fix this before optimizing):\nGEMMINI MVIN ILLEGAL: cols=64 overflows the 6-bit hardware num_cols field (rs2[37:32]) -> truncated to 0. Reduce block batch so cols=batch*DIM <= 63 (max block batch 3). -- RTL LoadController.sv cols field\nGemmini extension configured with:\ndim = 16',
+stderr=None)

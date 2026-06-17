@@ -1,0 +1,259 @@
+{'correct': False}
+Prev latency: 184241
+New latency: N/A
+Plan: An elegant and highly effective optimization strategy for this code is to **compile the Gemmini instruction-configuration sequences into non-inlined functions**.
+
+### The Strategy: Out-of-Line Configuration Helpers
+
+The baseline code repeatedly issues config macros (`gemmini_extended3_config_ex`, `gemmini_config_ld`, `gemmini_config_st`, and `gemmini_mxquant_config_mvout`) inside the outer loops. Because these macros expand into complex inline assembly instructions with a large number of inputs, they create severe **register pressure** and **instruction-cache (I-cache) thrashing** on the RISC-V host processor. 
+
+By encapsulating these configuration sequences into standalone, non-inlined helper functions (using `__attribute__((noinline))`), we can:
+1. **Reduce Host Register Spilling**: Prevent the compiler from spilling loop induction variables (such as `i0`, `j0`, `r`, `g`, etc.) to the stack.
+2. **Improve Host I-Cache Locality**: Shrink the footprint of the hot matmul loop in `solution` so it fits entirely within the host's L1 instruction cache.
+3. **Amortize Call Overhead**: Since configuration happens once per block (not per tile), the small overhead of a function call is completely negligible compared to the execution cycles of the hardware matmul.
+
+---
+
+### Implementation Plan
+
+1. **Define Non-Inlined Helpers**:
+   Create three specialized helper functions marked `__attribute__((noinline))` to isolate the inline assembly expansions:
+   * `config_gemmini_ex()`: Wraps `gemmini_extended3_config_ex` to set up formats and dataflow.
+   * `config_gemmini_ld_stride(stride)`: Wraps `gemmini_config_ld` to set up load strides.
+   * `config_gemmini_st_quant(out_stride, scale_dram, tiles_I, tiles_J, tiles_K)`: Wraps both `gemmini_config_st` and `gemmini_mxquant_config_mvout` to configure output write-back parameters.
+
+2. **Refactor the `solution` Loop**:
+   Replace the inline macro call sites inside the `solution()` function with calls to these helper functions. Ensure the exact programming sequence is maintained:
+   $$\text{Config EX} \rightarrow \text{Load Scales} \rightarrow \text{Config LD} \rightarrow \text{MVIN} \rightarrow \text{Config ST/Quant} \rightarrow \text{Compute Loop} \rightarrow \text{Read SMEM} \rightarrow \text{Fence}$$
+
+3. **Verify Constraints**:
+   Keep all block dimensions, scale loading, scratchpad indexing (`a_base`, `b_base`), accumulator limits, and the terminal `gemmini_fence()` exactly as specified to ensure bit-exact output equivalence on the Spike simulator.
+
+CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED outer-tiled MX matmul baseline (1x1024x3072).
+void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+   for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Partial last M/N block: compute only the real rows/cols, pad the rest.
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+      // PROF cpu_stage
+      // Stage only the tiny per-32-group scales; A/B data is mvin\'d DIRECTLY
+      // from DRAM (no host-side block memcpy — that was 98% of the cycles).
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+      // PROF accel
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K (full block-aligned tiles)
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+      for (int j = 0; j < tiles; j++)                    // B[k][j0*BLK+j] -> slot (k*tiles + j)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      // Accelerator-centric readout: per-row hardware DMA from smem straight into the
+      // bf16-packed row-major output (block-internal smem row stride is BLK).
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+}
+''',
+score=184241,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'CPU/host data staging detected (2 memcpy, ~0 scalar copy loops). Host staging is typically the dominant cost on this accelerator and autocomp cannot speed it up directly: mvin tiles STRIDED straight from the source DRAM arrays instead of copying through a host buffer, and keep partial sums in shared memory (bf16 accumulate) rather than accumulating on the CPU.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''An elegant and highly effective optimization strategy for this code is to **compile the Gemmini instruction-configuration sequences into non-inlined functions**.
+
+### The Strategy: Out-of-Line Configuration Helpers
+
+The baseline code repeatedly issues config macros (`gemmini_extended3_config_ex`, `gemmini_config_ld`, `gemmini_config_st`, and `gemmini_mxquant_config_mvout`) inside the outer loops. Because these macros expand into complex inline assembly instructions with a large number of inputs, they create severe **register pressure** and **instruction-cache (I-cache) thrashing** on the RISC-V host processor. 
+
+By encapsulating these configuration sequences into standalone, non-inlined helper functions (using `__attribute__((noinline))`), we can:
+1. **Reduce Host Register Spilling**: Prevent the compiler from spilling loop induction variables (such as `i0`, `j0`, `r`, `g`, etc.) to the stack.
+2. **Improve Host I-Cache Locality**: Shrink the footprint of the hot matmul loop in `solution` so it fits entirely within the host\'s L1 instruction cache.
+3. **Amortize Call Overhead**: Since configuration happens once per block (not per tile), the small overhead of a function call is completely negligible compared to the execution cycles of the hardware matmul.
+
+---
+
+### Implementation Plan
+
+1. **Define Non-Inlined Helpers**:
+   Create three specialized helper functions marked `__attribute__((noinline))` to isolate the inline assembly expansions:
+   * `config_gemmini_ex()`: Wraps `gemmini_extended3_config_ex` to set up formats and dataflow.
+   * `config_gemmini_ld_stride(stride)`: Wraps `gemmini_config_ld` to set up load strides.
+   * `config_gemmini_st_quant(out_stride, scale_dram, tiles_I, tiles_J, tiles_K)`: Wraps both `gemmini_config_st` and `gemmini_mxquant_config_mvout` to configure output write-back parameters.
+
+2. **Refactor the `solution` Loop**:
+   Replace the inline macro call sites inside the `solution()` function with calls to these helper functions. Ensure the exact programming sequence is maintained:
+   $$\text{Config EX} \rightarrow \text{Load Scales} \rightarrow \text{Config LD} \rightarrow \text{MVIN} \rightarrow \text{Config ST/Quant} \rightarrow \text{Compute Loop} \rightarrow \text{Read SMEM} \rightarrow \text{Fence}$$
+
+3. **Verify Constraints**:
+   Keep all block dimensions, scale loading, scratchpad indexing (`a_base`, `b_base`), accumulator limits, and the terminal `gemmini_fence()` exactly as specified to ensure bit-exact output equivalence on the Spike simulator.''',
+code='''// Optimized version of the MX-Gemmini matmul using out-of-line configuration helpers
+// to reduce register pressure and improve I-cache locality.
+
+#include <stdint.h>
+#include <string.h>
+
+// Assume these are defined elsewhere appropriately
+extern elem_t A_in[], B_in[];
+extern out_t C_hw[][768];
+extern scale_t A_scales_row[][/*MATMUL_M*/], B_scales_col[][/*MATMUL_N*/];
+extern uint8_t A_s[][/*BLK*/], B_s[][/*BLK*/];
+extern void* scale_factors;
+
+#define BLOCKS_M /*...*/
+#define BLOCKS_N /*...*/
+#define BLK /*...*/
+#define DIM 16
+#define BANK_NUM 4
+#define BANK_ROWS 2048
+#define ACC_ROWS 256
+#define BF16_PER_WORD 4
+#define MATMUL_K /*...*/
+#define MATMUL_N /*...*/
+#define A_S_BYTES /*...*/
+#define B_S_BYTES /*...*/
+#define BLK_OUTC /*...*/
+#define REAL_M /*...*/
+#define REAL_N /*...*/
+
+#define WEIGHT_STATIONARY 1
+#define ACC_SCALE_IDENTITY 1.0f
+#define NO_ACTIVATION 0
+
+// Helper function declarations
+static void config_gemmini_ex(void);
+static void config_gemmini_ld_A(void);
+static void config_gemmini_ld_B(void);
+static void config_gemmini_st_quant(uint32_t SPAD_DEST, int tiles_I, int tiles_J, int tiles_K);
+
+// Main optimized solution function
+void solution(void) {
+  const int tiles_K = MATMUL_K / DIM;
+  const uint32_t a_base = 0;
+  const uint32_t b_base = BANK_NUM * BANK_ROWS - (BLK/DIM) * tiles_K * DIM;
+  const int SPAD_DEST = 128;
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Calculate real dimensions for partial blocks
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+      
+      int ncols = REAL_N - j0 * BLK;
+      if (ncols > BLK) ncols = BLK;
+      if (ncols <= 0) continue;
+
+      int pad_i = BLK - mrows;
+      int pad_j = BLK - ncols;
+      int tiles_I = (mrows + DIM - 1) / DIM;
+      int tiles_J = (ncols + DIM - 1) / DIM;
+
+      // Stage scales per group
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+
+      // Flush and configure execution
+      gemmini_flush(0);
+      config_gemmini_ex();
+
+      // Load scales
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      // Load A tiles
+      config_gemmini_ld_A();
+      for (int i = 0; i < tiles_I; i++) {
+        for (int k = 0; k < tiles_K; k++) {
+          uint32_t dram_offset = (i0 * BLK + i * DIM) * MATMUL_K + k * DIM;
+          uint32_t spad_addr = a_base + (i * tiles_K + k) * DIM;
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + dram_offset),
+                                spad_addr, DIM, DIM);
+        }
+      }
+
+      // Load B tiles
+      config_gemmini_ld_B();
+      for (int j = 0; j < tiles_J; j++) {
+        for (int k = 0; k < tiles_K; k++) {
+          uint32_t dram_offset = (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM);
+          uint32_t spad_addr = b_base + (k * tiles_J + j) * DIM;
+          gemmini_extended_mvin2((void*)(((elem_t*)B_in) + dram_offset),
+                                 spad_addr, DIM, DIM);
+        }
+      }
+
+      // Configure store and quantization
+      config_gemmini_st_quant(SPAD_DEST, tiles_I, tiles_J, tiles_K);
+
+      // Compute
+      gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, pad_i, pad_j, 0,
+                           a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                           false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Drain results
+      for (int r = 0; r < mrows; r += BF16_PER_WORD) {
+        int rows_to_read = (mrows - r < BF16_PER_WORD) ? (mrows - r) : BF16_PER_WORD;
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][j0 * BLK],
+                             SPAD_DEST * 16 + r * BLK_OUTC, rows_to_read * ncols);
+      }
+      gemmini_fence();
+    }
+  }
+}
+
+// Helper implementations
+static void config_gemmini_ex(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                              /*C_stride*/1, /*A_stride*/1, /*A_transpose*/0, /*B_transpose*/0,
+                              /*set_only_strides*/false,
+                              /*act_mx_fmt*/0, /*wgt_mx_fmt*/0, /*out_mx_fmt*/3, /*uselut*/0);
+}
+
+static void config_gemmini_ld_A(void) {
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+}
+
+static void config_gemmini_ld_B(void) {
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+}
+
+static void config_gemmini_st_quant(uint32_t SPAD_DEST, int tiles_I, int tiles_J, int tiles_K) {
+  gemmini_config_st(BLK_OUTC * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+}
+''',
+score=inf,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='gemini-3.5-flash',
+code_gen_model='qwen.qwen3-coder-480b-a35b-v1:0',
+stdout="/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/auto_comp_test.c:151:39: error: invalid storage class for function 'config_gemmini_ex'\n/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/auto_comp_test.c:158:39: error: invalid storage class for function 'config_gemmini_ld_A'\n/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/auto_comp_test.c:162:39: error: invalid storage class for function 'config_gemmini_ld_B'\n/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/auto_comp_test.c:166:39: error: invalid storage class for function 'config_gemmini_st_quant'\nmake[1]: *** [/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/Makefile:145: auto_comp_test-baremetal] Error 1\nmake: *** [Makefile:20: bareMetalC] Error 2\n|                                       ^~~~~~~~~~~~~~~~~~~\n166 | static void __attribute__((noinline)) config_gemmini_st_quant(uint32_t SPAD_DEST, int tiles) {\n|                                       ^~~~~~~~~~~~~~~~~~~~~~~\n/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/auto_comp_test.c:173:44: warning: passing argument 2 of 'full_is_equal' from incompatible pointer type [-Wincompatible-pointer-types]\n173 |     if (!full_is_equal(OUTPUT_MATRIX_NAME, gold)) {\n|                                            ^~~~\n|                                            |\n|                                            out_t (*)[1] {aka long unsigned int (*)[1]}\n/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/auto_comp_test.c:53:60: note: expected 'const out_t (*)[768]' {aka 'const long unsigned int (*)[768]'} but argument is of type 'out_t (*)[1]' {aka 'long unsigned int (*)[1]'}\n53 | int full_is_equal(out_t x[MATMUL_M][OUT_COLS], const out_t y[MATMUL_M][OUT_COLS]) {\n|                                                ~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~\nmake[1]: Leaving directory '/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/bareMetalC'",
+stderr=None)

@@ -1,0 +1,116 @@
+## Analysis
+
+The original code has `gemmini_flush(0)` inside the `i0×j0` loop, which means for a 41×512×512 matmul with BLK=64 (tiles=4), it flushes/reconfigures the accelerator on **every** (i0,j0) block pair. With BLOCKS_M×BLOCKS_N iterations, this is a massive overhead source.
+
+More importantly, the feedback says **scratchpad utilization is 0KB out of 256KB** and **accumulator utilization is 0KB**. The current code uses only one (4-tile)×(4-tile) block at a time (tiles=BLK/DIM=4), using just `(4*tiles_K + 4*tiles_K)*DIM = 8*32*16 = 4096` rows out of 8192, and `4*4*16 = 256` accumulator rows.
+
+## Selected Strategy: **Strategy 5 — Amortize `gemmini_mxquant_config_mvout` (and `gemmini_loop_ws_spad`) calls by batching multiple output tiles per invocation**
+
+Currently each (i0,j0) pair issues its own full sequence: flush → config_ex → load_scales → mvin A → mvin B → mxquant_config_mvout → loop_ws_spad → read_smem → fence. For a 41×512×512 problem with BLK=64, BLOCKS_M≈1, BLOCKS_N=8, so there are ~8 invocations — but the flush+config overhead per iteration is still significant.
+
+The better opportunity is **strategy 2 / scratchpad batching**: the scratchpad can hold more tiles simultaneously. With tiles_K=32, tiles (tiles per BLK dim) = 4:
+- Current: loads 4 A-tile-rows + 4 B-tile-cols at a time → 4096 rows used
+- We can batch **multiple j0 (N-direction) blocks** in one shot, keeping A fixed and iterating over multiple B blocks
+
+**Plan: Fix A in scratchpad for a given i0, then iterate over all j0 blocks reusing A without reloading.**
+
+### Detailed Plan
+
+1. **Move `gemmini_flush` and `gemmini_extended3_config_ex` outside all loops** — they only need to be called once since format settings don't change.
+
+2. **Restructure the loop order** to `i0` outer, `j0` inner. For each `i0`:
+   - Load A tiles for block `i0` into scratchpad once at `a_base`.
+   - For each `j0`, load only B tiles (not A), run `loop_ws_spad`, and read results.
+   - This eliminates redundant A mvin across all j0 iterations for the same i0.
+
+3. **Eliminate `gemmini_flush` from inner loop** — flush is only needed once at startup. The `gemmini_extended3_config_ex`, scale loads, and mvin configs are already re-issued each iteration as needed; the flush is pure overhead inside the loop.
+
+4. **Keep A scales loaded once per i0, reload B scales each j0** — A scales don't change across j0, so `gemmini_mx_load_scales` for A can be hoisted out of the j0 loop.
+
+### Code
+
+```c
+void solution(void) {
+  const int GK = MATMUL_K / 32;
+
+  static uint8_t pre_A_s[BLOCKS_M][MATMUL_K / 32][BLK];
+  static uint8_t pre_B_s[BLOCKS_N][MATMUL_K / 32][BLK];
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+    for (int g = 0; g < GK; g++)
+      memcpy(&pre_A_s[i0][g][0], &A_scales_row[g][i0 * BLK], BLK);
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++)
+    for (int g = 0; g < GK; g++)
+      memcpy(&pre_B_s[j0][g][0], &B_scales_col[g][j0 * BLK], BLK);
+
+  // One-time accelerator setup: flush and configure format once.
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                               1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  int tiles = BLK / DIM;
+  int tiles_K = MATMUL_K / DIM;
+  uint32_t a_base = 0;
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+  int SPAD_DEST = 128;
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    int mrows = REAL_M - i0 * BLK;
+    if (mrows > BLK) mrows = BLK;
+    if (mrows <= 0) continue;
+    int pad_i = BLK - mrows;
+
+    // Load A scales once per i0 row-block (shared across all j0).
+    gemmini_mx_load_scales((uint64_t)pre_A_s[i0], A_S_BYTES, 0);
+
+    // Load A tiles once per i0 (reused across all j0).
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i = 0; i < tiles; i++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int ncols = REAL_N - j0 * BLK;
+      if (ncols > BLK) ncols = BLK;
+      if (ncols <= 0) continue;
+      int pad_j = BLK - ncols;
+
+      // Load B scales for this j0 column-block.
+      gemmini_mx_load_scales((uint64_t)pre_B_s[j0], B_S_BYTES, 1);
+
+      // Load B tiles for this j0.
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int j = 0; j < tiles; j++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin(
+              (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+              b_base + (k * tiles + j) * DIM, DIM, DIM);
+
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K,
+                                   0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0,
+                           a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                           false, false, false, false, false,
+                           NO_ACTIVATION, 0, 0, false, 0x38);
+
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(
+            &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+            SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+  }
+}
+```
+
+### Why This Helps
+
+- **`gemmini_flush` removed from loop**: The original flushed on every (i0,j0) pair. Moving it outside eliminates `BLOCKS_M × BLOCKS_N` flush stalls (each flush drains the pipeline).
+- **A mvin hoisted out of j0**: For each i0, A tiles are loaded once and reused across all j0 blocks. This eliminates `(BLOCKS_N - 1)` redundant A mvin sequences per i0 row.
+- **A scale load hoisted out of j0**: `gemmini_mx_load_scales` for A is called once per i0 instead of once per (i0,j0), halving scale-load overhead.
+- **`gemmini_extended3_config_ex` called once**: Format settings are invariant; calling it once eliminates repeated configuration overhead.
+- The scratchpad layout is unchanged (A at `a_base`, B at `b_base`), so correctness is preserved. The programming model order is maintained: config_ex → load_scales(A) → [mvin A] → per-j0: load_scales(B) → mvin B → mxquant_config_mvout → loop_ws_spad → read_smem → fence.

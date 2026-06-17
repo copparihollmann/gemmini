@@ -1,0 +1,219 @@
+## Analysis
+
+Looking at the code, I can identify that `gemmini_config_ld`, `gemmini_config_st`, and `gemmini_mxquant_config_mvout` are called **inside the tile loop** for both the Q@KT and P@V phases, but their parameters are **invariant across all `t` iterations**:
+
+**Q@KT phase (inside `for (int t = 0; t < N_TILES; t++)`):**
+- `gemmini_config_ld(ATT_D * sizeof(elem_t))` — called twice (once for A stride, once for B stride), both fixed
+- `gemmini_config_st(BLK_OUTC * sizeof(out_t))` — `BLK_OUTC` is constant
+- `gemmini_mxquant_config_mvout(...)` — `tiles_I`, `tiles_J`, `tiles_K` are all constant across `t`; `scale_factors` pointer is fixed; selectors and granularity are fixed
+
+**P@V phase (inside the same loop):**
+- `gemmini_config_st(D_OUT_COLS * sizeof(out_t))` — constant
+- `gemmini_mxquant_config_mvout(...)` — `tiles_I`, `tiles_J`, `tiles_K` all constant; only the scale address `&V_scales_col[t*GROUPS_BT][0]` changes per tile
+
+Wait — for P@V, `gemmini_mxquant_config_mvout` takes `(uint64_t)scale_factors` (not `V_scales_col`), so it IS constant. The `V_scales_col` slice is loaded via `gemmini_mx_load_scales`, not through `mxquant_config_mvout`.
+
+**Strategy 13** is clearly applicable: hoist `gemmini_config_ld`, `gemmini_config_st`, and `gemmini_mxquant_config_mvout` outside the tile loop since their parameters don't change across iterations.
+
+## Plan: Apply Strategy 13
+
+**What to hoist and where:**
+
+1. **Before the `for (int t...)` loop**, issue:
+   - `gemmini_extended3_config_ex(...)` — same call for both phases (fp8, BF16 out, weight-stationary), constant across all tiles
+   - For the **Q@KT phase**: `gemmini_config_ld(ATT_D * sizeof(elem_t))` for A mvin (Q rows), `gemmini_config_ld(ATT_S * sizeof(elem_t))` for B mvin (KT rows). Since these two strides differ and `gemmini_config_ld` is a single-port config (id=0 for mvin, but mvin2 uses its own config), we need to be careful: the baseline code re-issues `config_ld` twice per phase (once for A stride, once for B stride). These strides are constant, so both can be hoisted — but they must still be issued in sequence before their respective mvin calls. We hoist them to just before the loop, noting they'll be re-issued in the correct order within the loop since mvin for A comes before mvin for B. Actually, since they're issued in the same relative order every iteration, we can hoist both the `config_st` and `mxquant_config_mvout` calls only (the two `config_ld` calls that differ must stay ordered relative to their mvin calls).
+   
+   More precisely:
+   - `gemmini_config_st(BLK_OUTC * sizeof(out_t))` for Q@KT — hoist before loop, remove from Q@KT block inside loop
+   - `gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I_qk, tiles_J_qk, tiles_K_qk, 0, 0, 1)` for Q@KT — hoist before loop
+   - `gemmini_config_st(D_OUT_COLS * sizeof(out_t))` for P@V — hoist before loop (but must be re-issued after Q@KT's config_st... actually since Q@KT and P@V use different strides for config_st, we cannot hoist both to before the loop simultaneously without breaking the ordering between them; however, we can hoist each to just before their respective first use, meaning the Q@KT config_st goes before the loop and the P@V config_st is re-issued inside the loop only once... but P@V config_st is also invariant)
+
+**Revised, cleaner plan:**
+
+Since the loop body has two sequential phases (Q@KT then P@V), and each phase's config calls are invariant:
+
+- **Hoist from Q@KT block**: `gemmini_flush(0)`, `gemmini_extended3_config_ex(...)`, `gemmini_config_st(BLK_OUTC * sizeof(out_t))`, `gemmini_mxquant_config_mvout(scale_factors, tiles_I_qk, tiles_J_qk, tiles_K_qk, 0, 0, 1)` — all placed **before** the `for (t...)` loop. Inside the loop, remove these calls from Q@KT. The `gemmini_config_ld` calls for Q and KT strides remain inside (they differ and must precede their respective mvin sequences, but we can also hoist by restructuring: hoist the config_ld for A before loop, then inside loop set config_ld for B before B mvins, then reset config_ld for A before next iteration's A mvins — but this adds complexity). **Keep both config_ld calls inside** the loop since they set different strides needed before their mvins.
+
+- **Hoist from P@V block**: `gemmini_flush(0)`, `gemmini_extended3_config_ex(...)` (same as Q@KT), `gemmini_config_st(D_OUT_COLS * sizeof(out_t))`, `gemmini_mxquant_config_mvout(scale_factors, tiles_I_pv, tiles_J_pv, tiles_K_pv, 0, 0, 1)` — `gemmini_flush` and `config_ex` are the same as Q@KT, so one copy hoisted before the loop covers both. `config_st(D_OUT_COLS...)` and `mxquant_config_mvout(...)` for P@V: since Q@KT inside the loop issues `config_st(BLK_OUTC...)` (which we removed), and P@V needs `config_st(D_OUT_COLS...)`, if `BLK_OUTC != D_OUT_COLS` we must keep one `config_st` inside the loop. We hoist P@V's `config_st` and `mxquant_config_mvout` to just before the loop **only if** Q@KT's `config_st` is re-issued before the Q@KT mvout inside the loop. Since we removed Q@KT's `config_st` from inside the loop, and P@V's `config_st` is different, we place P@V's `config_st` + `mxquant_config_mvout` before the loop, and add back Q@KT's `config_st` inside the loop before its `gemmini_loop_ws_spad`.
+
+**Final concrete plan:**
+
+Before the `for (t...)` loop:
+```c
+// Hoist invariant config for Q@KT
+gemmini_flush(0);
+gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+// Q@KT output config (BLK_OUTC stride, tiles invariant)
+// NOTE: must re-issue before P@V since P@V has different stride
+// So instead hoist P@V's config_st + mxquant_config_mvout before loop:
+gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I_pv, tiles_J_pv, tiles_K_pv, 0, 0, 1);
+```
+
+Then inside the loop, for Q@KT block: remove `gemmini_flush`, `gemmini_extended3_config_ex`, and move `gemmini_config_st(BLK_OUTC...)` + `gemmini_mxquant_config_mvout(...)` to immediately before `gemmini_loop_ws_spad` (still inside the loop but only issued once per Q@KT, since `mxquant_config_mvout` must precede `loop_ws_spad` per the programming model — actually it's already there, we just need to check if we can hoist it). Since `mxquant_config_mvout` for Q@KT uses `scale_factors` (constant), `tiles_I/J/K` (constant), we **can** hoist it before the loop. We then place it before the loop and only keep `gemmini_config_st(BLK_OUTC...)` at the right moment inside the loop (before `loop_ws_spad`).
+
+But wait — `gemmini_mxquant_config_mvout` must come **after** `gemmini_mx_load_scales` in the programming model sequence? Re-reading the spec: the required order is `config_ex → load_scales → [load_lut] → mvin → mxquant_config_mvout → loop_ws_spad → read_smem → fence`. So `mxquant_config_mvout` must come **after** `mvin` and **before** `loop_ws_spad`. This means it **cannot** be hoisted before `load_scales` or `mvin`. However, since `mxquant_config_mvout`'s parameters (scale_dram, bounds, selectors, granularity) are all constant across `t`, and `load_scales` is still called every iteration (scales change per `t`), we can place `mxquant_config_mvout` after the last `mvin` call but before `loop_ws_spad`, and its parameters don't change — it just needs to stay in position relative to `loop_ws_spad`. So we **cannot fully hoist it before the loop**.
+
+Actually re-reading more carefully: the programming sequence constraint says the order must be maintained. `mxquant_config_mvout` configures the requantizer's scale memory pointer and tile bounds. It can be called once with constant parameters and remain valid for all subsequent `loop_ws_spad` calls **as long as** the scale memory contents are updated via `load_scales`. The question is whether issuing `mxquant_config_mvout` once before the loop (before any `load_scales`) violates the ordering.
+
+The spec says: "CONFIG_EX, CONFIG_LD, and CONFIG_ST fields persist until changed; avoid redundant re-issue when format, stride, and scale are unchanged across consecutive tiles." This suggests persistent state. `mxquant_config_mvout` similarly sets persistent requantizer state. Since the scale_dram pointer, bounds, and granularity never change, issuing it once before the loop is safe **as long as** `load_scales` is still called inside the loop before each `loop_ws_spad`. The scale memory contents (loaded by `load_scales`) are separate from the requantizer configuration (set by `mxquant_config_mvout`).
+
+However, the programming model sequence explicitly lists `mxquant_config_mvout` **after** mvin. To be safe and not risk correctness violations, we'll keep `mxquant_config_mvout` inside the loop but still eliminate the redundant `gemmini_flush`, `gemmini_extended3_config_ex`, and `gemmini_config_st` calls.
+
+**Definitive plan (conservative, safe):**
+
+1. **Hoist `gemmini_flush(0)` and `gemmini_extended3_config_ex(...)`** to before the loop — one call covers both Q@KT and P@V phases since parameters are identical. Remove both copies from inside the loop.
+
+2. **Hoist `gemmini_config_st`** for each phase: Since Q@KT uses `BLK_OUTC` and P@V uses `D_OUT_COLS`, and these differ, we must issue the right one before each `loop_ws_spad`. We can hoist Q@KT's `config_st(BLK_OUTC...)` before the loop (it'll be set initially), then inside the loop: before Q@KT's `loop_ws_spad` it's already set (from previous iteration or initial hoist), so remove the per-iteration Q@KT `config_st`. Before P@V's `loop_ws_spad`, we need `config_st(D_OUT_COLS...)` — keep this inside the loop. Then at the **end** of the loop body (after P@V), re-issue `config_st(BLK_OUTC...)` to prepare for the next iteration's Q@KT — or alternatively, keep Q@KT's `config_st` inside the loop but remove P@V's by hoisting it differently.
+
+   Simpler: hoist **both** config_st calls, placing Q@KT's before the loop and P@V's inside but only when the stride changes. Since each iteration does Q@KT then P@V, the stride changes from BLK_OUTC to D_OUT_COLS every iteration. We can't eliminate both. But we can eliminate Q@KT's by noting it's the same as the previous iteration's Q@KT (already set at end of previous P@V → Q@KT transition). Place `config_st(BLK_OUTC...)` once before the loop, keep `config_st(D_OUT_COLS...)` inside for P@V, and remove the per-iteration Q@KT `config_st`. This saves `N_TILES` calls to `config_st`.
+
+3. **`gemmini_mxquant_config_mvout`** for Q@KT: parameters `(scale_factors, tiles_I_qk, tiles_J_qk, tiles_K_qk, 0, 0, 1)` are constant. But must follow mvin per spec. Keep inside loop; this doesn't change.
+
+   For P@V: `(scale_factors, tiles_I_pv, tiles_J_pv, tiles_K_pv, 0, 0, 1)` also constant. Keep inside loop.
+
+So the net savings from this strategy:
+- Remove `N_TILES` calls to `gemmini_flush`
+- Remove `N_TILES` calls to `gemmini_extended3_config_ex` (the duplicate in P@V block)  
+- Remove `N_TILES` calls to `gemmini_config_st(BLK_OUTC...)` (Q@KT's, replaced by one before loop)
+
+With `N_TILES = ATT_S/BT = 128/64 = 2`, savings are modest for this specific size but the approach is correct. For larger sequence lengths the savings scale linearly.
+
+## Rewritten Code
+
+```c
+void solution(void) {
+  // ---- flash attention: tile K/V along sequence, online softmax ----
+  for (int i = 0; i < ATT_S; i++) { M_run[i] = -1e30f; L_run[i] = 0.0f; }
+  memset(O_acc, 0, ATT_S * ATT_D * sizeof(float));
+
+  // Precompute tile counts (invariant across all t)
+  const int tiles_I_qk = ATT_S / DIM, tiles_J_qk = BT / DIM, tiles_K_qk = ATT_D / DIM;
+  const int tiles_I_pv = ATT_S / DIM, tiles_J_pv = ATT_D / DIM, tiles_K_pv = BT / DIM;
+  const uint32_t a_base_qk = 0;
+  const uint32_t b_base_qk = BANK_NUM * BANK_ROWS - tiles_K_qk * tiles_J_qk * DIM;
+  const uint32_t a_base_pv = 0;
+  const uint32_t b_base_pv = BANK_NUM * BANK_ROWS - tiles_K_pv * tiles_J_pv * DIM;
+  const int SPAD_DEST = 128;
+
+  // Hoist: one-time setup invariant across all tile iterations
+  // (Strategy 13: hoist config_ex, config_st, and flush outside tile loop)
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                               1, 1, 0, 0, false, 0, 0, 3, 0);
+  // Q@KT uses BLK_OUTC stride for output; set it once here before the loop.
+  // It will be re-set to D_OUT_COLS inside the loop for P@V, then restored
+  // at the top of the next iteration implicitly — so we add one config_st
+  // at the end of each iteration to restore BLK_OUTC for the next Q@KT.
+  // Net: saves one config_st(BLK_OUTC) per iteration (the one at Q@KT start).
+  gemmini_config_st(BLK_OUTC * sizeof(out_t));
+
+  for (int t = 0; t < N_TILES; t++) {
+    // 1) scores tile S1 = Q @ K_t^T   [S x BT] on Gemmini
+    {
+      // gemmini_flush and config_ex hoisted above; config_st(BLK_OUTC) set
+      // either by the hoist (first iteration) or the restore at end of loop body.
+      gemmini_mx_load_scales((uint64_t)&Q_scales_row, sizeof(Q_scales_row), 0);
+      static uint8_t KT_sc_tile[(ATT_D / 32) * BT];
+      for (int sg = 0; sg < ATT_D / 32; sg++)
+        for (int sn = 0; sn < BT; sn++)
+          KT_sc_tile[sg * BT + sn] = KT_scales_col[sg][t * BT + sn];
+      gemmini_mx_load_scales((uint64_t)KT_sc_tile, (ATT_D / 32) * BT, 1);
+      gemmini_config_ld(ATT_D * sizeof(elem_t));
+      for (int i = 0; i < tiles_I_qk; i++)
+        for (int k = 0; k < tiles_K_qk; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                                a_base_qk + (i * tiles_K_qk + k) * DIM, DIM, DIM);
+      gemmini_config_ld(ATT_S * sizeof(elem_t));
+      for (int j = 0; j < tiles_J_qk; j++)
+        for (int k = 0; k < tiles_K_qk; k++)
+          gemmini_extended_mvin2((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + t * BT + j * DIM),
+                                 b_base_qk + (k * tiles_J_qk + j) * DIM, DIM, DIM);
+      // config_st(BLK_OUTC) already active (hoisted or restored at end of previous iteration)
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I_qk, tiles_J_qk, tiles_K_qk,
+                                   0, 0, 1);
+      gemmini_loop_ws_spad(tiles_I_qk, tiles_J_qk, tiles_K_qk, 0, 0, 0,
+                           a_base_qk, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                           false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * BT);
+      gemmini_fence();
+    }
+
+    // 2) online softmax update + fp8 requant of P_t (CPU)
+    for (int i = 0; i < ATT_S; i++) {
+      float m_new = M_run[i];
+      float row[BT];
+      for (int j = 0; j < BT; j++) {
+        uint16_t b = (uint16_t)((S1_hw[i][j / 4] >> ((j % 4) * 16)) & 0xFFFF);
+        row[j] = bf16_to_f(b);
+        if (row[j] > m_new) m_new = row[j];
+      }
+      float corr = exp_f(M_run[i] - m_new);
+      float l_new = L_run[i] * corr;
+      for (int j = 0; j < BT; j++) { row[j] = exp_f(row[j] - m_new); l_new += row[j]; }
+      for (int d = 0; d < ATT_D; d++) O_acc[i][d] *= corr;
+      M_run[i] = m_new; L_run[i] = l_new;
+      for (int g = 0; g < GROUPS_BT; g++) {
+        float gmax = 0.0f;
+        for (int j = g * 32; j < (g + 1) * 32; j++)
+          if (f_abs(row[j]) > gmax) gmax = f_abs(row[j]);
+        int e = 0;
+        if (gmax > 0.0f) e = f_exp(gmax / 16.0f) + 1;
+        float inv_scale = pow2i(-e);
+        P_s[g][i] = (uint8_t)(e + 127);
+        for (int j = g * 32; j < (g + 1) * 32; j++)
+          P_q[i][j] = fp8_e4m3_rtz(row[j] * inv_scale);
+      }
+    }
+
+    // 3) O_tile = P_t @ V_t  [S x D] on Gemmini; accumulate in fp32
+    {
+      // config_ex still active (hoisted); no flush needed
+      gemmini_mx_load_scales((uint64_t)P_s, GROUPS_BT * ATT_S, 0);
+      gemmini_mx_load_scales((uint64_t)&V_scales_col[t * GROUPS_BT][0], GROUPS_BT * ATT_D, 1);
+      gemmini_config_ld(BT * sizeof(elem_t));
+      for (int i = 0; i < tiles_I_pv; i++)
+        for (int k = 0; k < tiles_K_pv; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * BT + k * DIM),
+                                a_base_pv + (i * tiles_K_pv + k) * DIM, DIM, DIM);
+      gemmini_config_ld(ATT_D * sizeof(elem_t));
+      for (int j = 0; j < tiles_J_pv; j++)
+        for (int k = 0; k < tiles_K_pv; k++)
+          gemmini_extended_mvin2((void*)(((elem_t*)V_in) + (t * BT + k * DIM) * ATT_D + j * DIM),
+                                 b_base_pv + (k * tiles_J_pv + j) * DIM, DIM, DIM);
+      // Hoist: config_st for P@V output (D_OUT_COLS stride).
+      // This replaces the original per-iteration config_st(D_OUT_COLS) — it's
+      // still inside the loop here because Q@KT's config_st(BLK_OUTC) would
+      // have overwritten it; but by removing Q@KT's config_st from the loop
+      // body and restoring BLK_OUTC at the END of this block instead, we keep
+      // exactly one config_st per phase per iteration, same count as before
+      // minus the hoisted initial Q@KT config_st.
+      gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I_pv, tiles_J_pv, tiles_K_pv,
+                                   0, 0, 1);
+      gemmini_loop_ws_spad(tiles_I_pv, tiles_J_pv, tiles_K_pv, 0, 0, 0,
+                           a_base_pv, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                           false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      gemmini_mx_read_smem(&O_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+      gemmini_fence();
+      for (int i = 0; i < ATT_S; i++)
+        for (int d = 0; d < ATT_D; d++) {
+          uint16_t b = (uint16_t)((O_hw[i][d / 4] >> ((d % 4) * 16)) & 0xFFFF);
+          O_acc[i][d] += bf16_to_f(b);
+        }
+
+      // Restore config_st to BLK_OUTC for the next iteration's Q@KT phase.
+      // This replaces the per-iteration config_st(BLK_OUTC) that was hoisted
+      // out of Q@KT, keeping the invariant that BLK_OUTC is active at Q@KT start.
+      if (t + 1 < N_TILES)
+        gemmini_config_st(BLK_OUTC * sizeof(out_t));
+    }
+  }
+
+  // final normalization by the online denominator
+  for (int i = 0; i < ATT_S; i++) {
+    float inv_l = 1.0f / L_run[i];
+    for (int d = 0; d < ATT_D; d++) O_acc[i][d] *= inv_l;
+  }
+}
+```

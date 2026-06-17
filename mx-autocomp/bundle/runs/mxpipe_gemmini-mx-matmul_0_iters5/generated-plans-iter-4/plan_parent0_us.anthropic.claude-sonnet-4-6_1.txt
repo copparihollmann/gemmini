@@ -1,0 +1,104 @@
+## Analysis of the Current Code
+
+Looking at the current code, I need to identify which strategy offers the most benefit.
+
+The current code uses `lut_update_granularity=1` in `gemmini_mxquant_config_mvout`. This means the requantizer LUT refreshes on **every single tile output**, which is the most frequent possible refresh rate.
+
+For a 4×4×4 tiled matmul (tiles_I=4, tiles_J=4, tiles_K=4), with `lut_update_granularity=1`, the LUT gets refreshed for every output tile — 16 output tiles total (4×4). Each refresh adds overhead to the requantization post-pass.
+
+However, looking more carefully at the strategies, **strategy 12** stands out: replace the per-row `OUT_COLS * sizeof(out_t)` config_st stride computation with a compile-time constant expression.
+
+But strategy 12 is minor. Let me reconsider strategy 10: **consolidate scale factor arrays to minimize `gemmini_mx_load_scales` call count**. The current code already loads scales once — this is already optimal.
+
+**Strategy 12** is the most directly applicable improvement not yet made: `OUT_COLS * sizeof(out_t)` is computed at runtime. `OUT_COLS = MATMUL_M / BF16_PER_WORD = 64/4 = 16`, `sizeof(out_t) = 8` → value is `128`. Making this a compile-time constant eliminates any runtime multiply.
+
+Wait — the **`lut_update_granularity`** is set to 1. Since fp8 doesn't use a LUT (`uselut=0`), but there's still a requantization pass to BF16. The granularity controls how often the output requant LUT refreshes. Setting it larger (e.g., `tiles_J` or `tiles_I*tiles_J`) means fewer refreshes during the output pass, reducing overhead.
+
+## Plan: Strategy 12 — Replace Runtime Stride with Compile-Time Constant
+
+**Selected strategy: 12**
+
+### Specific Changes
+
+In the current code:
+```c
+gemmini_config_st(OUT_COLS * sizeof(out_t));
+```
+
+`OUT_COLS` is defined in `matmul_fp8_64x64.h` (or derivable) as `MATMUL_N / 8` = `64/8 = 8` (since BF16 output packs 4 BF16 values per `uint64_t` = 8 bytes, so `MATMUL_N / (8/2)` ... let me reason carefully).
+
+`out_t = uint64_t` (8 bytes), holds 4 BF16 values. `OUT_COLS = MATMUL_N / 4 = 16`. So `OUT_COLS * sizeof(out_t) = 16 * 8 = 128`.
+
+Replace:
+```c
+gemmini_config_st(OUT_COLS * sizeof(out_t));
+```
+with:
+```c
+gemmini_config_st(MATMUL_N * 2);   // compile-time constant: N BF16 bytes per row = 64*2=128
+```
+
+or more explicitly as a compile-time `#define`. This eliminates the runtime multiply and allows the compiler to fold it directly into the instruction encoding, removing any load/multiply sequence.
+
+```c
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+#include "include/matmul_fp8_64x64.h"
+
+// Compile-time constant: each output row is MATMUL_N BF16 values = MATMUL_N*2 bytes
+#define OUT_ROW_BYTES (MATMUL_N * 2)
+
+void solution(void) {
+    const int tiles_I = MATMUL_M / DIM;
+    const int tiles_J = MATMUL_N / DIM;
+    const int tiles_K = MATMUL_K / DIM;
+
+    const uint32_t a_base    = 0;
+    const uint32_t b_base    = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    const uint32_t SPAD_DEST = 128;
+
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+        1, 1, 0, 0, false, 0, 0, 3, 0);
+
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    {
+        const elem_t *A_ptr = (const elem_t *)A_in;
+        for (int i = 0; i < tiles_I; i++) {
+            const void *dram_ptr = (const void *)(A_ptr + (i * DIM) * MATMUL_K);
+            uint32_t    sp_addr  = a_base + i * tiles_K * DIM;
+            gemmini_block_mvin(dram_ptr, sp_addr, tiles_K);
+        }
+    }
+
+    {
+        const elem_t *B_ptr = (const elem_t *)B_in;
+        for (int k = 0; k < tiles_K; k++) {
+            const void *dram_ptr = (const void *)(B_ptr + (k * DIM) * MATMUL_N);
+            uint32_t    sp_addr  = b_base + k * tiles_J * DIM;
+            gemmini_block_mvin(dram_ptr, sp_addr, tiles_J);
+        }
+    }
+
+    // Strategy 12: use compile-time constant OUT_ROW_BYTES instead of
+    // the runtime expression OUT_COLS * sizeof(out_t).
+    // OUT_COLS = MATMUL_N/4 = 16, sizeof(out_t)=8 → 128 bytes = MATMUL_N*2.
+    // The compiler can now fold this directly into the instruction encoding
+    // without emitting a runtime multiply or load.
+    gemmini_config_st(OUT_ROW_BYTES);
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+        tiles_I, tiles_J, tiles_K,
+        0, 0, 1);
+
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+        a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+        false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+    gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+    gemmini_fence();
+}
+```

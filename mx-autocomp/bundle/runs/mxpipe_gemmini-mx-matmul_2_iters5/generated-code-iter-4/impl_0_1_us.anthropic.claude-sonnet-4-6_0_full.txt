@@ -1,0 +1,64 @@
+Looking at the original code, I need to understand the problem and optimize it.
+
+The original code is a 64×128×128 FP8 matmul. Let me analyze:
+- M=64, N=128, K=128
+- tiles_I = 64/16 = 4, tiles_J = 128/16 = 8, tiles_K = 128/16 = 8
+- b_base = BANK_NUM*BANK_ROWS - tiles_K*tiles_J*DIM = 8192 - 8*8*16 = 8192 - 1024 = 7168
+- a_base = 0 (A needs tiles_I*tiles_K*DIM = 4*8*16 = 512 rows, fits well below 7168)
+
+The plan says "max retries reached" which means I should just write a clean, correct, optimized version. The key optimizations are:
+1. Maximize batching in mvin (already done with MAX_BLOCK_LEN=4)
+2. The `lut_update_granularity` can be set higher since BF16 output doesn't need LUT refresh per tile - set to tiles_J (or larger) to minimize overhead
+3. The B matrix loading can be optimized - batch along j dimension which is already done
+4. Since `out_mx_fmt=3` (BF16), no LUT is needed
+
+The main optimization opportunity is setting `lut_update_granularity` to a larger value (e.g., `tiles_I * tiles_J`) since we're outputting BF16 and don't need frequent LUT refreshes. Also ensure maximum batching.
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Load A tiles: stride = MATMUL_K cols, batch up to MAX_BLOCK_LEN=4 k-tiles per i row
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+  for (int i = 0; i < tiles_I; i++) {
+    int k = 0;
+    while (k < tiles_K) {
+      int batch = tiles_K - k;
+      if (batch > MAX_BLOCK_LEN) batch = MAX_BLOCK_LEN;
+      gemmini_extended_mvin(
+        (void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+        a_base + (i * tiles_K + k) * DIM,
+        batch * DIM, DIM);
+      k += batch;
+    }
+  }
+
+  // Load B tiles: stride = MATMUL_N cols, batch up to MAX_BLOCK_LEN=4 j-tiles per k row
+  gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+  for (int k = 0; k < tiles_K; k++) {
+    int j = 0;
+    while (j < tiles_J) {
+      int batch = tiles_J - j;
+      if (batch > MAX_BLOCK_LEN) batch = MAX_BLOCK_LEN;
+      gemmini_extended_mvin2(
+        (void*)(((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM),
+        b_base + (k * tiles_J + j) * DIM,
+        batch * DIM, DIM);
+      j += batch;
+    }
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  // Use larger lut_update_granularity since out_mx_fmt=3 (BF16) requires no LUT refresh;
+  // setting granularity to tiles_I*tiles_J amortizes any requantizer overhead over all output tiles.
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, tiles_I * tiles_J);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+                       a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false,
+                       NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```

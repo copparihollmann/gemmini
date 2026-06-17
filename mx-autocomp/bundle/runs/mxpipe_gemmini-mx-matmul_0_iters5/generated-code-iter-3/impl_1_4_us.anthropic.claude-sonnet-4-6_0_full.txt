@@ -1,0 +1,95 @@
+```c
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+#include "include/matmul_fp8_64x64.h"
+
+void solution(void) {
+    // Tile counts
+    const int tiles_I = MATMUL_M / DIM;  // 4
+    const int tiles_J = MATMUL_N / DIM;  // 4
+    const int tiles_K = MATMUL_K / DIM;  // 4
+
+    // Scratchpad layout
+    const uint32_t a_base    = 0;
+    const uint32_t b_base    = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    const uint32_t SPAD_DEST = 128;
+
+    // -----------------------------------------------------------------------
+    // 1. Configure execution (fp8 e4m3 inputs, BF16 output, weight-stationary)
+    // -----------------------------------------------------------------------
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+        /*C_stride*/1, /*A_stride*/1,
+        /*A_transpose*/0, /*B_transpose*/0,
+        /*set_only_strides*/false,
+        /*act_mx_fmt*/0, /*wgt_mx_fmt*/0, /*out_mx_fmt*/3, /*uselut*/0);
+
+    // -----------------------------------------------------------------------
+    // 2. Load scale factors (A: sel=0, B: sel=1)
+    // -----------------------------------------------------------------------
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+    // -----------------------------------------------------------------------
+    // 3. Configure port 0 (mvin) for A tiles and port 1 (mvin2) for B tiles
+    //    independently, then interleave A and B loads to allow the hardware
+    //    DMA engines to pipeline both streams concurrently.
+    //
+    //    Port 0 (id=0): A tiles, stride = MATMUL_K bytes per row
+    //    Port 1 (id=1): B tiles, stride = MATMUL_N bytes per row
+    // -----------------------------------------------------------------------
+    gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, /*id*/0);
+    gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, /*id*/1);
+
+    // Interleaved A (port 0) and B (port 1) loads.
+    // tiles_I == tiles_K == 4, so we pair them: iteration t loads
+    //   - A row-group t (all tiles_K k-tiles) via port 0
+    //   - B k-group t   (all tiles_J j-tiles) via port 1
+    // Both pairs are independent and can be pipelined by the hardware.
+    {
+        const elem_t *A_ptr = (const elem_t *)A_in;
+        const elem_t *B_ptr = (const elem_t *)B_in;
+
+        #pragma GCC unroll 4
+        for (int t = 0; t < tiles_I; t++) {
+            // A: row-group t — all k-tiles contiguous, batch via block_mvin (port 0)
+            const void *a_dram = (const void *)(A_ptr + (t * DIM) * MATMUL_K);
+            uint32_t    a_sp   = a_base + t * tiles_K * DIM;
+            gemmini_block_mvin(a_dram, a_sp, tiles_K);
+
+            // B: k-group t — all j-tiles contiguous, batch via mvin2 (port 1)
+            const void *b_dram = (const void *)(B_ptr + (t * DIM) * MATMUL_N);
+            uint32_t    b_sp   = b_base + t * tiles_J * DIM;
+            gemmini_extended_mvin2(b_dram, b_sp, tiles_J * DIM, DIM);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 4. Configure output store and requantizer
+    //    i_bound/j_bound/k_bound must exactly match tiles_I/tiles_J/tiles_K
+    //    used in the subsequent gemmini_loop_ws_spad call.
+    // -----------------------------------------------------------------------
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+        tiles_I, tiles_J, tiles_K,
+        /*scale_act_sel*/0, /*scale_w_sel*/0,
+        /*lut_update_granularity*/1);
+
+    // -----------------------------------------------------------------------
+    // 5. Execute fused weight-stationary tiled matmul
+    //    LOOP_WS_CONFIG_SPAD_AB (funct 24) is re-issued inside the macro
+    //    (mx_loop_spad_marker is one-shot and must be set before every call).
+    //    skip_mask=0x38: skip ldA + ldB + ldD (already in spad).
+    // -----------------------------------------------------------------------
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+        a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+        false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+    // -----------------------------------------------------------------------
+    // 6. Drain BF16 results from shared memory to DRAM, then fence
+    // -----------------------------------------------------------------------
+    gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+    gemmini_fence();
+}
+```

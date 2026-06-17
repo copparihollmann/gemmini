@@ -1,0 +1,419 @@
+Here is a detailed optimization plan followed by the complete, optimized code.
+
+### Optimization Plan: Loop Unrolling
+
+We will apply **loop unrolling** to eliminate CPU-side branching, instruction overhead, and loop control structures, which represent the main performance bottleneck in the functional simulator.
+
+1. **Unroll the Head Loop ($H=4$):** 
+   Since the number of attention heads is small ($H=4$) and the key-value heads group size is fixed ($H_{kv}=2$), we can completely unroll the outer loop `for (int h = 0; h < ATT_H; h++)`. This removes the dynamic tracking of `last_kv` and the branch overhead of `if (kv != last_kv)`. The cache loading of $K^T$ and $V$ is statically resolved:
+   - For $h=0$ (first head of $kv=0$), we statically stream $K^T[0]$ and $V[0]$.
+   - For $h=1$, we skip loading $K^T$ and $V$ entirely (reusing cached scratchpad).
+   - For $h=2$ (first head of $kv=1$), we statically stream $K^T[1]$ and $V[1]$.
+   - For $h=3$, we skip loading.
+
+2. **Unroll the Softmax Loop Nest:**
+   The CPU-side integer softmax performs unpacking, maximum extraction, and requantization. We can fully unroll and inline these operations:
+   - Replace variable-shifted unpacking (`w >> (l * 16)`) with four static 16-bit masks/shifts, avoiding ALU-intensive dynamic shifts on the CPU.
+   - Unroll the reduction groups (`GROUPS_S = 2`), executing Group 0 and Group 1 computations explicitly without loop counter updates.
+
+3. **Unroll MVIN Tile Loops:**
+   Replace the nested loop structures for loading $Q$, $P_q$, $K^T$, and $V$ with flat, contiguous sequences of `gemmini_extended_mvin` calls. This eliminates nested loop structures, address calculation ALU operations, and array offsets at runtime.
+
+---
+
+### Optimized Code
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+
+// Assuming standard target parameters and variables are declared in scope:
+// Qs, Qss, KTs, KTss, Vs, Vss, S1_hw, O_hw, P_scales, P_q, scale_factors, etc.
+
+// Optimized helper function for CPU softmax and requantization
+static inline void compute_softmax_and_requant(
+    const uint64_t S1_hw[ATT_S][ATT_S / 4],
+    elem_t P_q[ATT_S][ATT_S],
+    uint8_t P_scales[GROUPS_S][ATT_S]
+) {
+    for (int i = 0; i < ATT_S; i++) {
+        int64_t q[ATT_S];
+        int64_t mq = -((int64_t)1 << 62);
+        
+        // Unrolled unpacking of S1_hw (4 bf16 values per uint64_t)
+        for (int j = 0; j < ATT_S; j += 4) {
+            uint64_t w = S1_hw[i][j / 4];
+            uint16_t w0 = w & 0xFFFF;
+            uint16_t w1 = (w >> 16) & 0xFFFF;
+            uint16_t w2 = (w >> 32) & 0xFFFF;
+            uint16_t w3 = (w >> 48);
+            
+            int64_t qq0 = mx_ibf16_to_q(w0);
+            int64_t qq1 = mx_ibf16_to_q(w1);
+            int64_t qq2 = mx_ibf16_to_q(w2);
+            int64_t qq3 = mx_ibf16_to_q(w3);
+            
+            q[j + 0] = qq0; if (qq0 > mq) mq = qq0;
+            q[j + 1] = qq1; if (qq1 > mq) mq = qq1;
+            q[j + 2] = qq2; if (qq2 > mq) mq = qq2;
+            q[j + 3] = qq3; if (qq3 > mq) mq = qq3;
+        }
+        
+        int64_t p[ATT_S];
+        int64_t sm = 0;
+        int64_t gmax_arr[GROUPS_S];
+        
+        // Unrolled Group 0 Reduction
+        {
+            int64_t gmax = 0;
+            for (int j = 0; j < 32; j++) {
+                int64_t pv = mx_iexp(q[j] - mq);
+                p[j] = pv;
+                sm += pv;
+                if (pv > gmax) gmax = pv;
+            }
+            gmax_arr[0] = gmax;
+        }
+        
+        // Unrolled Group 1 Reduction
+        {
+            int64_t gmax = 0;
+            for (int j = 32; j < 64; j++) {
+                int64_t pv = mx_iexp(q[j] - mq);
+                p[j] = pv;
+                sm += pv;
+                if (pv > gmax) gmax = pv;
+            }
+            gmax_arr[1] = gmax;
+        }
+        
+        int ls = mx_ilog2((uint64_t)sm);
+        uint64_t inv_sm = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;
+        
+        // Unrolled Requantization for Group 0
+        {
+            int64_t gmax = gmax_arr[0];
+            if (gmax == 0) {
+                P_scales[0][i] = 0;
+                for (int j = 0; j < 32; j++) P_q[i][j] = 0;
+            } else {
+                int e = mx_ilog2((uint64_t)gmax) - ls - MX_P_TARGET_LOG2;
+                P_scales[0][i] = (uint8_t)(e + 127);
+                for (int j = 0; j < 32; j++) {
+                    P_q[i][j] = mx_ienc_fp8(p[j], inv_sm, ls, e);
+                }
+            }
+        }
+        
+        // Unrolled Requantization for Group 1
+        {
+            int64_t gmax = gmax_arr[1];
+            if (gmax == 0) {
+                P_scales[1][i] = 0;
+                for (int j = 32; j < 64; j++) P_q[i][j] = 0;
+            } else {
+                int e = mx_ilog2((uint64_t)gmax) - ls - MX_P_TARGET_LOG2;
+                P_scales[1][i] = (uint8_t)(e + 127);
+                for (int j = 32; j < 64; j++) {
+                    P_q[i][j] = mx_ienc_fp8(p[j], inv_sm, ls, e);
+                }
+            }
+        }
+    }
+}
+
+// High-performance MHA kernel (S=64, D=64, H=4, H_kv=2, causal=0, fp8:e4m3).
+void solution(void) {
+  // === Hoisted format-invariant configurations ===
+  gemmini_extended3_config_ex(
+    WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+    /*C_stride=*/1, /*A_stride=*/1,
+    /*A_transpose=*/0, /*B_transpose=*/0,
+    /*set_only_strides=*/false,
+    /*act_mx_fmt=*/0, /*wgt_mx_fmt=*/0, /*out_mx_fmt=*/3, /*uselut=*/0
+  );
+
+  uint32_t a_base = 0;
+  uint32_t b_base_KT = BANK_NUM * BANK_ROWS - 4 * 4 * DIM; // 8192 - 256 = 7936
+  uint32_t b_base_V  = b_base_KT - 4 * 4 * DIM;             // 7936 - 256 = 7680
+
+  // ==========================================
+  // HEAD 0 (kv = 0)
+  // ==========================================
+  {
+    const elem_t *Q_in = Qs[0];   const uint8_t *Q_sc = Qss[0];
+    const elem_t *KT_in = KTs[0];  const uint8_t *KT_sc = KTss[0];
+    const elem_t *V_in = Vs[0];   const uint8_t *V_sc = Vss[0];
+
+    // 1) Stream KT and V for kv = 0
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    gemmini_extended_mvin((void*)(KT_in + 0 * DIM * ATT_S + 0 * DIM), b_base_KT + 0 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(KT_in + 0 * DIM * ATT_S + 2 * DIM), b_base_KT + 2 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(KT_in + 1 * DIM * ATT_S + 0 * DIM), b_base_KT + 4 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(KT_in + 1 * DIM * ATT_S + 2 * DIM), b_base_KT + 6 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(KT_in + 2 * DIM * ATT_S + 0 * DIM), b_base_KT + 8 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(KT_in + 2 * DIM * ATT_S + 2 * DIM), b_base_KT + 10 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(KT_in + 3 * DIM * ATT_S + 0 * DIM), b_base_KT + 12 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(KT_in + 3 * DIM * ATT_S + 2 * DIM), b_base_KT + 14 * DIM, 2 * DIM, DIM);
+
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    gemmini_extended_mvin((void*)(V_in + 0 * DIM * ATT_D + 0 * DIM), b_base_V + 0 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(V_in + 0 * DIM * ATT_D + 2 * DIM), b_base_V + 2 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(V_in + 1 * DIM * ATT_D + 0 * DIM), b_base_V + 4 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(V_in + 1 * DIM * ATT_D + 2 * DIM), b_base_V + 6 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(V_in + 2 * DIM * ATT_D + 0 * DIM), b_base_V + 8 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(V_in + 2 * DIM * ATT_D + 2 * DIM), b_base_V + 10 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(V_in + 3 * DIM * ATT_D + 0 * DIM), b_base_V + 12 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(V_in + 3 * DIM * ATT_D + 2 * DIM), b_base_V + 14 * DIM, 2 * DIM, DIM);
+
+    // 2) S1 = Q @ K^T
+    gemmini_flush(0);
+    gemmini_mx_load_scales((uint64_t)Q_sc, QSS_BYTES, 0);
+    gemmini_mx_load_scales((uint64_t)KT_sc, QSS_BYTES, 1);
+
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    gemmini_extended_mvin((void*)(Q_in + 0 * DIM * ATT_D + 0 * DIM), a_base + 0 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(Q_in + 0 * DIM * ATT_D + 2 * DIM), a_base + 2 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(Q_in + 1 * DIM * ATT_D + 0 * DIM), a_base + 4 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(Q_in + 1 * DIM * ATT_D + 2 * DIM), a_base + 6 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(Q_in + 2 * DIM * ATT_D + 0 * DIM), a_base + 8 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(Q_in + 2 * DIM * ATT_D + 2 * DIM), a_base + 10 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(Q_in + 3 * DIM * ATT_D + 0 * DIM), a_base + 12 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(Q_in + 3 * DIM * ATT_D + 2 * DIM), a_base + 14 * DIM, 2 * DIM, DIM);
+
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, 4, 4, 4, 0, 0, 1);
+    
+    gemmini_loop_ws_spad(4, 4, 4, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+    gemmini_fence();
+
+    // 3) Softmax & Requant
+    compute_softmax_and_requant(S1_hw, P_q, P_scales);
+
+    // 4) O = P @ V
+    gemmini_flush(0);
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+    gemmini_mx_load_scales((uint64_t)V_sc, VSS_BYTES, 1);
+
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    gemmini_extended_mvin((void*)(P_q + 0 * DIM * ATT_S + 0 * DIM), a_base + 0 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(P_q + 0 * DIM * ATT_S + 2 * DIM), a_base + 2 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(P_q + 1 * DIM * ATT_S + 0 * DIM), a_base + 4 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(P_q + 1 * DIM * ATT_S + 2 * DIM), a_base + 6 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(P_q + 2 * DIM * ATT_S + 0 * DIM), a_base + 8 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(P_q + 2 * DIM * ATT_S + 2 * DIM), a_base + 10 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(P_q + 3 * DIM * ATT_S + 0 * DIM), a_base + 12 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(P_q + 3 * DIM * ATT_S + 2 * DIM), a_base + 14 * DIM, 2 * DIM, DIM);
+
+    gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, 4, 4, 4, 0, 0, 1);
+
+    gemmini_loop_ws_spad(4, 4, 4, 0, 0, 0, a_base, b_base_KT, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[0][0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+    gemmini_fence();
+  }
+
+  // ==========================================
+  // HEAD 1 (kv = 0)
+  // ==========================================
+  {
+    const elem_t *Q_in = Qs[1];   const uint8_t *Q_sc = Qss[1];
+    const uint8_t *KT_sc = KTss[0];
+    const uint8_t *V_sc = Vss[0];
+
+    // KT and V are already resident in scratchpad
+
+    // 2) S1 = Q @ K^T
+    gemmini_flush(0);
+    gemmini_mx_load_scales((uint64_t)Q_sc, QSS_BYTES, 0);
+    gemmini_mx_load_scales((uint64_t)KT_sc, QSS_BYTES, 1);
+
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    gemmini_extended_mvin((void*)(Q_in + 0 * DIM * ATT_D + 0 * DIM), a_base + 0 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(Q_in + 0 * DIM * ATT_D + 2 * DIM), a_base + 2 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(Q_in + 1 * DIM * ATT_D + 0 * DIM), a_base + 4 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(Q_in + 1 * DIM * ATT_D + 2 * DIM), a_base + 6 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(Q_in + 2 * DIM * ATT_D + 0 * DIM), a_base + 8 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(Q_in + 2 * DIM * ATT_D + 2 * DIM), a_base + 10 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(Q_in + 3 * DIM * ATT_D + 0 * DIM), a_base + 12 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(Q_in + 3 * DIM * ATT_D + 2 * DIM), a_base + 14 * DIM, 2 * DIM, DIM);
+
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, 4, 4, 4, 0, 0, 1);
+    
+    gemmini_loop_ws_spad(4, 4, 4, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+    gemmini_fence();
+
+    // 3) Softmax & Requant
+    compute_softmax_and_requant(S1_hw, P_q, P_scales);
+
+    // 4) O = P @ V
+    gemmini_flush(0);
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+    gemmini_mx_load_scales((uint64_t)V_sc, VSS_BYTES, 1);
+
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    gemmini_extended_mvin((void*)(P_q + 0 * DIM * ATT_S + 0 * DIM), a_base + 0 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(P_q + 0 * DIM * ATT_S + 2 * DIM), a_base + 2 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(P_q + 1 * DIM * ATT_S + 0 * DIM), a_base + 4 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(P_q + 1 * DIM * ATT_S + 2 * DIM), a_base + 6 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(P_q + 2 * DIM * ATT_S + 0 * DIM), a_base + 8 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(P_q + 2 * DIM * ATT_S + 2 * DIM), a_base + 10 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(P_q + 3 * DIM * ATT_S + 0 * DIM), a_base + 12 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(P_q + 3 * DIM * ATT_S + 2 * DIM), a_base + 14 * DIM, 2 * DIM, DIM);
+
+    gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, 4, 4, 4, 0, 0, 1);
+
+    gemmini_loop_ws_spad(4, 4, 4, 0, 0, 0, a_base, b_base_KT, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[1][0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+    gemmini_fence();
+  }
+
+  // ==========================================
+  // HEAD 2 (kv = 1)
+  // ==========================================
+  {
+    const elem_t *Q_in = Qs[2];   const uint8_t *Q_sc = Qss[2];
+    const elem_t *KT_in = KTs[1];  const uint8_t *KT_sc = KTss[1];
+    const elem_t *V_in = Vs[1];   const uint8_t *V_sc = Vss[1];
+
+    // 1) Stream KT and V for kv = 1
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    gemmini_extended_mvin((void*)(KT_in + 0 * DIM * ATT_S + 0 * DIM), b_base_KT + 0 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(KT_in + 0 * DIM * ATT_S + 2 * DIM), b_base_KT + 2 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(KT_in + 1 * DIM * ATT_S + 0 * DIM), b_base_KT + 4 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(KT_in + 1 * DIM * ATT_S + 2 * DIM), b_base_KT + 6 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(KT_in + 2 * DIM * ATT_S + 0 * DIM), b_base_KT + 8 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(KT_in + 2 * DIM * ATT_S + 2 * DIM), b_base_KT + 10 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(KT_in + 3 * DIM * ATT_S + 0 * DIM), b_base_KT + 12 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(KT_in + 3 * DIM * ATT_S + 2 * DIM), b_base_KT + 14 * DIM, 2 * DIM, DIM);
+
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    gemmini_extended_mvin((void*)(V_in + 0 * DIM * ATT_D + 0 * DIM), b_base_V + 0 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(V_in + 0 * DIM * ATT_D + 2 * DIM), b_base_V + 2 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(V_in + 1 * DIM * ATT_D + 0 * DIM), b_base_V + 4 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(V_in + 1 * DIM * ATT_D + 2 * DIM), b_base_V + 6 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(V_in + 2 * DIM * ATT_D + 0 * DIM), b_base_V + 8 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(V_in + 2 * DIM * ATT_D + 2 * DIM), b_base_V + 10 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(V_in + 3 * DIM * ATT_D + 0 * DIM), b_base_V + 12 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(V_in + 3 * DIM * ATT_D + 2 * DIM), b_base_V + 14 * DIM, 2 * DIM, DIM);
+
+    // 2) S1 = Q @ K^T
+    gemmini_flush(0);
+    gemmini_mx_load_scales((uint64_t)Q_sc, QSS_BYTES, 0);
+    gemmini_mx_load_scales((uint64_t)KT_sc, QSS_BYTES, 1);
+
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    gemmini_extended_mvin((void*)(Q_in + 0 * DIM * ATT_D + 0 * DIM), a_base + 0 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(Q_in + 0 * DIM * ATT_D + 2 * DIM), a_base + 2 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(Q_in + 1 * DIM * ATT_D + 0 * DIM), a_base + 4 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(Q_in + 1 * DIM * ATT_D + 2 * DIM), a_base + 6 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(Q_in + 2 * DIM * ATT_D + 0 * DIM), a_base + 8 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(Q_in + 2 * DIM * ATT_D + 2 * DIM), a_base + 10 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(Q_in + 3 * DIM * ATT_D + 0 * DIM), a_base + 12 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(Q_in + 3 * DIM * ATT_D + 2 * DIM), a_base + 14 * DIM, 2 * DIM, DIM);
+
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, 4, 4, 4, 0, 0, 1);
+    
+    gemmini_loop_ws_spad(4, 4, 4, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+    gemmini_fence();
+
+    // 3) Softmax & Requant
+    compute_softmax_and_requant(S1_hw, P_q, P_scales);
+
+    // 4) O = P @ V
+    gemmini_flush(0);
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+    gemmini_mx_load_scales((uint64_t)V_sc, VSS_BYTES, 1);
+
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    gemmini_extended_mvin((void*)(P_q + 0 * DIM * ATT_S + 0 * DIM), a_base + 0 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(P_q + 0 * DIM * ATT_S + 2 * DIM), a_base + 2 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(P_q + 1 * DIM * ATT_S + 0 * DIM), a_base + 4 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(P_q + 1 * DIM * ATT_S + 2 * DIM), a_base + 6 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(P_q + 2 * DIM * ATT_S + 0 * DIM), a_base + 8 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(P_q + 2 * DIM * ATT_S + 2 * DIM), a_base + 10 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(P_q + 3 * DIM * ATT_S + 0 * DIM), a_base + 12 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(P_q + 3 * DIM * ATT_S + 2 * DIM), a_base + 14 * DIM, 2 * DIM, DIM);
+
+    gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, 4, 4, 4, 0, 0, 1);
+
+    gemmini_loop_ws_spad(4, 4, 4, 0, 0, 0, a_base, b_base_KT, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[2][0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+    gemmini_fence();
+  }
+
+  // ==========================================
+  // HEAD 3 (kv = 1)
+  // ==========================================
+  {
+    const elem_t *Q_in = Qs[3];   const uint8_t *Q_sc = Qss[3];
+    const uint8_t *KT_sc = KTss[1];
+    const uint8_t *V_sc = Vss[1];
+
+    // KT and V are already resident in scratchpad
+
+    // 2) S1 = Q @ K^T
+    gemmini_flush(0);
+    gemmini_mx_load_scales((uint64_t)Q_sc, QSS_BYTES, 0);
+    gemmini_mx_load_scales((uint64_t)KT_sc, QSS_BYTES, 1);
+
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    gemmini_extended_mvin((void*)(Q_in + 0 * DIM * ATT_D + 0 * DIM), a_base + 0 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(Q_in + 0 * DIM * ATT_D + 2 * DIM), a_base + 2 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(Q_in + 1 * DIM * ATT_D + 0 * DIM), a_base + 4 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(Q_in + 1 * DIM * ATT_D + 2 * DIM), a_base + 6 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(Q_in + 2 * DIM * ATT_D + 0 * DIM), a_base + 8 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(Q_in + 2 * DIM * ATT_D + 2 * DIM), a_base + 10 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(Q_in + 3 * DIM * ATT_D + 0 * DIM), a_base + 12 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(Q_in + 3 * DIM * ATT_D + 2 * DIM), a_base + 14 * DIM, 2 * DIM, DIM);
+
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, 4, 4, 4, 0, 0, 1);
+    
+    gemmini_loop_ws_spad(4, 4, 4, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+    gemmini_fence();
+
+    // 3) Softmax & Requant
+    compute_softmax_and_requant(S1_hw, P_q, P_scales);
+
+    // 4) O = P @ V
+    gemmini_flush(0);
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+    gemmini_mx_load_scales((uint64_t)V_sc, VSS_BYTES, 1);
+
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    gemmini_extended_mvin((void*)(P_q + 0 * DIM * ATT_S + 0 * DIM), a_base + 0 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(P_q + 0 * DIM * ATT_S + 2 * DIM), a_base + 2 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(P_q + 1 * DIM * ATT_S + 0 * DIM), a_base + 4 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(P_q + 1 * DIM * ATT_S + 2 * DIM), a_base + 6 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(P_q + 2 * DIM * ATT_S + 0 * DIM), a_base + 8 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(P_q + 2 * DIM * ATT_S + 2 * DIM), a_base + 10 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(P_q + 3 * DIM * ATT_S + 0 * DIM), a_base + 12 * DIM, 2 * DIM, DIM);
+    gemmini_extended_mvin((void*)(P_q + 3 * DIM * ATT_S + 2 * DIM), a_base + 14 * DIM, 2 * DIM, DIM);
+
+    gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, 4, 4, 4, 0, 0, 1);
+
+    gemmini_loop_ws_spad(4, 4, 4, 0, 0, 0, a_base, b_base_KT, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[3][0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+    gemmini_fence();
+  }
+}
+```

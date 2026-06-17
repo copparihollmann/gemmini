@@ -1,0 +1,80 @@
+An elegant and highly effective optimization strategy for this accelerator is **Direct DRAM Scale Loading & Monolithic Scratchpad/Accumulator Packing (Zero-Staging / Monolithic Tiling)**.
+
+### Explanation of the Strategy
+Instead of partitioning the $64 \times 64$ matrix multiplication into smaller blocks (`BLOCKS_M` $\times$ `BLOCKS_N`) via nested C loops, we scale up the tile sizes to the hardware's maximum capability. 
+
+The baseline solution suffers from severe host CPU overhead due to:
+1. Copying row-wise and column-wise scale factors to local temporary arrays (`A_s` and `B_s`) via `memcpy` before loading them.
+2. Frequent overhead of setting up and flushing the hardware pipeline inside highly nested CPU loops.
+
+Since the problem size is $64 \times 64 \times 64$, we can exploit the 256KB scratchpad and 64KB accumulator to fit the **entire** computation on-chip at once:
+- **Scratchpad Space**: We define `tiles_I = 4`, `tiles_J = 4`, and `tiles_K = 4`. The total scratchpad rows needed for both $A$ and $B$ tiles is $(4 \times 4 + 4 \times 4) \times 16 = 512$ rows. This is well within the 8192-row scratchpad limit.
+- **Accumulator Space**: The output $C$ requires $4 \times 4 \times 16 = 256$ accumulator rows, which perfectly utilizes the entire 256-row accumulator.
+
+By matching the tiling parameters to the full problem dimensions, we can completely eliminate the CPU loops and the host staging buffers:
+1. **Direct DRAM Scale Load**: We load `A_scales_row` and `B_scales_col` directly from their original DRAM addresses via a single DMA operation (`gemmini_mx_load_scales`), eliminating all CPU `memcpy` overheads.
+2. **Monolithic Hardware Computation**: We issue a single `gemmini_loop_ws_spad` command, leaving the entire tiled execution to the hardware controller.
+3. **One-Shot Readout**: We drain the entire output matrix $C$ back from shared memory using a single `gemmini_mx_read_smem` instruction.
+
+---
+
+### Optimized Code
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+#include "include/matmul_data_mx_lut_hw.h"
+
+// Optimized monolithic MX matmul solution.
+void solution(void) {
+  // 1. Configure execution: Weight-stationary, MX format (act=0, wgt=0, out=3, uselut=0)
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // 2. Direct DRAM Scale Loading (no staging buffers, no memcpy)
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Define tile counts for a single monolithic 64x64 matmul (4x4 tiles of DIM=16)
+  int tiles_I = MATMUL_M / DIM;
+  int tiles_J = MATMUL_N / DIM;
+  int tiles_K = MATMUL_K / DIM;
+
+  uint32_t a_base = 0;
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+  int SPAD_DEST = 128;
+
+  // 3. MVIN A tiles directly from strided DRAM
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  // 4. MVIN B tiles directly from strided DRAM
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base + (j * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  // 5. Configure store stride and requantizer mvout bounds
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // 6. Fused weight-stationary hardware compute loop
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+                       a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                       false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // 7. Monolithic readout of the entire result matrix from shared memory to DRAM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```

@@ -1,0 +1,92 @@
+## Strategy: Eliminate the `gemmini_flush(0)` Inside the Loop
+
+### Observation
+
+The original code issues `gemmini_flush(0)` at the **start of every (i0, j0) iteration** — inside both the outer `i0` loop and the inner `j0` loop. `gemmini_flush` is a full pipeline drain/reset instruction that stalls the host until all in-flight accelerator operations complete and the accelerator is in a quiescent state. This is expensive because:
+
+1. It serializes every block iteration: the accelerator cannot begin the next block's mvin/compute pipeline until the flush fully completes.
+2. It prevents any overlap between the tail of one block (e.g., `gemmini_mx_read_smem`, DMA writeback) and the head of the next block (config, scale loads, mvin).
+3. For a 41×512×512 problem with `BLK` tiles, this flush fires on **every outer tile pair** — potentially dozens of times — adding pure stall cycles each time.
+
+### Why It Is Unnecessary Here
+
+`gemmini_flush` is only required at program start (to reset stale hardware state from a previous kernel) or when changing fundamental hardware modes. In this kernel:
+
+- The MX format fields (`act_mx_fmt`, `wgt_mx_fmt`, `out_mx_fmt`) are **invariant** across all (i0, j0) iterations — they are always FP8/BF16 with the same config.
+- The scratchpad layout is **recomputed identically** every iteration (`a_base=0`, `b_base=BANK_NUM*BANK_ROWS - tiles*tiles_K*DIM`), so there is no residual state hazard.
+- `gemmini_fence()` at the end of each iteration **already ensures** that all DMA writes from `gemmini_mx_read_smem` are visible to the host before the next iteration reads `C_hw`. The fence is a sufficient ordering barrier for correctness; the flush is not needed in addition to it.
+
+### The Fix
+
+Move `gemmini_flush(0)` to **outside and before the outermost loop** (called once at kernel entry), and remove it from the per-iteration body:
+
+```c
+void solution(void) {
+  // ONE flush at kernel entry to reset any prior accelerator state.
+  gemmini_flush(0);
+
+  // ONE config_ex outside all loops — format is invariant.
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                               1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      // No gemmini_flush here — removed.
+      // No gemmini_extended3_config_ex here — hoisted above.
+
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int j = 0; j < tiles; j++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+            b_base + (k * tiles + j) * DIM, DIM, DIM);
+
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0,
+                           a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                           false, false, false, false, false,
+                           NO_ACTIVATION, 0, 0, false, 0x38);
+
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(
+          &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+          SPAD_DEST * 16 + r * BLK, ncols);
+
+      gemmini_fence();
+    }
+  }
+}
+```
+
+### Why This Improves Performance
+
+- **Eliminates O(BLOCKS_M × BLOCKS_N) full pipeline stalls.** Each `gemmini_flush` was a synchronization barrier costing at minimum one round-trip drain of the accelerator's instruction queue plus any in-flight DMA. Removing these allows the accelerator's command queue to stay populated across iterations.
+- **Enables pipelining across iterations.** With the flush gone, the tail of one iteration (the `gemmini_mx_read_smem` DMA and the `gemmini_fence`) can overlap with the accelerator immediately accepting the next iteration's `gemmini_mx_load_scales` and mvin commands into its queue, reducing idle bubbles.
+- **`gemmini_fence()` at the end of each iteration still guarantees correctness**: it ensures the host-visible `C_hw` writes are complete before the next iteration would overwrite `SPAD_DEST` or `scale_factors`, so no data hazard is introduced.
+- The **config_ex hoist** (also applied above, consistent with strategy 1 from the provided list) removes redundant reconfiguration overhead, complementing the flush removal.

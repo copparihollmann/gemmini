@@ -1,0 +1,374 @@
+{'correct': True, 'test_results': {0: True}, 'compiled': True, 'latency': 97}
+Prev latency: 97
+New latency: 97
+Plan: ## Analysis of the Current Code
+
+Looking at the current code, I need to identify the key inefficiency to target.
+
+The current B mvin uses:
+```c
+gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+```
+
+Where `elem_t = uint8_t` (1 byte), so this sets stride = `MATMUL_N * 1 = MATMUL_N` bytes.
+
+However, B is stored in FP8 format (from the context: `GEMMINI_FORMAT 1` for fp6, but the original code uses `wgt_mx_fmt=0` which is FP8 E4M3). Looking at the architecture: FP8 means 1 byte per element, so `VALUES_PER_BYTE = 1` for FP8... but the reference pattern uses `VALUES_PER_BYTE = 2` and configures B stride as `(MATMUL_N / VALUES_PER_BYTE) * sizeof(uint8_t)`.
+
+Wait - in the original code being optimized, `wgt_mx_fmt=0` (FP8), and `gemmini_config_ld(MATMUL_N * sizeof(elem_t))` sets stride = MATMUL_N bytes. For FP8, this is correct since each element is 1 byte.
+
+But looking more carefully at the reference pattern (`matmul_ws_mx_generic.c`), it uses `VALUES_PER_BYTE = 2` for B (FP6 format packs 2 values/byte), setting stride = `MATMUL_N/2` bytes. This matches **strategy 12**: configuring B mvin stride to match the actual packed-byte row width.
+
+In the original code with `wgt_mx_fmt=0` (FP8), 1 byte per element, the stride `MATMUL_N * sizeof(uint8_t)` is actually correct. So strategy 12 doesn't apply here unless the format has packing.
+
+Let me reconsider. The `gemmini_block_mvin` for B uses `tiles_J` — if `tiles_J ≤ 4 = MAX_BLOCK_LEN`, this is already batched. The key remaining opportunity is **strategy 12** applied correctly, or **strategy 14** for chunking.
+
+Actually, looking at the B mvin: `gemmini_block_mvin` sends `tiles_J` tiles at once. If `tiles_J > MAX_BLOCK_LEN=4`, this would be incorrect/overflow. The plan should use **strategy 14** to chunk into groups of MAX_BLOCK_LEN=4.
+
+## Plan: Strategy 14 — Chunk `gemmini_block_mvin` into MAX_BLOCK_LEN=4 Groups
+
+**Problem:** The current code issues `gemmini_block_mvin(..., tiles_J)` for B tiles in a single call. If `tiles_J > 4`, this exceeds `MAX_BLOCK_LEN=4` and causes incorrect DMA behavior. Similarly for A tiles with `tiles_K`. Even when the current dimensions fit within 4, restructuring to always batch in groups of exactly 4 ensures correctness and maximizes DMA burst efficiency for larger problem sizes.
+
+**Change for B mvin:**
+Instead of one `gemmini_block_mvin` per k-row loading all `tiles_J` tiles, chunk into groups of `MAX_BLOCK_LEN=4`:
+
+```c
+gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j += MAX_BLOCK_LEN) {
+        int batch = (tiles_J - j < MAX_BLOCK_LEN) ? (tiles_J - j) : MAX_BLOCK_LEN;
+        elem_t *dram_ptr = ((elem_t*)B_in) + (k * DIM) * MATMUL_N + j * DIM;
+        uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+        gemmini_block_mvin((void*)dram_ptr, sp_addr, batch);
+    }
+}
+```
+
+**Change for A mvin:**
+Similarly chunk A:
+```c
+gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+        int batch = (tiles_K - k < MAX_BLOCK_LEN) ? (tiles_K - k) : MAX_BLOCK_LEN;
+        elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+        uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+        gemmini_block_mvin((void*)dram_ptr, sp_addr, batch);
+    }
+}
+```
+
+This ensures each DMA command transfers exactly MAX_BLOCK_LEN=4 tiles (the hardware maximum burst), minimizing instruction dispatch overhead and maximizing DMA efficiency.
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // MVIN A: chunk into groups of MAX_BLOCK_LEN=4 tiles along K dimension
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+      int batch = (tiles_K - k < MAX_BLOCK_LEN) ? (tiles_K - k) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_block_mvin((void*)dram_ptr, sp_addr, batch);
+    }
+  }
+
+  // MVIN B: chunk into groups of MAX_BLOCK_LEN=4 tiles along J dimension
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j += MAX_BLOCK_LEN) {
+      int batch = (tiles_J - j < MAX_BLOCK_LEN) ? (tiles_J - j) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)B_in) + (k * DIM) * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+      gemmini_block_mvin((void*)dram_ptr, sp_addr, batch);
+    }
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+CodeCandidate(parent=CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED baseline MX matmul kernel (64x64x64, fp8:e4m3).
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K
+  for (int i = 0; i < tiles_I; i++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+  // B tile (k,j) = B_in[k][j] (stride N) into scratchpad slot (k*tiles_J + j) —
+  // the layout gemmini\'s MX loop reads (B_t = B_sp + (k*TJ + j)*DIM). The old
+  // (j*tiles_K + k) slot was a transpose: correct only when N==K, garbage otherwise.
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+  for (int j = 0; j < tiles_J; j++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + j * DIM),
+                            b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+''',
+score=279,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''## Analysis of the Current Code
+
+Looking at the original code, I need to identify which strategy offers the most impactful single improvement.
+
+The current mvin loops are:
+```c
+gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+for (int i = 0; i < tiles_I; i++)
+    for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin(..., a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+for (int j = 0; j < tiles_J; j++)
+    for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin(..., b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+```
+
+With `MATMUL_M=MATMUL_N=MATMUL_K=64` and `DIM=16`: `tiles_I=4, tiles_J=4, tiles_K=4`. This means **16 individual mvin calls for A** and **16 individual mvin calls for B** = 32 total DMA commands.
+
+## Selected Strategy: #11 — Use `gemmini_block_mvin` (multi-tile DMA)
+
+**Why this is the best single strategy here:** Each tile occupies exactly DIM=16 rows in both DRAM and the scratchpad. When iterating over k for a fixed i (A) or over k for a fixed j (B), consecutive k-tiles are contiguous in DRAM (stride is already set to the full row width) **and** contiguous in the scratchpad (addresses are sequential with step DIM). `MAX_BLOCK_LEN=4` allows batching up to 4 tiles per single DMA command. Since `tiles_K=4`, each entire (i, *) A-row and each entire (j, *) B-column can be transferred in a **single** `gemmini_block_mvin` call, reducing 32 DMA commands to 8 total — a 4× reduction in DMA command overhead.
+
+## Plan
+
+**For A tiles:** The inner loop over `k` (k=0..tiles_K-1=3) for a fixed `i` produces scratchpad addresses `a_base + (i*tiles_K + 0)*DIM` through `a_base + (i*tiles_K + 3)*DIM` — these are contiguous with step DIM, matching `block_mvin`\'s requirement. The DRAM pointer `A_in + i*DIM*MATMUL_K + 0*DIM` is the start of a block of `tiles_K * DIM = 4*16 = 64` bytes — exactly one full DRAM row of A (since `MATMUL_K=64`). Replace the inner k-loop with a single `gemmini_block_mvin(dram_ptr, spad_addr, tiles_K)` call.
+
+**For B tiles:** Similarly, the inner loop over `k` for a fixed `j` produces scratchpad addresses `b_base + (0*tiles_J + j)*DIM`, `b_base + (1*tiles_J + j)*DIM`, ... — **not** contiguous because the stride between successive k-values is `tiles_J*DIM`, not `DIM`. So `gemmini_block_mvin` cannot be applied directly to the k-inner loop for B. However, reordering the B loop to iterate `k` outer, `j` inner: for a fixed `k`, addresses `b_base + (k*tiles_J + 0)*DIM` through `b_base + (k*tiles_J + 3)*DIM` are contiguous with step DIM, and DRAM addresses `B_in + k*DIM*MATMUL_N + 0*DIM` through `B_in + k*DIM*MATMUL_N + 3*DIM` are contiguous. Replace the inner j-loop with `gemmini_block_mvin(dram_ptr, spad_addr, tiles_J)`.
+
+This reduces both loops from 16 commands each to 4 commands each (one per outer tile), totaling 8 DMA commands instead of 32 — a **4× reduction** in mvin command count with no change to correctness or data layout.
+
+## Rewritten Code
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // MVIN A: for each row-tile i, all tiles_K k-tiles are contiguous in DRAM
+  // and scratchpad, so batch them in a single block_mvin (tiles_K <= MAX_BLOCK_LEN=4).
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K;
+    uint32_t sp_addr = a_base + (i * tiles_K) * DIM;
+    gemmini_block_mvin((void*)dram_ptr, sp_addr, tiles_K);
+  }
+
+  // MVIN B: reorder to k-outer, j-inner so all j-tiles for a fixed k are
+  // contiguous in DRAM and scratchpad, then batch in a single block_mvin.
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int k = 0; k < tiles_K; k++) {
+    elem_t *dram_ptr = ((elem_t*)B_in) + (k * DIM) * MATMUL_N;
+    uint32_t sp_addr = b_base + (k * tiles_J) * DIM;
+    gemmini_block_mvin((void*)dram_ptr, sp_addr, tiles_J);
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```''',
+code='''void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // MVIN A: for each row-tile i, all tiles_K k-tiles are contiguous in DRAM
+  // and scratchpad, so batch them in a single block_mvin (tiles_K <= MAX_BLOCK_LEN=4).
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K;
+    uint32_t sp_addr = a_base + (i * tiles_K) * DIM;
+    gemmini_block_mvin((void*)dram_ptr, sp_addr, tiles_K);
+  }
+
+  // MVIN B: reorder to k-outer, j-inner so all j-tiles for a fixed k are
+  // contiguous in DRAM and scratchpad, then batch in a single block_mvin.
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int k = 0; k < tiles_K; k++) {
+    elem_t *dram_ptr = ((elem_t*)B_in) + (k * DIM) * MATMUL_N;
+    uint32_t sp_addr = b_base + (k * tiles_J) * DIM;
+    gemmini_block_mvin((void*)dram_ptr, sp_addr, tiles_J);
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+''',
+score=97,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='us.anthropic.claude-sonnet-4-6',
+code_gen_model='us.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None),
+plan='''## Analysis of the Current Code
+
+Looking at the current code, I need to identify the key inefficiency to target.
+
+The current B mvin uses:
+```c
+gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+```
+
+Where `elem_t = uint8_t` (1 byte), so this sets stride = `MATMUL_N * 1 = MATMUL_N` bytes.
+
+However, B is stored in FP8 format (from the context: `GEMMINI_FORMAT 1` for fp6, but the original code uses `wgt_mx_fmt=0` which is FP8 E4M3). Looking at the architecture: FP8 means 1 byte per element, so `VALUES_PER_BYTE = 1` for FP8... but the reference pattern uses `VALUES_PER_BYTE = 2` and configures B stride as `(MATMUL_N / VALUES_PER_BYTE) * sizeof(uint8_t)`.
+
+Wait - in the original code being optimized, `wgt_mx_fmt=0` (FP8), and `gemmini_config_ld(MATMUL_N * sizeof(elem_t))` sets stride = MATMUL_N bytes. For FP8, this is correct since each element is 1 byte.
+
+But looking more carefully at the reference pattern (`matmul_ws_mx_generic.c`), it uses `VALUES_PER_BYTE = 2` for B (FP6 format packs 2 values/byte), setting stride = `MATMUL_N/2` bytes. This matches **strategy 12**: configuring B mvin stride to match the actual packed-byte row width.
+
+In the original code with `wgt_mx_fmt=0` (FP8), 1 byte per element, the stride `MATMUL_N * sizeof(uint8_t)` is actually correct. So strategy 12 doesn\'t apply here unless the format has packing.
+
+Let me reconsider. The `gemmini_block_mvin` for B uses `tiles_J` — if `tiles_J ≤ 4 = MAX_BLOCK_LEN`, this is already batched. The key remaining opportunity is **strategy 12** applied correctly, or **strategy 14** for chunking.
+
+Actually, looking at the B mvin: `gemmini_block_mvin` sends `tiles_J` tiles at once. If `tiles_J > MAX_BLOCK_LEN=4`, this would be incorrect/overflow. The plan should use **strategy 14** to chunk into groups of MAX_BLOCK_LEN=4.
+
+## Plan: Strategy 14 — Chunk `gemmini_block_mvin` into MAX_BLOCK_LEN=4 Groups
+
+**Problem:** The current code issues `gemmini_block_mvin(..., tiles_J)` for B tiles in a single call. If `tiles_J > 4`, this exceeds `MAX_BLOCK_LEN=4` and causes incorrect DMA behavior. Similarly for A tiles with `tiles_K`. Even when the current dimensions fit within 4, restructuring to always batch in groups of exactly 4 ensures correctness and maximizes DMA burst efficiency for larger problem sizes.
+
+**Change for B mvin:**
+Instead of one `gemmini_block_mvin` per k-row loading all `tiles_J` tiles, chunk into groups of `MAX_BLOCK_LEN=4`:
+
+```c
+gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j += MAX_BLOCK_LEN) {
+        int batch = (tiles_J - j < MAX_BLOCK_LEN) ? (tiles_J - j) : MAX_BLOCK_LEN;
+        elem_t *dram_ptr = ((elem_t*)B_in) + (k * DIM) * MATMUL_N + j * DIM;
+        uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+        gemmini_block_mvin((void*)dram_ptr, sp_addr, batch);
+    }
+}
+```
+
+**Change for A mvin:**
+Similarly chunk A:
+```c
+gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+        int batch = (tiles_K - k < MAX_BLOCK_LEN) ? (tiles_K - k) : MAX_BLOCK_LEN;
+        elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+        uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+        gemmini_block_mvin((void*)dram_ptr, sp_addr, batch);
+    }
+}
+```
+
+This ensures each DMA command transfers exactly MAX_BLOCK_LEN=4 tiles (the hardware maximum burst), minimizing instruction dispatch overhead and maximizing DMA efficiency.
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // MVIN A: chunk into groups of MAX_BLOCK_LEN=4 tiles along K dimension
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+      int batch = (tiles_K - k < MAX_BLOCK_LEN) ? (tiles_K - k) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_block_mvin((void*)dram_ptr, sp_addr, batch);
+    }
+  }
+
+  // MVIN B: chunk into groups of MAX_BLOCK_LEN=4 tiles along J dimension
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j += MAX_BLOCK_LEN) {
+      int batch = (tiles_J - j < MAX_BLOCK_LEN) ? (tiles_J - j) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)B_in) + (k * DIM) * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+      gemmini_block_mvin((void*)dram_ptr, sp_addr, batch);
+    }
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```''',
+code='''void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // MVIN A: chunk into groups of MAX_BLOCK_LEN=4 tiles along K dimension
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+      int batch = (tiles_K - k < MAX_BLOCK_LEN) ? (tiles_K - k) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_block_mvin((void*)dram_ptr, sp_addr, batch);
+    }
+  }
+
+  // MVIN B: chunk into groups of MAX_BLOCK_LEN=4 tiles along J dimension
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j += MAX_BLOCK_LEN) {
+      int batch = (tiles_J - j < MAX_BLOCK_LEN) ? (tiles_J - j) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)B_in) + (k * DIM) * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+      gemmini_block_mvin((void*)dram_ptr, sp_addr, batch);
+    }
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+''',
+score=None,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='us.anthropic.claude-sonnet-4-6',
+code_gen_model='us.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None)

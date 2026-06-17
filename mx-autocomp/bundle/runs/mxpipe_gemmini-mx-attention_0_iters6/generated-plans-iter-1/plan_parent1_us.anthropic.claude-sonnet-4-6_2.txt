@@ -1,0 +1,164 @@
+## Strategy: Eliminate Redundant `gemmini_flush` Between the Two Matmuls
+
+### Analysis of the Problem
+
+The original code calls `gemmini_flush(0)` at the beginning of **both** matmul blocks (S1 = Q@K^T and O = P@V). The `gemmini_flush` instruction drains the entire Gemmini pipeline and resets internal state. Between the two matmuls, the second flush is unnecessary overhead because:
+
+1. The `gemmini_mx_read_smem` + `gemmini_fence()` at the end of the first matmul already ensures all results are drained and the accelerator is idle before the softmax loop begins.
+2. The softmax loop runs entirely on the CPU with no Gemmini instructions, so the accelerator is guaranteed to be idle when the second matmul begins.
+3. The second `gemmini_flush` therefore stalls for no reason — it just wastes cycles waiting for a pipeline that's already empty.
+
+### What to Change
+
+Remove the `gemmini_flush(0)` call from the second matmul block (O = P@V). The first flush at the very start of `solution()` is necessary to establish a clean initial state. The second one is redundant.
+
+Additionally, since both matmuls use **identical** configuration parameters:
+- Same dataflow: `WEIGHT_STATIONARY`
+- Same format fields: `act_mx_fmt=0, wgt_mx_fmt=0, out_mx_fmt=3, uselut=0`
+- Same strides: `C_stride=1, A_stride=1`
+- Same transposes: `A_transpose=0, B_transpose=0`
+
+The `gemmini_extended3_config_ex` call in the second matmul can use `set_only_strides=false` but crucially we can **hoist the shared config** before the first matmul and use `set_only_strides=true` (bit 7 of RS1) for any stride-only re-issue, or simply skip the second `config_ex` entirely since all format fields are unchanged after the first config. The `gemmini_flush` resets Gemmini's internal state (including format configuration), so eliminating it means the config from the first matmul is still valid — and the second `gemmini_extended3_config_ex` call becomes redundant too and can be removed.
+
+### Implementation
+
+```c
+void solution(void) {
+  // Single flush + config at the top; valid for both matmuls
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                               1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    // No flush, no config_ex here — already done above
+    gemmini_mx_load_scales((uint64_t)&Q_scales_row, sizeof(Q_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&KT_scales_col, sizeof(KT_scales_col), 1);
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) {
+        int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+      }
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) {
+        int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+      }
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+    gemmini_fence();
+  }
+
+  // ---- 2) FLOAT-FREE integer softmax + fp8 requant (4 rows at a time) ----
+  for (int i = 0; i < ATT_S; i += 4) {
+    int64_t q[4][ATT_S];
+    int64_t mq[4];
+    int64_t p[4][ATT_S];
+    int64_t sm[4];
+    int ls[4];
+    uint64_t inv_sm[4];
+
+    mq[0] = mq[1] = mq[2] = mq[3] = -((int64_t)1 << 62);
+
+    for (int j = 0; j < ATT_S; j += 4) {
+      uint64_t w0 = S1_hw[i + 0][j / 4];
+      uint64_t w1 = S1_hw[i + 1][j / 4];
+      uint64_t w2 = S1_hw[i + 2][j / 4];
+      uint64_t w3 = S1_hw[i + 3][j / 4];
+      for (int l = 0; l < 4; l++) {
+        int shift = l * 16;
+        int64_t qq0 = mx_ibf16_to_q((uint16_t)((w0 >> shift) & 0xFFFF));
+        int64_t qq1 = mx_ibf16_to_q((uint16_t)((w1 >> shift) & 0xFFFF));
+        int64_t qq2 = mx_ibf16_to_q((uint16_t)((w2 >> shift) & 0xFFFF));
+        int64_t qq3 = mx_ibf16_to_q((uint16_t)((w3 >> shift) & 0xFFFF));
+        q[0][j + l] = qq0; if (qq0 > mq[0]) mq[0] = qq0;
+        q[1][j + l] = qq1; if (qq1 > mq[1]) mq[1] = qq1;
+        q[2][j + l] = qq2; if (qq2 > mq[2]) mq[2] = qq2;
+        q[3][j + l] = qq3; if (qq3 > mq[3]) mq[3] = qq3;
+      }
+    }
+
+    sm[0] = sm[1] = sm[2] = sm[3] = 0;
+    for (int j = 0; j < ATT_S; j++) {
+      int64_t pv0 = mx_iexp(q[0][j] - mq[0]);
+      int64_t pv1 = mx_iexp(q[1][j] - mq[1]);
+      int64_t pv2 = mx_iexp(q[2][j] - mq[2]);
+      int64_t pv3 = mx_iexp(q[3][j] - mq[3]);
+      p[0][j] = pv0; sm[0] += pv0;
+      p[1][j] = pv1; sm[1] += pv1;
+      p[2][j] = pv2; sm[2] += pv2;
+      p[3][j] = pv3; sm[3] += pv3;
+    }
+
+    for (int r = 0; r < 4; r++) {
+      ls[r] = mx_ilog2((uint64_t)sm[r]);
+      inv_sm[r] = (((uint64_t)1 << (ls[r] + MX_FRAC)) + ((uint64_t)sm[r] >> 1)) / (uint64_t)sm[r];
+    }
+
+    for (int g = 0; g < GROUPS_S; g++) {
+      int jstart = g * 32;
+      int jend = (g + 1) * 32;
+      for (int r = 0; r < 4; r++) {
+        int row = i + r;
+        int64_t gmax = 0;
+        for (int j = jstart; j < jend; j++) if (p[r][j] > gmax) gmax = p[r][j];
+        if (gmax == 0) {
+          P_scales[g][row] = 0;
+          for (int j = jstart; j < jend; j++) P_q[row][j] = 0;
+          continue;
+        }
+        int e = mx_ilog2((uint64_t)gmax) - ls[r] - MX_P_TARGET_LOG2;
+        P_scales[g][row] = (uint8_t)(e + 127);
+        for (int j = jstart; j < jend; j++)
+          P_q[row][j] = mx_ienc_fp8(p[r][j], inv_sm[r], ls[r], e);
+      }
+    }
+  }
+
+  // ---- 3) O = P @ V on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    // No flush, no config_ex — format/dataflow unchanged from the initial config
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+    gemmini_mx_load_scales((uint64_t)&V_scales_col, sizeof(V_scales_col), 1);
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) {
+        int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+      }
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) {
+        int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+      }
+    gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+    gemmini_fence();
+  }
+}
+```
+
+### Why This Improves Performance
+
+- **`gemmini_flush` cost eliminated for the second matmul**: The flush stalls the CPU until all in-flight Gemmini operations complete and the pipeline is fully drained. After the `gemmini_fence()` at the end of the first matmul, the accelerator is already idle. The second flush is pure overhead — it adds a full pipeline-drain stall with no benefit.
+- **`gemmini_extended3_config_ex` cost eliminated for the second matmul**: This RoCC instruction writes multiple configuration registers. Since no flush occurred, the format/dataflow/stride state is unchanged, and reissuing it is wasted instruction dispatch and register-write cycles.
+- Both removals are **semantically safe**: the programming model sequence (config_ex → load_scales → mvin → mxquant_config_mvout → loop_ws_spad → read_smem → fence) is still respected for each matmul; we've only hoisted the shared prefix to once at function entry.

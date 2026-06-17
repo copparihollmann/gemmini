@@ -1,0 +1,102 @@
+## Analysis of the Current Code
+
+Looking at the original code, I see the `gemmini_mxquant_config_mvout` call uses `lut_update_granularity = tiles_I * tiles_J`, which is already maximally coarse. The main remaining inefficiency is in the **mvin loops**.
+
+### Key Observation: Redundant Loop Structure and Stride Configuration
+
+The current code:
+1. Issues **two separate `gemmini_extended3_config_ld`** calls to configure ports 0 and 1
+2. Has an **outer loop over `k`** with inner loops over `i` and `j` — this ordering forces alternating between A and B addresses for each `k` slice, which doesn't batch consecutive same-port transfers well
+3. More importantly: the **stride configured for both ports is `MATMUL_K * sizeof(elem_t)`** — but for a `DIM×DIM` mvin with `cols=DIM`, the stride controls how many bytes to skip between rows in DRAM. The current stride `MATMUL_K * 1 = MATMUL_K` bytes is correct, but it's set once and shared.
+
+### Primary Inefficiency: Port-Level Batching and Loop Structure
+
+The deeper issue is **loop ordering and batching opportunities**. With the current `k`-outer, `i/j`-inner loop:
+- For each `k`, we issue `tiles_I` A-mvins and `tiles_J` B-mvins
+- These are interleaved across k-slices rather than batching all A tiles then all B tiles per port
+
+**Strategy: Loop Reordering (Strategy 3) + Batching via `MAX_BLOCK_LEN` (Strategy 1)**
+
+By reordering to `i`-outer, `k`-inner for A, and `j`-outer, `k`-inner for B (issuing all A tiles first, then all B tiles), consecutive scratchpad addresses allow us to use `gemmini_block_mvin` to batch up to `MAX_BLOCK_LEN=4` consecutive DIM-row tiles per single mvin command, reducing total instruction count by up to 4×.
+
+For `tiles_K` consecutive k-tiles for a fixed `i`, the scratchpad addresses are `a_base + (i*tiles_K + k)*DIM` for k=0,1,... — these are **contiguous** in the scratchpad. However, the DRAM addresses `A_in[i*DIM][k*DIM]` are not contiguous (they skip by `DIM` bytes within a `MATMUL_K`-wide row). So `gemmini_block_mvin` (which batches consecutive DRAM rows) doesn't apply to the k-dimension.
+
+But for fixed `k`, varying `i`: DRAM addresses `A_in + i*DIM*MATMUL_K + k*DIM` — these differ by `DIM*MATMUL_K` bytes, not contiguous either.
+
+### Actual Bottleneck: Instruction Count from Non-Batched Mvins
+
+The real win is: **for fixed `j` and `k`**, the B tile DRAM address is `B_in + j*DIM*MATMUL_K + k*DIM`. With the current loop order (k-outer, j-inner), for fixed k: B tiles for j=0,1,2,... have DRAM addresses `B_in + j*DIM*MATMUL_K + k*DIM` — non-contiguous in j.
+
+However, for **fixed `j`**, k=0,1,... gives DRAM addresses `B_in + j*DIM*MATMUL_K + k*DIM` = `B_in + j*DIM*MATMUL_K + k*DIM`. These differ by `DIM` bytes each — they ARE contiguous chunks within row `j*DIM` to `(j+1)*DIM-1`. Since stride = `MATMUL_K`, each row is `MATMUL_K` bytes apart, and within a row, consecutive k-tiles are `DIM` bytes apart. So for a **row-by-row** mvin with stride=MATMUL_K, k-consecutive tiles for fixed (i or j) are indeed addressable by a single config_ld + multiple mvins with incrementing src pointer.
+
+**The real strategy: eliminate the per-iteration port reconfiguration overhead and reorder loops to maximize instruction pipeline efficiency.**
+
+## Plan: Loop Reordering to Separate A and B Loads + Eliminate Redundant Config
+
+**Specific changes:**
+
+1. **Separate A-port and B-port mvin loops** completely — first issue all A mvins on port 0, then all B mvins on port 1. This avoids the overhead of the accelerator's instruction queue interleaving two different port streams and allows the DMA engines to run more coherently.
+
+2. **Reorder the A mvin loop to `i`-outer, `k`-inner** and the B mvin loop to `j`-outer, `k`-inner. For fixed `i`, the k-loop accesses DRAM at `A_in + i*DIM*MATMUL_K + k*DIM` for k=0..tiles_K-1. These are `DIM` bytes apart in DRAM (contiguous within row `i*DIM`). With stride=`MATMUL_K*sizeof(elem_t)`, the mvin copies DIM rows each MATMUL_K bytes apart. Consecutive k-tiles for the same `i` are contiguous in the scratchpad (`a_base + (i*tiles_K+k)*DIM`), so **we can batch them using `gemmini_block_mvin`** — one instruction loads up to `MAX_BLOCK_LEN=4` consecutive tiles, reducing mvin instruction count by 4×.
+
+   Wait — `gemmini_block_mvin` loads `len*DIM` cols × DIM rows, meaning `len` horizontal tiles from a single DIM-row block. The DRAM pointer steps by `len*DIM` bytes horizontally. So for k-consecutive tiles of the same `i`: `A_in + i*DIM*MATMUL_K + k*DIM` to `A_in + i*DIM*MATMUL_K + (k+len-1)*DIM` — yes, these are `len*DIM` bytes horizontally in a MATMUL_K-wide matrix, exactly what `gemmini_block_mvin(ptr, spad_addr, len)` loads (cols=len*DIM, rows=DIM). This batches `len` k-tiles in one instruction.
+
+3. **Use `gemmini_block_mvin` / `gemmini_extended_mvin` with `cols=len*DIM`** to batch groups of up to `MAX_BLOCK_LEN=4` k-tiles per single mvin command, reducing total mvin commands from `tiles_I*tiles_K + tiles_J*tiles_K` to `ceil(tiles_I*tiles_K/4) + ceil(tiles_J*tiles_K/4)`.
+
+This directly reduces the total number of RoCC instructions issued for data movement, reducing instruction dispatch overhead and improving DMA engine utilization.
+
+## Rewritten Code
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Configure port 0 (mvin) for A tiles: stride = MATMUL_K bytes per row
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), SCALE_IDENTITY, false, 0);
+  // Configure port 1 (mvin2) for B tiles: stride = MATMUL_K bytes per row
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), SCALE_IDENTITY, false, 1);
+
+  // Load all A tiles: i-outer, k-inner, batching up to MAX_BLOCK_LEN=4 k-tiles per mvin
+  for (int i = 0; i < tiles_I; i++) {
+    int k = 0;
+    while (k < tiles_K) {
+      int batch = tiles_K - k;
+      if (batch > MAX_BLOCK_LEN) batch = MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void*)dram_ptr, sp_addr, batch * DIM, DIM);
+      k += batch;
+    }
+  }
+
+  // Load all B tiles: j-outer, k-inner, batching up to MAX_BLOCK_LEN=4 k-tiles per mvin2
+  for (int j = 0; j < tiles_J; j++) {
+    int k = 0;
+    while (k < tiles_K) {
+      int batch = tiles_K - k;
+      if (batch > MAX_BLOCK_LEN) batch = MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = b_base + (j * tiles_K + k) * DIM;
+      gemmini_extended_mvin2((void*)dram_ptr, sp_addr, batch * DIM, DIM);
+      k += batch;
+    }
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, tiles_I * tiles_J);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+## Why This Improves Performance
+
+**Instruction count reduction via batching:** With `tiles_K=4` (for a 64×64 matmul with K=64), each `i` issues `ceil(4/4)=1` mvin instead of 4, and similarly for each `j`. Total A mvin instructions: `tiles_I * ceil(tiles_K/4)` vs `tiles_I * tiles_K` — a 4× reduction in mvin command count for the A matrix, and same for B. Fewer RoCC instructions means less instruction dispatch latency and more efficient DMA queuing.
+
+**Contiguous DRAM access pattern:** For fixed `i` (or `j`), k-consecutive tiles are `DIM` bytes apart horizontally in DRAM (within the same `DIM` rows). Batching them into one mvin with `cols=batch*DIM` exploits spatial locality in DRAM, improving memory access efficiency.
+
+**Separated port streams:** By completing all port-0 (A) loads before starting port-1 (B) loads (rather than interleaving), each DMA port receives a clean uninterrupted stream of commands, reducing queue thrashing and improving throughput utilization of both DMA engines.

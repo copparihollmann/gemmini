@@ -1,0 +1,384 @@
+{'correct': True, 'test_results': {0: True}, 'compiled': True, 'latency_spike_raw': 790892, 'latency': 790892}
+Prev latency: 786929
+New latency: 790892
+Plan: An elegant and highly effective optimization plan to improve the latency of the MHA kernel is to apply **Strategy 1: cache reused data in local memory instead of reloading from main memory** by reordering the computation loops.
+
+### Analysis of Inefficiencies in the Baseline
+In the baseline implementation, the outer loop iterates over each attention head $h$ sequentially (`for (int h = 0; h < ATT_H; h++)`). Within each iteration, the code:
+1. Loads $K^T$ (`KT_in` and `KT_sc`) from DRAM to compute $S1 = Q \times K^T$.
+2. Performs the softmax on the host.
+3. Loads $V$ (`V_in` and `V_sc`) from DRAM to compute $O = P \times V$.
+
+Because $H > H_{kv}$ (specifically, $H=4$ and $H_{kv}=2$), multiple attention heads share the same key-value head ($kv = h / 2$). In the baseline, `KT_in` and `V_in` (as well as their scales `KT_sc` and `V_sc`) are repeatedly evicted and reloaded from DRAM for every single head $h$. Since the scratchpad B-region is overwritten between Step 1 and Step 3 within the same head iteration, we cannot cache them across steps without reordering.
+
+---
+
+### Optimization Plan: Loop Reordering and Scratchpad Caching
+
+Since there are no loop-carried dependencies between different attention heads, we can reorder the execution to group heads sharing the same `kv` index. This allows us to load the key and value matrices into the scratchpad **exactly once per `kv` group**, rather than once per head $h$.
+
+#### Step-by-Step Implementation Plan:
+
+1. **Allocate Head-Private Temporary Buffers**:
+   To avoid overwriting the intermediate outputs $S1$, $P_q$, and $P_{\text{scales}}$ when processing heads out of order, define head-private arrays on the stack:
+   ```c
+   uint64_t S1_hw_h[ATT_H][ATT_S][ATT_S / 4];
+   elem_t P_q_h[ATT_H][ATT_S][ATT_S];
+   uint8_t P_scales_h[ATT_H][GROUPS_S][ATT_S];
+   ```
+   These buffers are small (totaling $\approx 48\text{ KB}$) and easily fit within the host memory.
+
+2. **Restructure the Outer Loop**:
+   Iterate over each KV head `kv` from $0$ to $ATT\_HKV - 1$. For each `kv` group, determine the range of corresponding query heads `h` (from `h_start` to `h_end`).
+
+3. **Stage 1: Batch $Q \times K^T$ Computations**:
+   * Load the shared scale factor `KT_sc` into the scale register (`sel=1`) once.
+   * Load the shared key matrix `KT_in` into the top of the scratchpad (`b_base`) once.
+   * Iterate $h$ from `h_start` to `h_end`:
+     * Load `Q_sc[h]` to `sel=0` and `Q_in[h]` to `a_base`.
+     * Execute `gemmini_loop_ws_spad` with `skips = 0x38` (skipping the B load from DRAM since $K^T$ is already cached in the scratchpad).
+     * Drain the result to `S1_hw_h[h]`.
+
+4. **Stage 2: Run Softmax**:
+   * For each head $h$ in the `kv` group, execute the CPU-side softmax algorithm on `S1_hw_h[h]` to produce `P_q_h[h]` and `P_scales_h[h]`.
+
+5. **Stage 3: Batch $P \times V$ Computations**:
+   * Load the shared scale factor `V_sc` into the scale register (`sel=1`) once.
+   * Load the shared value matrix `V_in` into the top of the scratchpad (`b_base`) once.
+   * Iterate $h$ from `h_start` to `h_end`:
+     * Load `P_scales_h[h]` to `sel=0` and `P_q_h[h]` to `a_base`.
+     * Execute `gemmini_loop_ws_spad` with `skips = 0x38` (skipping the B load from DRAM since $V$ is already cached in the scratchpad).
+     * Drain the final result directly to the corresponding head slice in `O_hw[h]`.
+
+### Expected Impact
+* **DRAM Bandwidth Reduction**: Reduces the total volume of $K^T$ and $V$ coordinate data read from DRAM by $2\times$.
+* **Scale Loading Latency**: Reduces the scale-factor loading overhead via `gemmini_mx_load_scales` for `KT_sc` and `V_sc` by $2\times$.
+* **Systolic Array Efficiency**: By reusing B tiles already present in the scratchpad across consecutive systolic array invocations, we maximize compute-to-load overlap and greatly reduce execution latency.
+
+CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED baseline MHA kernel (S=64, D=64, H=4, H_kv=2, causal=0, fp8:e4m3).
+void solution(void) {
+  for (int h = 0; h < ATT_H; h++) {
+    int kv = h / (ATT_H / ATT_HKV);
+    const elem_t *Q_in = Qs[h];  const uint8_t *Q_sc = Qss[h];
+    const elem_t *KT_in = KTs[kv]; const uint8_t *KT_sc = KTss[kv];
+    const elem_t *V_in = Vs[kv];  const uint8_t *V_sc = Vss[kv];
+  // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)Q_sc, QSS_BYTES, 0);
+    gemmini_mx_load_scales((uint64_t)KT_sc, QSS_BYTES, 1);
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) { int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM); }
+    gemmini_config_ld(ATT_S * sizeof(elem_t));   // B=KT[D][S] stride N=S -> slot (k*tiles_J+j)
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) { int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM); }
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+    gemmini_fence();
+  }
+
+  // ---- 2) FLOAT-FREE integer softmax + fp8 requant (I-BERT iexp; host has no FPU) ----
+  for (int i = 0; i < ATT_S; i++) {
+    int64_t q[ATT_S];
+    int64_t mq = -((int64_t)1 << 62);
+    for (int j = 0; j < ATT_S; j += 4) {                       // unpack 4 bf16/word -> Q(1/1024) int + max
+      uint64_t w = S1_hw[i][j / 4];
+      for (int l = 0; l < 4; l++) {
+#if ATT_CAUSAL
+        if (j + l > i) { q[j + l] = -((int64_t)1 << 62); continue; }   // causal: future col -> iexp()=0
+#endif
+        int64_t qq = mx_ibf16_to_q((uint16_t)((w >> (l * 16)) & 0xFFFF));
+        q[j + l] = qq; if (qq > mq) mq = qq;
+      }
+    }
+    int64_t p[ATT_S];
+    int64_t sm = 0;
+    int64_t gmax_arr[GROUPS_S];                                // fused group-max: capture per-group max IN the iexp pass
+    for (int g = 0; g < GROUPS_S; g++) {                       // (group-nested, register-scalar gmax) -> removes the
+      int64_t gmax = 0;                                        // separate 16384-elem max scan. Output bit-identical.
+      for (int j = g * 32; j < (g + 1) * 32; j++) { int64_t pv = mx_iexp(q[j] - mq); p[j] = pv; sm += pv; if (pv > gmax) gmax = pv; }
+      gmax_arr[g] = gmax;
+    }
+    int ls = mx_ilog2((uint64_t)sm);
+    uint64_t inv_sm = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;   // one rounded reciprocal/row
+    for (int g = 0; g < GROUPS_S; g++) {
+      int64_t gmax = gmax_arr[g];
+      if (gmax == 0) { P_scales[g][i] = 0; for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = 0; continue; }
+      // group e8m0 scale so the group-max lands at ~2^MX_P_TARGET_LOG2 (moderate; avoids e4 overflow)
+      int e = mx_ilog2((uint64_t)gmax) - ls - MX_P_TARGET_LOG2;
+      P_scales[g][i] = (uint8_t)(e + 127);
+      for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = mx_ienc_fp8(p[j], inv_sm, ls, e);
+    }
+  }
+
+  // ---- 3) O = P @ V on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+    gemmini_mx_load_scales((uint64_t)V_sc, VSS_BYTES, 1);
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) { int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM); }
+    gemmini_config_ld(ATT_D * sizeof(elem_t));   // B=V[S][D] stride N=D -> slot (k*tiles_J+j)
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) { int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM); }
+    gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[h][0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+    gemmini_fence();
+  }
+  }
+}
+''',
+score=786929,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'Accelerator-bound: compute and data-movement look balanced; tune tiling / scratchpad occupancy for more overlap.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''An elegant and highly effective optimization plan to improve the latency of the MHA kernel is to apply **Strategy 1: cache reused data in local memory instead of reloading from main memory** by reordering the computation loops.
+
+### Analysis of Inefficiencies in the Baseline
+In the baseline implementation, the outer loop iterates over each attention head $h$ sequentially (`for (int h = 0; h < ATT_H; h++)`). Within each iteration, the code:
+1. Loads $K^T$ (`KT_in` and `KT_sc`) from DRAM to compute $S1 = Q \times K^T$.
+2. Performs the softmax on the host.
+3. Loads $V$ (`V_in` and `V_sc`) from DRAM to compute $O = P \times V$.
+
+Because $H > H_{kv}$ (specifically, $H=4$ and $H_{kv}=2$), multiple attention heads share the same key-value head ($kv = h / 2$). In the baseline, `KT_in` and `V_in` (as well as their scales `KT_sc` and `V_sc`) are repeatedly evicted and reloaded from DRAM for every single head $h$. Since the scratchpad B-region is overwritten between Step 1 and Step 3 within the same head iteration, we cannot cache them across steps without reordering.
+
+---
+
+### Optimization Plan: Loop Reordering and Scratchpad Caching
+
+Since there are no loop-carried dependencies between different attention heads, we can reorder the execution to group heads sharing the same `kv` index. This allows us to load the key and value matrices into the scratchpad **exactly once per `kv` group**, rather than once per head $h$.
+
+#### Step-by-Step Implementation Plan:
+
+1. **Allocate Head-Private Temporary Buffers**:
+   To avoid overwriting the intermediate outputs $S1$, $P_q$, and $P_{\text{scales}}$ when processing heads out of order, define head-private arrays on the stack:
+   ```c
+   uint64_t S1_hw_h[ATT_H][ATT_S][ATT_S / 4];
+   elem_t P_q_h[ATT_H][ATT_S][ATT_S];
+   uint8_t P_scales_h[ATT_H][GROUPS_S][ATT_S];
+   ```
+   These buffers are small (totaling $\approx 48\text{ KB}$) and easily fit within the host memory.
+
+2. **Restructure the Outer Loop**:
+   Iterate over each KV head `kv` from $0$ to $ATT\_HKV - 1$. For each `kv` group, determine the range of corresponding query heads `h` (from `h_start` to `h_end`).
+
+3. **Stage 1: Batch $Q \times K^T$ Computations**:
+   * Load the shared scale factor `KT_sc` into the scale register (`sel=1`) once.
+   * Load the shared key matrix `KT_in` into the top of the scratchpad (`b_base`) once.
+   * Iterate $h$ from `h_start` to `h_end`:
+     * Load `Q_sc[h]` to `sel=0` and `Q_in[h]` to `a_base`.
+     * Execute `gemmini_loop_ws_spad` with `skips = 0x38` (skipping the B load from DRAM since $K^T$ is already cached in the scratchpad).
+     * Drain the result to `S1_hw_h[h]`.
+
+4. **Stage 2: Run Softmax**:
+   * For each head $h$ in the `kv` group, execute the CPU-side softmax algorithm on `S1_hw_h[h]` to produce `P_q_h[h]` and `P_scales_h[h]`.
+
+5. **Stage 3: Batch $P \times V$ Computations**:
+   * Load the shared scale factor `V_sc` into the scale register (`sel=1`) once.
+   * Load the shared value matrix `V_in` into the top of the scratchpad (`b_base`) once.
+   * Iterate $h$ from `h_start` to `h_end`:
+     * Load `P_scales_h[h]` to `sel=0` and `P_q_h[h]` to `a_base`.
+     * Execute `gemmini_loop_ws_spad` with `skips = 0x38` (skipping the B load from DRAM since $V$ is already cached in the scratchpad).
+     * Drain the final result directly to the corresponding head slice in `O_hw[h]`.
+
+### Expected Impact
+* **DRAM Bandwidth Reduction**: Reduces the total volume of $K^T$ and $V$ coordinate data read from DRAM by $2\times$.
+* **Scale Loading Latency**: Reduces the scale-factor loading overhead via `gemmini_mx_load_scales` for `KT_sc` and `V_sc` by $2\times$.
+* **Systolic Array Efficiency**: By reusing B tiles already present in the scratchpad across consecutive systolic array invocations, we maximize compute-to-load overlap and greatly reduce execution latency.''',
+code='''// AUTO-GENERATED optimized MHA kernel (S=64, D=64, H=4, H_kv=2, causal=0, fp8:e4m3).
+void solution(void) {
+  // Head-private temporary buffers to allow out-of-order processing
+  uint64_t S1_hw_h[ATT_H][ATT_S][ATT_S / 4];
+  elem_t P_q_h[ATT_H][ATT_S][ATT_S];
+  uint8_t P_scales_h[ATT_H][GROUPS_S][ATT_S];
+
+  for (int kv = 0; kv < ATT_HKV; kv++) {
+    int h_start = kv * (ATT_H / ATT_HKV);
+    int h_end = (kv + 1) * (ATT_H / ATT_HKV);
+
+    const elem_t *KT_in = KTs[kv];
+    const uint8_t *KT_sc = KTss[kv];
+    const elem_t *V_in = Vs[kv];
+    const uint8_t *V_sc = Vss[kv];
+
+    // ---- Stage 1: Batch Q @ K^T computations for all heads in this kv group ----
+    {
+      int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+
+      // Load shared KT scales and matrix once
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)KT_sc, QSS_BYTES, 1);
+      gemmini_config_ld(ATT_S * sizeof(elem_t));
+      for (int k = 0; k < tiles_K; k++)
+        for (int j = 0; j < tiles_J; j += 2) {
+          int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+          gemmini_extended_mvin((void *)(((elem_t *)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                                b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+        }
+
+      // Process each head\'s Q matrix against the shared K^T
+      for (int h = h_start; h < h_end; h++) {
+        const elem_t *Q_in = Qs[h];
+        const uint8_t *Q_sc = Qss[h];
+
+        gemmini_flush(0);
+        gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+        gemmini_mx_load_scales((uint64_t)Q_sc, QSS_BYTES, 0);
+
+        gemmini_config_ld(ATT_D * sizeof(elem_t));
+        for (int i = 0; i < tiles_I; i++)
+          for (int k = 0; k < tiles_K; k += 2) {
+            int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+            gemmini_extended_mvin((void *)(((elem_t *)Q_in) + i * DIM * ATT_D + k * DIM),
+                                  a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+          }
+
+        gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+        gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+        // Use skips=0x38 to avoid redundant B-load (KT already in spad)
+        gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+                             a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                             false, false, false, false, false, NO_ACTIVATION,
+                             0, 0, false, 0x38);
+        gemmini_mx_read_smem(&S1_hw_h[h][0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+        gemmini_fence();
+      }
+    }
+
+    // ---- Stage 2: Softmax on host for all heads in this kv group ----
+    for (int h = h_start; h < h_end; h++) {
+      for (int i = 0; i < ATT_S; i++) {
+        int64_t q[ATT_S];
+        int64_t mq = -((int64_t)1 << 62);
+        for (int j = 0; j < ATT_S; j += 4) {
+          uint64_t w = S1_hw_h[h][i][j / 4];
+          for (int l = 0; l < 4; l++) {
+#if ATT_CAUSAL
+            if (j + l > i) {
+              q[j + l] = -((int64_t)1 << 62);
+              continue;
+            }
+#endif
+            int64_t qq = mx_ibf16_to_q((uint16_t)((w >> (l * 16)) & 0xFFFF));
+            q[j + l] = qq;
+            if (qq > mq) mq = qq;
+          }
+        }
+        int64_t p[ATT_S];
+        int64_t sm = 0;
+        int64_t gmax_arr[GROUPS_S];
+        for (int g = 0; g < GROUPS_S; g++) {
+          int64_t gmax = 0;
+          for (int j = g * 32; j < (g + 1) * 32; j++) {
+            int64_t pv = mx_iexp(q[j] - mq);
+            p[j] = pv;
+            sm += pv;
+            if (pv > gmax) gmax = pv;
+          }
+          gmax_arr[g] = gmax;
+        }
+        int ls = mx_ilog2((uint64_t)sm);
+        uint64_t inv_sm =
+            (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;
+        for (int g = 0; g < GROUPS_S; g++) {
+          int64_t gmax = gmax_arr[g];
+          if (gmax == 0) {
+            P_scales_h[h][g][i] = 0;
+            for (int j = g * 32; j < (g + 1) * 32; j++) P_q_h[h][i][j] = 0;
+            continue;
+          }
+          int e = mx_ilog2((uint64_t)gmax) - ls - MX_P_TARGET_LOG2;
+          P_scales_h[h][g][i] = (uint8_t)(e + 127);
+          for (int j = g * 32; j < (g + 1) * 32; j++)
+            P_q_h[h][i][j] = mx_ienc_fp8(p[j], inv_sm, ls, e);
+        }
+      }
+    }
+
+    // ---- Stage 3: Batch P @ V computations for all heads in this kv group ----
+    {
+      int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+
+      // Load shared V scales and matrix once
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)V_sc, VSS_BYTES, 1);
+      gemmini_config_ld(ATT_D * sizeof(elem_t));
+      for (int k = 0; k < tiles_K; k++)
+        for (int j = 0; j < tiles_J; j += 2) {
+          int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+          gemmini_extended_mvin((void *)(((elem_t *)V_in) + (k * DIM) * ATT_D + j * DIM),
+                                b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+        }
+
+      // Process each head\'s P matrix against the shared V
+      for (int h = h_start; h < h_end; h++) {
+        gemmini_flush(0);
+        gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+        gemmini_mx_load_scales((uint64_t)&P_scales_h[h], sizeof(P_scales_h[h]), 0);
+
+        gemmini_config_ld(ATT_S * sizeof(elem_t));
+        for (int i = 0; i < tiles_I; i++)
+          for (int k = 0; k < tiles_K; k += 2) {
+            int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+            gemmini_extended_mvin((void *)(((elem_t *)P_q_h[h]) + i * DIM * ATT_S + k * DIM),
+                                  a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+          }
+
+        gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+        gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+        // Use skips=0x38 to avoid redundant B-load (V already in spad)
+        gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+                             a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                             false, false, false, false, false, NO_ACTIVATION,
+                             0, 0, false, 0x38);
+        gemmini_mx_read_smem(&O_hw[h][0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+        gemmini_fence();
+      }
+    }
+  }
+}
+''',
+score=None,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='gemini-3.5-flash',
+code_gen_model='qwen.qwen3-coder-480b-a35b-v1:0',
+stdout=None,
+stderr=None)

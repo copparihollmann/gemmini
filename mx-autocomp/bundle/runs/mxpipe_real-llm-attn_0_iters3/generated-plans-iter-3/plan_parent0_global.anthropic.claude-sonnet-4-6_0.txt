@@ -1,0 +1,87 @@
+## Analysis
+
+Looking at the original code, I can identify the inefficiency targeted by **strategy 4**:
+
+```c
+for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    // A scales copied once per i0 — correct
+    for (int g = 0; g < MATMUL_K / 32; g++)
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+        // B scales copied once per (i0,j0) — correct
+        ...
+        gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);  // ← REDUNDANT: A_s unchanged across j0
+        gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+```
+
+`A_s` is only updated in the `i0` loop, yet `gemmini_mx_load_scales` for A (sel=0) is called inside the `j0` loop on every iteration. Since `A_s` doesn't change across `j0` iterations, this is a redundant DRAM→hardware load repeated `BLOCKS_N` times per `i0` iteration.
+
+## Plan
+
+**Apply strategy 4: hoist `gemmini_mx_load_scales` for A-side (sel=0) outside the j0 loop.**
+
+The change is:
+1. Move `gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0)` from inside the `j0` loop to just after the `memcpy` block that populates `A_s`, but **before** the `j0` loop begins.
+2. Keep `gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1)` inside the `j0` loop (it depends on `j0`).
+3. The programming model sequence rule requires both A and B scales to be loaded before `gemmini_loop_ws_spad`. Since the A-side load now happens before `j0` starts, and the B-side load happens inside the `j0` loop before `gemmini_loop_ws_spad`, the sequence is still respected per invocation: for each `j0`, B scales are loaded (A scales were already loaded and are still valid since `A_s` hasn't changed), then the matmul proceeds. The scales persist in hardware state until overwritten, so the A-side load from the outer scope is still valid when the inner `j0` loop executes.
+4. Remove the `gemmini_mx_load_scales` for A from inside the `j0` loop.
+
+This eliminates `BLOCKS_N - 1` redundant A-scale loads per `i0` iteration, reducing total A-scale load calls from `BLOCKS_M * BLOCKS_N` down to `BLOCKS_M`.
+
+The `gemmini_flush(0)` call is also currently inside the `j0` loop. It resets accelerator state, which would invalidate the hoisted A-scale load. Therefore, the `gemmini_flush(0)` must also be hoisted to before the `j0` loop (or removed from inside it), so the A-scale load isn't wiped by a subsequent flush before the matmul that uses it.
+
+## Rewritten Code
+
+```c
+void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+
+    // A scales only depend on i0: copy once per i0, reuse across all j0.
+    for (int g = 0; g < MATMUL_K / 32; g++)
+      memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+
+    // Flush and configure once per i0; A scales are invariant across j0.
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    // Hoist A-side scale load outside j0 loop: A_s does not change across j0.
+    gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      // B scales depend on j0: copy once per (i0,j0).
+      for (int g = 0; g < MATMUL_K / 32; g++)
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      // B scales change with j0: must reload before each matmul invocation.
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int j = 0; j < tiles; j++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+  }
+}
+```

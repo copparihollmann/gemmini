@@ -1,0 +1,55 @@
+## Analysis of the Original Code
+
+The original code for a 128×128×256 FP8 matmul has:
+- `tiles_I = 128/16 = 8`, `tiles_J = 128/16 = 8`, `tiles_K = 256/16 = 16`
+- `lut_update_granularity = 1` in `gemmini_mxquant_config_mvout`
+
+## Identifying the Inefficiency
+
+Looking at strategy **11**: the `lut_update_granularity` parameter in `gemmini_mxquant_config_mvout` is set to `1`. This means the requantizer refreshes its LUT after every single tile during the output writeback phase, performing `tiles_I × tiles_J = 8 × 8 = 64` LUT refreshes total.
+
+Each LUT refresh is overhead inserted between output tiles during the fused `gemmini_loop_ws_spad` execution. By increasing `lut_update_granularity`, we reduce how often the requantizer re-reads and updates its LUT, directly reducing this overhead.
+
+The `lut_update_granularity` G controls how many output tiles share a single LUT lookup. Setting `G = tiles_K = 16` means the LUT is refreshed only once per `tiles_K` tiles, cutting the number of refreshes from 64 down to `64/16 = 4`. Even setting it to `tiles_J = 8` would reduce refreshes from 64 to 8.
+
+## Plan
+
+**Strategy 11: Increase `lut_update_granularity` to `tiles_K` in `gemmini_mxquant_config_mvout`.**
+
+Change the single line:
+```c
+gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+```
+to:
+```c
+gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, tiles_K);
+```
+
+This sets `lut_update_granularity = 16` (= `tiles_K`), meaning the requantizer will only refresh its LUT every 16 output tiles instead of every 1. Since the weight tiles (`B_in`) are stationary across the K dimension and the scales don't change within a single `gemmini_loop_ws_spad` invocation, all K-tiles share the same scale/LUT context — making this semantically safe.
+
+The rest of the code remains identical. This is a one-line change with no impact on data layout, memory ordering, or correctness of the BF16 output values.
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+  for (int j = 0; j < tiles_J; j++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+                            b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, tiles_K);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```

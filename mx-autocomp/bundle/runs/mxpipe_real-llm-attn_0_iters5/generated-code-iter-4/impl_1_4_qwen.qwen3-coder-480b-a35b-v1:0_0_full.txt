@@ -1,0 +1,112 @@
+```c
+void solution(void) {
+  int tiles_K = MATMUL_K / DIM;
+  uint32_t b_base = BANK_NUM * BANK_ROWS - (BLK/DIM) * tiles_K * DIM;
+  int pad_k = 0; // K is always a multiple of BLK in this setup
+
+  // Outer loop over N blocks (j0) - hoist B tile loading here
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    int ncols = REAL_N - j0 * BLK;
+    if (ncols > BLK) ncols = BLK;
+    if (ncols <= 0) continue;
+
+    int tiles_J = (ncols + DIM - 1) / DIM; // Number of N-tiles for this block (rounded up)
+    int pad_j_B = tiles_J * DIM - ncols;   // Padding for B tiles to align with DIM
+
+    // Load B scales for this j0 block
+    for (int g = 0; g < MATMUL_K / 32; g++)
+      memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+
+    // Flush and configure for B loading
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1); // Load B scales (selector 1)
+
+    // Load B tiles into scratchpad once per j0
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+    for (int k = 0; k < tiles_K; k++) {
+      for (int j = 0; j < tiles_J; j += MAX_BLOCK_LEN) {
+        int chunk_size = (j + MAX_BLOCK_LEN > tiles_J) ? (tiles_J - j) : MAX_BLOCK_LEN;
+        int dram_col_idx = j0 * BLK + j * DIM;
+        int spad_col_offset = (k * tiles_J + j) * DIM;
+        
+        gemmini_extended_mvin2(
+          (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + dram_col_idx),
+          b_base + spad_col_offset,
+          chunk_size * DIM, DIM
+        );
+      }
+    }
+
+    // Inner loop over M blocks (i0) - reuse B tiles
+    for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+
+      int tiles_I = (mrows + DIM - 1) / DIM; // Number of M-tiles for this block (rounded up)
+      int pad_i_A = tiles_I * DIM - mrows;   // Padding for A tiles to align with DIM
+      int pad_j_C = tiles_J * DIM - ncols;   // Padding for C tiles (matches B's tile width)
+
+      // Load A scales for this i0 block
+      for (int g = 0; g < MATMUL_K / 32; g++)
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+
+      uint32_t a_base = 0;
+      int SPAD_DEST = 128; // Fixed output location in shared memory
+
+      // Configure execution for A tile processing
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      
+      // Load A and B scales (B scales are already in memory, reload allowed but minimal cost)
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0); // Load A scales (selector 0)
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1); // Re-load B scales (required by programming model)
+
+      // Load A tiles into scratchpad
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles_I; i++) {
+        for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+          int chunk_size = (k + MAX_BLOCK_LEN > tiles_K) ? (tiles_K - k) : MAX_BLOCK_LEN;
+          int dram_row_idx = i0 * BLK + i * DIM;
+          int dram_col_idx = k * DIM;
+          int spad_row_offset = (i * tiles_K + k) * DIM;
+
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + dram_row_idx * MATMUL_K + dram_col_idx),
+            a_base + spad_row_offset,
+            chunk_size * DIM, DIM
+          );
+        }
+      }
+
+      // Configure output and requantization parameters
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout(
+        (uint64_t)scale_factors,
+        tiles_I, tiles_J, tiles_K,
+        0, 0, 1
+      );
+
+      // Perform computation using pre-loaded B tiles
+      gemmini_loop_ws_spad(
+        tiles_I, tiles_J, tiles_K,
+        pad_i_A, pad_j_C, pad_k,
+        a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+        false, false, false, false, false,
+        NO_ACTIVATION, 0, 0, false, 0x38
+      );
+
+      // Drain results from shared memory to DRAM
+      for (int r = 0; r < mrows; r++) {
+        gemmini_mx_read_smem(
+          &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+          SPAD_DEST * 16 + r * BLK,
+          ncols
+        );
+      }
+      gemmini_fence(); // Ensure completion before next iteration
+    }
+  }
+}
+```

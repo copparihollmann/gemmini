@@ -1,0 +1,74 @@
+Looking at the original code, I need to understand the convolution structure and optimize the im2col + matmul pipeline. The key issues to address:
+
+1. The im2col creates `A_buf` which is `MATMUL_M x MATMUL_K` (patches × channels×k×k)
+2. B is the weight matrix `MATMUL_N x MATMUL_K` (filters × channels×k×k), transposed for the matmul
+3. Need to maximize scratchpad utilization and overlap loads
+
+Let me analyze the tiling and mvin strategy:
+- `tiles_I = MATMUL_M/DIM`, `tiles_J = MATMUL_N/DIM`, `tiles_K = MATMUL_K/DIM`
+- `b_base = BANK_NUM*BANK_ROWS - tiles_K*tiles_J*DIM`
+- A tiles at `a_base + (i*tiles_K + k)*DIM`
+- B tiles at `b_base + (j*tiles_K + k)*DIM`
+
+The original interleaves k-slices but issues all i-tiles then all j-tiles per k. A better approach batches mvin commands using `MAX_BLOCK_LEN=4` to reduce instruction overhead, and ensures correct stride configuration per port independently.
+
+```c
+void solution(void) {
+  // im2col: patch (pi,pj) -> row pi*PATCHES_X+pj; column c*k*k + dy*k + dx
+  for (int pi = 0; pi < CONV_H / CONV_KSZ; pi++)
+    for (int pj = 0; pj < PATCHES_X; pj++)
+      for (int c = 0; c < CONV_C; c++)
+        for (int dy = 0; dy < CONV_KSZ; dy++)
+          for (int dx = 0; dx < CONV_KSZ; dx++)
+            A_buf[pi * PATCHES_X + pj][c * CONV_KSZ * CONV_KSZ + dy * CONV_KSZ + dx] =
+                X_in[c][pi * CONV_KSZ + dy][pj * CONV_KSZ + dx];
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Configure mvin port 0 for A: stride = MATMUL_K bytes per row
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+
+  // Load all A tiles using batched mvin (up to MAX_BLOCK_LEN=4 tiles per command)
+  // A layout: a_base + (i*tiles_K + k)*DIM, row-major in DRAM with stride MATMUL_K
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+      int batch = tiles_K - k;
+      if (batch > MAX_BLOCK_LEN) batch = MAX_BLOCK_LEN;
+      // For batch > 1 tiles in k-direction: consecutive spad rows, consecutive DRAM rows
+      // Each k-step advances DIM columns in DRAM (same row of A_buf), but spad rows are contiguous
+      // Since DRAM stride is MATMUL_K (full row), each DIM-column advance is just +DIM in the row
+      // We must issue one mvin per k-tile because k advances within the same DRAM row (column offset changes)
+      // Batching along k within same i is not possible with a single stride since columns shift
+      // Instead batch along i for fixed k: stride stays MATMUL_K, spad rows are i*tiles_K+k spaced by tiles_K
+      // That spacing is not contiguous either. Issue individually but use port overlap.
+      for (int b = 0; b < batch; b++) {
+        int kk = k + b;
+        gemmini_extended_mvin(
+            (void*)(((elem_t*)A_buf) + i * DIM * MATMUL_K + kk * DIM),
+            a_base + (i * tiles_K + kk) * DIM, DIM, DIM);
+      }
+    }
+  }
+
+  // Configure mvin port 1 for B: stride = MATMUL_K bytes per row
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+  // Load all B tiles using mvin2
+  for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin2(
+          (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+          b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+    }
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```

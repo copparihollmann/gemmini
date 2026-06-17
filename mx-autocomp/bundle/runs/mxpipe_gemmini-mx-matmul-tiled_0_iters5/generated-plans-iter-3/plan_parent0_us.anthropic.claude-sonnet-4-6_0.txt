@@ -1,0 +1,133 @@
+## Analysis of the Original Code
+
+The original code has this structure:
+```
+for i0 in BLOCKS_M:
+  for j0 in BLOCKS_N:
+    memcpy A_s scales    ← cpu_stage overhead
+    memcpy B_s scales    ← cpu_stage overhead
+    gemmini_flush(0)
+    gemmini_extended3_config_ex
+    gemmini_mx_load_scales(A_s, ...)
+    gemmini_mx_load_scales(B_s, ...)
+    mvin A tiles
+    mvin B tiles
+    gemmini_loop_ws_spad
+    gemmini_mx_read_smem
+    gemmini_fence()
+    cpu_store (unpack BF16)
+```
+
+## Applying Strategy 6
+
+**Strategy 6:** Replace per-iteration `memcpy`-based scale staging with direct DRAM pointer arithmetic into the existing `A_scales_row`/`B_scales_col` arrays, eliminating the intermediate `A_s`/`B_s` buffers and their copy overhead entirely.
+
+### Plan
+
+The current code copies sub-blocks of `A_scales_row` and `B_scales_col` into intermediate staging buffers `A_s` and `B_s` before calling `gemmini_mx_load_scales`. This `memcpy` is identified as "98% of the cycles" in the `cpu_stage` comment and constitutes pure wasted work.
+
+The scale arrays `A_scales_row[g][i0 * BLK ... i0*BLK+BLK-1]` and `B_scales_col[g][j0 * BLK ... j0*BLK+BLK-1]` are already contiguous in memory for a fixed `g`... but the layout is `[MATMUL_K/32][TOTAL_M]` and `[MATMUL_K/32][TOTAL_N]`, so `A_scales_row[g][i0*BLK]` through `A_scales_row[g][i0*BLK + BLK - 1]` are contiguous within row `g`, but consecutive `g` rows are not contiguous with each other.
+
+However, `gemmini_mx_load_scales` loads `len` bytes from a flat DRAM address. The hardware expects e8m0 scale codes laid out as `scale_dram + m * N_blocks + bi`, i.e., row-major where the outer index is the M/N dimension and the inner index is the K-block group. This means the hardware expects layout `[M][GK]` not `[GK][M]`.
+
+Looking at what `A_s` contains after the memcpy: for each group `g`, `A_s[g][0..BLK-1]` = `A_scales_row[g][i0*BLK .. i0*BLK+BLK-1]`. The loaded buffer is `[GK][BLK]` = `[MATMUL_K/32][BLK]` bytes. This matches what `gemmini_mx_load_scales` expects to consume as a flat byte array of size `A_S_BYTES = GK * BLK`.
+
+The key observation: `A_scales_row` has layout `[GK][TOTAL_M]`. For a given `i0`, the slice `A_scales_row[g][i0*BLK]` for each `g` is **not** contiguous across `g` — there are `TOTAL_M - BLK` bytes between consecutive groups. So a direct pointer won't work for A.
+
+For `B_scales_col[g][j0*BLK]` similarly, consecutive `g` groups are separated by `TOTAL_N - BLK` bytes.
+
+**The fix:** Transpose the scale arrays to `[BLK][GK]` layout (i.e., `[M_per_block][K_groups]`) so a single contiguous pointer covers all needed scales. But that requires a one-time layout change.
+
+**Simpler approach that directly eliminates the memcpy:** Change the scale arrays' storage layout from `[GK][TOTAL_DIM]` to `[TOTAL_DIM][GK]`. Then `&A_scales_row[i0*BLK][0]` gives a contiguous block of `BLK * GK` bytes covering all K-groups for rows `i0*BLK` to `i0*BLK+BLK-1`, which can be passed directly to `gemmini_mx_load_scales` without any copying.
+
+Since we cannot change the header file, we instead perform the transposition once outside the loop. But that's still a copy. 
+
+**Most direct application of strategy 6:** The strategy says to use "direct DRAM pointer arithmetic into the existing arrays." Since `A_scales_row` is `[GK][TOTAL_M]` and the hardware needs `[BLK][GK]` (row-major over the M-block), the memcpy *is* performing a gather/transpose — it cannot be trivially eliminated with a pointer unless the data is already in the right layout.
+
+However, looking more carefully: the `memcpy` copies `A_scales_row[g][i0*BLK .. BLK-1]` for each `g` into `A_s[g][0..BLK-1]`. The result `A_s` has the same `[GK][BLK]` logical layout, just at a local base. The hardware `gemmini_mx_load_scales` then reads it as a flat `GK*BLK`-byte stream. The memcpy is therefore **not** a transpose — it's just extracting a column-block from `A_scales_row`. The layout is `[GK][BLK]` in both source and destination, just offset by `i0*BLK` in the inner dimension.
+
+Since `A_scales_row[g]` is a row of length `TOTAL_M`, and we want bytes `[i0*BLK .. i0*BLK+BLK-1]` of that row, consecutive `g` rows are not contiguous. The memcpy cannot be replaced by a single pointer.
+
+**Revised plan — allocate scales in transposed layout `[TOTAL_M][GK]`:** Create `A_scales_T[TOTAL_M][GK]` and `B_scales_T[TOTAL_N][GK]` once before the outer loop by transposing `A_scales_row` and `B_scales_col`. Then inside the loop, `&A_scales_T[i0*BLK][0]` is a contiguous `BLK*GK`-byte block, directly passable to `gemmini_mx_load_scales`. This eliminates the per-iteration `memcpy` at the cost of one upfront transposition.
+
+Wait — but the hardware reads scales as `scale_dram + m*N_blocks + bi`. If we pass `A_scales_T[i0*BLK]` where `A_scales_T[m][g]` = scale for row `m`, group `g`, then the flat layout is `[m0*GK + g]` which matches the hardware's expected `m * N_blocks + bi` indexing exactly. This is correct.
+
+### Concrete Changes
+
+1. Before the outer loop, allocate and compute transposed scale arrays:
+   ```c
+   uint8_t A_scales_T[MATMUL_M][MATMUL_K/32];  // [m][gk]
+   uint8_t B_scales_T[MATMUL_N][MATMUL_K/32];  // [n][gk]
+   for (int g = 0; g < MATMUL_K/32; g++) {
+     for (int m = 0; m < MATMUL_M; m++) A_scales_T[m][g] = A_scales_row[g][m];
+     for (int n = 0; n < MATMUL_N; n++) B_scales_T[n][g] = B_scales_col[g][n];
+   }
+   ```
+
+2. Remove `A_s`, `B_s` buffers and the per-iteration `memcpy` loops.
+
+3. Replace `gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0)` with:
+   ```c
+   gemmini_mx_load_scales((uint64_t)&A_scales_T[i0 * BLK][0], A_S_BYTES, 0);
+   ```
+   and `gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1)` with:
+   ```c
+   gemmini_mx_load_scales((uint64_t)&B_scales_T[j0 * BLK][0], B_S_BYTES, 1);
+   ```
+
+This eliminates `BLOCKS_M * BLOCKS_N * 2 * GK` `memcpy` calls entirely, replacing them with a single upfront O(MATMUL_M * GK + MATMUL_N * GK) transposition. The per-iteration overhead of `cpu_stage` drops from O(BLK * GK) memcpy to zero (just pointer arithmetic).
+
+## Rewritten Code
+
+```c
+// AUTO-GENERATED outer-tiled MX matmul baseline (256x256x512).
+void solution(void) {
+  // One-time transposition of scale arrays from [GK][DIM] to [DIM][GK] layout
+  // so that per-block slices are contiguous in memory, enabling direct pointer
+  // arithmetic into the existing arrays without per-iteration memcpy staging.
+  static uint8_t A_scales_T[MATMUL_M][MATMUL_K / 32];
+  static uint8_t B_scales_T[MATMUL_N][MATMUL_K / 32];
+  for (int g = 0; g < MATMUL_K / 32; g++) {
+    for (int m = 0; m < MATMUL_M; m++)
+      A_scales_T[m][g] = ((uint8_t (*)[MATMUL_M])A_scales_row)[g][m];
+    for (int n = 0; n < MATMUL_N; n++)
+      B_scales_T[n][g] = ((uint8_t (*)[MATMUL_N])B_scales_col)[g][n];
+  }
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      // PROF accel
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      // Directly pass contiguous slice of transposed scale arrays — no memcpy needed
+      gemmini_mx_load_scales((uint64_t)&A_scales_T[i0 * BLK][0], A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)&B_scales_T[j0 * BLK][0], B_S_BYTES, 1);
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+      for (int j = 0; j < tiles; j++)                    // B[k][j0*BLK+j] -> slot (k*tiles + j)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      gemmini_mx_read_smem(&C_blk[0][0], SPAD_DEST * 16, BLK * BLK);
+      gemmini_fence();
+      // PROF cpu_store
+      for (int r = 0; r < BLK; r++)
+        for (int c = 0; c < BLK; c++) {
+          uint16_t b = (uint16_t)((C_blk[r][c / 4] >> ((c % 4) * 16)) & 0xFFFF);
+          C_acc[i0 * BLK + r][j0 * BLK + c] = bf16f(b);
+        }
+    }
+}
+```

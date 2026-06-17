@@ -1,0 +1,76 @@
+## Analysis of the Current Code
+
+The current code has two key inefficiencies the strategies address:
+
+1. **Every iteration** of the `i0`/`j0` loop computes `pad_i`/`pad_j` and passes them to `gemmini_loop_ws_spad`, even though for a 41×512×512 problem with `BLK` (let's say 32 or 64), only the last `i0` block is partial (41 is not a multiple of BLK/DIM). The full blocks — the vast majority — pay the overhead of the padding logic and the boundary checks on every invocation.
+
+2. **Strategy 2** directly addresses this: split into a **fast path** (full blocks, `pad_i=0, pad_j=0`) and a **slow path** (partial boundary block only). This removes the runtime `pad_i`/`pad_j` calculation and conditional branching from the common case without changing correctness.
+
+Strategy 1 is already being used (`gemmini_loop_ws_spad` is present), so it's not applicable.
+
+## Plan: Specialize into Full-Block Fast Path and Partial-Block Slow Path
+
+### Step-by-Step Plan
+
+**1. Determine the boundary tile indices at the top of the function.**
+
+Before the loop, compute:
+```c
+int last_i0 = (REAL_M - 1) / BLK;  // the only i0 that can be partial
+int last_j0 = (REAL_N - 1) / BLK;  // the only j0 that can be partial
+```
+
+**2. Split the outer loop into two distinct code paths.**
+
+The loop structure becomes:
+- An **inner fast-path loop** over all `(i0, j0)` pairs where both `i0 < last_i0` and `j0 < last_j0` — these are guaranteed full blocks (`mrows == BLK`, `ncols == BLK`, `pad_i == 0`, `pad_j == 0`).
+- A **slow path** that handles any row `i0 == last_i0` (partial M) and/or column `j0 == last_j0` (partial N).
+
+**3. In the fast path, eliminate all padding logic.**
+
+Remove the `mrows`/`ncols` clipping computation entirely. Hardcode `pad_i = 0`, `pad_j = 0` as compile-time constants (literal `0`) in the `gemmini_loop_ws_spad` call. This avoids runtime variable computation and enables the compiler to treat these as constants.
+
+Also simplify the `gemmini_mx_read_smem` call: since `mrows == BLK` and `ncols == BLK`, replace the per-row loop with a single call (or keep the loop but with the fixed `BLK` bound — the key saving is eliminating the pad computation and the branch in `gemmini_loop_ws_spad`).
+
+**4. In the slow path, keep the existing logic.**
+
+For `i0 == last_i0` or `j0 == last_j0`, compute `mrows` and `ncols` as before, compute `pad_i = BLK - mrows`, `pad_j = BLK - ncols`, and call the full padded path. Since there is at most 1 partial M-block (`REAL_M=41`, so `last_i0=1` if `BLK=32` or `last_i0=0` if `BLK=64`) and REAL_N=512 is an exact multiple of BLK (assuming BLK divides 512), the slow path executes for only the partial-M row of `j0` tiles — a tiny fraction of total work.
+
+**5. Structure the loops.**
+
+```
+// Fast path: all full (i0, j0) blocks
+for (int i0 = 0; i0 < last_i0; i0++) {          // strictly interior M blocks
+    for (int j0 = 0; j0 <= last_j0; j0++) {      // all N blocks (N=512 is exact)
+        // ... same body but pad_i=0, pad_j=0 hardcoded
+        gemmini_loop_ws_spad(..., /*pad_I*/0, /*pad_J*/0, ...);
+        for (int r = 0; r < BLK; r++)             // BLK is constant
+            gemmini_mx_read_smem(...);
+    }
+}
+// Slow path: the single partial M boundary block (i0 == last_i0)
+{
+    int i0 = last_i0;
+    for (int j0 = 0; j0 <= last_j0; j0++) {
+        int mrows = REAL_M - i0 * BLK; // < BLK
+        int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK;
+        int pad_i = BLK - mrows, pad_j = BLK - ncols;
+        // ... full padded body as before
+        gemmini_loop_ws_spad(..., pad_i, pad_j, ...);
+        for (int r = 0; r < mrows; r++)
+            gemmini_mx_read_smem(...);
+    }
+}
+```
+
+**6. Ensure the fast-path `gemmini_mx_read_smem` loop uses `BLK` not `mrows`.**
+
+In the fast path, replace `for (int r = 0; r < mrows; r++)` with `for (int r = 0; r < BLK; r++)`, since `mrows == BLK` is guaranteed. This is a minor clarification but allows the compiler to unroll or optimize the loop.
+
+**7. No changes to the programming model sequence.**
+
+The sequence — `gemmini_flush` → `gemmini_extended3_config_ex` → `gemmini_mx_load_scales` → `gemmini_config_ld` + mvin loops → `gemmini_config_st` + `gemmini_mxquant_config_mvout` → `gemmini_loop_ws_spad` → `gemmini_mx_read_smem` → `gemmini_fence` — remains identical in both paths. No reordering is needed.
+
+### Why This Helps
+
+For `REAL_M=41` with `BLK=32`: there are 2 M-blocks (`ceil(41/32)=2`), so `last_i0=1`. The fast path covers `i0=0` (32 rows, full) across all `j0`; the slow path covers `i0=1` (9 rows, partial). Since `REAL_N=512` is a multiple of `BLK`, `pad_j=0` always, meaning the fast path removes the padding overhead from 512/BLK × 1 = 16 full-M invocations (roughly half the total), and the slow path handles only 16 partial-M invocations. The `gemmini_loop_ws_spad` in the fast path now receives literal `0,0` for `pad_I`/`pad_J`, which the hardware processes without zero-padding overhead. The CPU-side elimination of the `mrows`/`ncols` clamp and `pad_i`/`pad_j` subtraction also removes unnecessary scalar work from the hot path.

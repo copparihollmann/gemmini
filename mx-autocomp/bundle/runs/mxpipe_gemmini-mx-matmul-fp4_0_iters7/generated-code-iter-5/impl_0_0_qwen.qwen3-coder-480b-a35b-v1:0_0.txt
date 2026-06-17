@@ -1,0 +1,118 @@
+#include <stdint.h>
+#include "include/gemmini_testutils.h"
+
+// Direct MMIO addresses for Gemmini RoCC instructions
+#define GEMMINI_CTRL      0x40084000
+#define GEMMINI_INST_ADDR (GEMMINI_CTRL + 0x0)
+#define GEMMINI_RS1_ADDR  (GEMMINI_CTRL + 0x10)
+#define GEMMINI_RS2_ADDR  (GEMMINI_CTRL + 0x18)
+
+// Optimized low-overhead MMIO instruction dispatch helper
+static inline void fast_gemmini_op(uint64_t rs1, uint64_t rs2, uint32_t funct) {
+    *((volatile uint64_t *) GEMMINI_RS1_ADDR) = rs1;
+    *((volatile uint64_t *) GEMMINI_RS2_ADDR) = rs2;
+    *((volatile uint32_t *) GEMMINI_INST_ADDR) = (0x7B) | (0 << 7) | (3 << 12)
+        | (1 << 15) | (2 << 20) | (funct << 25);
+}
+
+// Optimized MX matmul kernel (128x128x256, fp4:e2m1) using fast MMIO packaging
+void solution(void) {
+  {
+    const int ti = MATMUL_M / DIM / 2; // 4
+    const int tj = MATMUL_N / DIM / 2; // 4
+    const int tk = MATMUL_K / DIM;     // 16
+    const uint32_t ab = 0;
+    const uint32_t bb = BANK_NUM * BANK_ROWS - tk * tj * DIM;
+    const int SDST = 128;
+    
+    // 1. Pre-calculated config_ex registers
+    const uint64_t config_ex_rs1 = 
+        ((uint64_t)acc_scale_t_to_acc_scale_t_bits((acc_scale_t)ACC_SCALE_IDENTITY) << 32) |
+        ((uint64_t)(1) << 16) | // A_stride
+        ((uint64_t)(3) << 14) | // out_mx_fmt (BF16 output)
+        ((uint64_t)(2) << 12) | // wgt_mx_fmt (FP4)
+        ((uint64_t)(2) << 10) | // act_mx_fmt (FP4)
+        ((uint64_t)(0) << 9)  | // B_transpose
+        ((uint64_t)(0) << 8)  | // A_transpose
+        ((uint64_t)(0) << 7)  | // set_only_strides
+        ((uint64_t)(0) << 5)  | // uselut
+        ((uint64_t)(0) << 3)  | // sys_act
+        ((uint64_t)(WEIGHT_STATIONARY) << 2) | 
+        CONFIG_EX;
+    const uint64_t config_ex_rs2 = ((uint64_t)(1) << 48); // C_stride = 1, sys_shift = 0
+    fast_gemmini_op(config_ex_rs1, config_ex_rs2, k_CONFIG);
+    
+    // 2. Load scale factors directly (corrected encoding)
+    fast_gemmini_op((uint64_t)&A_scales_row, 
+                    ((uint64_t)(0) << 32) | sizeof(A_scales_row), // sel=0 for A scales
+                    k_MX_LOAD_SCALES);
+    fast_gemmini_op((uint64_t)&B_scales_col, 
+                    ((uint64_t)(1) << 32) | sizeof(B_scales_col), // sel=1 for B scales
+                    k_MX_LOAD_SCALES);
+    
+    // 3. Pre-calculated config_st registers
+    const uint64_t config_st_rs1 = CONFIG_ST;
+    const uint64_t config_st_rs2 = 
+        ((uint64_t)acc_scale_t_to_acc_scale_t_bits((acc_scale_t)ACC_SCALE_IDENTITY) << 32) | 
+        ((uint32_t)(OUT_COLS * sizeof(out_t)));
+    fast_gemmini_op(config_st_rs1, config_st_rs2, k_CONFIG);
+    
+    // 4. Pre-calculated requantizer config_mvout registers (corrected)
+    const uint64_t mvout_rs1 = 
+        ((uint64_t)(0) << 61) | ((uint64_t)(0) << 60) |  // scale_w_sel=0, scale_act_sel=0
+        ((uint64_t)(tk) << 51) | ((uint64_t)(tj) << 42) | ((uint64_t)(ti) << 33) | 
+        (uint64_t)(uint32_t)(scale_factors);  // Only lower 32 bits for dram_addr
+    const uint64_t mvout_rs2 = 1 & 0xFFFF;  // lut_update_granularity
+    fast_gemmini_op(mvout_rs1, mvout_rs2, k_CONFIG);  // funct=k_CONFIG for MXQUANT_CONFIG_MVOUT
+    
+    // 5. Pre-calculated config_ld registers
+    const uint64_t config_ld_rs1 = 
+        ((uint64_t)(scale_t_to_scale_t_bits(scale_t_identity)) << 32) | 
+        ((uint64_t)(DIM) << 16) | CONFIG_LD;
+    
+    // Config LD for A
+    fast_gemmini_op(config_ld_rs1, MATMUL_K * sizeof(elem_t), k_CONFIG);
+    
+    // Batched MVIN for A
+    for (int i = 0; i < ti; i++) {
+      for (int k = 0; k < tk; k += 2) {
+        uint64_t dram_ptr = (uint64_t)(((elem_t*)A_in_hw) + i*DIM*MATMUL_K + k*DIM);
+        uint64_t spad_addr = ab + (i*tk + k)*DIM;
+        uint64_t mvin_rs2 = ((uint64_t)(DIM) << (ADDR_LEN + 16)) | ((uint64_t)(2 * DIM) << ADDR_LEN) | spad_addr;
+        fast_gemmini_op(dram_ptr, mvin_rs2, k_MVIN);
+      }
+    }
+    
+    // Config LD for B
+    fast_gemmini_op(config_ld_rs1, MATMUL_N * sizeof(elem_t) / 2, k_CONFIG);
+    
+    // Batched MVIN for B
+    for (int k = 0; k < tk; k++) {
+      for (int j = 0; j < tj; j += 2) {
+        uint64_t dram_ptr = (uint64_t)(((elem_t*)B_in) + k*DIM*(MATMUL_N/2) + j*DIM);
+        uint64_t spad_addr = bb + (k*tj + j)*DIM;
+        uint64_t mvin_rs2 = ((uint64_t)(DIM) << (ADDR_LEN + 16)) | ((uint64_t)(2 * DIM) << ADDR_LEN) | spad_addr;
+        fast_gemmini_op(dram_ptr, mvin_rs2, k_MVIN);
+      }
+    }
+    
+    // 6. Compute WS loop in hardware using pre-calculated bounds and addresses
+    fast_gemmini_op(((uint64_t)(0) << 32) | ((uint64_t)(tj) << 16) | (uint64_t)(ti),  // pad_K=0, pad_J, pad_I
+                    ((uint64_t)(tk) << 32) | ((uint64_t)(tj) << 16) | (uint64_t)(ti),   // K, J, I
+                    k_LOOP_WS_CONFIG_BOUNDS);
+    fast_gemmini_op(ab, bb, k_LOOP_WS_CONFIG_SPAD_AB);  // Set marker for MX path
+    
+    const uint64_t ws_rs1 = ((uint64_t)(0) << 18) | ((uint64_t)(0) << 16) |  // a_spad_id=0, b_spad_id=0
+                           ((uint64_t)(NO_ACTIVATION) << 8) |                 // act=NO_ACTIVATION
+                           ((uint64_t)(0) << 2) | ((uint64_t)(0) << 1) | 0;   // low_D=0, full_C=0, ex_accumulate=0
+    const uint64_t ws_rs2 = ((uint64_t)(SDST) << 32) | 0x200U | 0x38;         // C addr + marker + skips
+    fast_gemmini_op(ws_rs1, ws_rs2, k_LOOP_WS);
+    
+    // 7. Drain BF16 results from SMEM and sync
+    const uint64_t read_rs1 = (uint64_t)&C_hw[0][0];
+    const uint64_t read_rs2 = ((uint64_t)(MATMUL_M * MATMUL_N) << 32) | ((uint64_t)(SDST * 16) & 0xFFFFFFFFu);
+    fast_gemmini_op(read_rs1, read_rs2, k_MX_READ_SMEM);
+    
+    gemmini_fence();
+  }
+}

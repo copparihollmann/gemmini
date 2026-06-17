@@ -1,0 +1,173 @@
+#include "include/gemmini.h"
+#include "include/gemmini_params.h"
+#include <stdint.h>
+#include <string.h>
+
+#ifndef MATMUL_M
+#define MATMUL_M 64
+#endif
+#ifndef MATMUL_N
+#define MATMUL_N 64
+#endif
+#ifndef MATMUL_K
+#define MATMUL_K 64
+#endif
+
+// MX block size along K (number of elements sharing one scale factor)
+#ifndef MX_BLOCK_SIZE
+#define MX_BLOCK_SIZE 32
+#endif
+
+#define tiles_I (MATMUL_M / DIM)
+#define tiles_J (MATMUL_N / DIM)
+#define tiles_K (MATMUL_K / DIM)
+
+// Number of scale groups along K
+#define GK ((MATMUL_K + MX_BLOCK_SIZE - 1) / MX_BLOCK_SIZE)
+
+// A tiles go at the bottom of the scratchpad
+#define a_base 0
+// B tiles go at the top of the scratchpad
+#define b_base (BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM)
+
+// Output destination in mx_smem (word offset)
+#define SPAD_DEST 0
+
+// Scale factors: A_scales[GK][MATMUL_M], B_scales[GK][MATMUL_N]
+// Each scale is an e8m0 byte
+static uint8_t A_scales_row[GK][MATMUL_M] __attribute__((aligned(64)));
+static uint8_t B_scales_col[GK][MATMUL_N] __attribute__((aligned(64)));
+
+// Input matrices in FP8 E4M3 format
+static uint8_t A_fp8[MATMUL_M][MATMUL_K] __attribute__((aligned(64)));
+static uint8_t B_fp8[MATMUL_K][MATMUL_N] __attribute__((aligned(64)));
+
+// Output matrix in BF16 format (uint16_t per element)
+static uint16_t C_hw[MATMUL_M][MATMUL_N] __attribute__((aligned(64)));
+
+void matmul_mx_fp8(
+    uint8_t A[MATMUL_M][MATMUL_K],
+    uint8_t B[MATMUL_K][MATMUL_N],
+    uint8_t a_scales[GK][MATMUL_M],
+    uint8_t b_scales[GK][MATMUL_N],
+    uint16_t C[MATMUL_M][MATMUL_N])
+{
+    // Step 1: Configure execution - FP8 E4M3 inputs, BF16 output
+    // act_mx_fmt=0 (FP8 E4M3), wgt_mx_fmt=0 (FP8 E4M3), out_mx_fmt=3 (BF16)
+    // uselut=0 for FP8
+    gemmini_extended3_config_ex(
+        WEIGHT_STATIONARY,
+        /*sys_act*/0,
+        /*sys_shift*/0,
+        /*sys_acc_scale*/ACC_SCALE_IDENTITY,
+        /*C_stride*/1,
+        /*A_stride*/1,
+        /*A_transpose*/0,
+        /*B_transpose*/0,
+        /*set_only_strides*/0,
+        /*act_mx_fmt*/0,
+        /*wgt_mx_fmt*/0,
+        /*out_mx_fmt*/3,
+        /*uselut*/0
+    );
+
+    // Step 2: Load scale factors
+    // sel=0 for A (activation) scales, sel=1 for B (weight) scales
+    gemmini_mx_load_scales((uint64_t)a_scales, sizeof(uint8_t) * GK * MATMUL_M, 0);
+    gemmini_mx_load_scales((uint64_t)b_scales, sizeof(uint8_t) * GK * MATMUL_N, 1);
+
+    // Step 3: No LUT needed for FP8 (uselut=0)
+
+    // Step 4: MVIN tiles of A and B into scratchpad
+    // Configure load for A matrix: stride = MATMUL_K bytes (row stride)
+    gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+
+    // Load A tiles: a_base + (i*tiles_K + k)*DIM
+    for (int i = 0; i < tiles_I; i++) {
+        for (int k = 0; k < tiles_K; k++) {
+            uint32_t spad_addr = a_base + (i * tiles_K + k) * DIM;
+            uint8_t *dram_ptr = &A[i * DIM][k * DIM];
+            gemmini_extended_mvin(
+                (uint64_t)dram_ptr,
+                spad_addr,
+                DIM,
+                DIM
+            );
+        }
+    }
+
+    // Configure load for B matrix: stride = MATMUL_N bytes (row stride)
+    gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+    // Load B tiles: b_base + (j*tiles_K + k)*DIM
+    for (int j = 0; j < tiles_J; j++) {
+        for (int k = 0; k < tiles_K; k++) {
+            uint32_t spad_addr = b_base + (j * tiles_K + k) * DIM;
+            uint8_t *dram_ptr = &B[k * DIM][j * DIM];
+            gemmini_extended_mvin2(
+                (uint64_t)dram_ptr,
+                spad_addr,
+                DIM,
+                DIM
+            );
+        }
+    }
+
+    // Step 5: Configure requantized mvout
+    // i_bound, j_bound, k_bound must match tiles_I, tiles_J, tiles_K
+    gemmini_extended_config_st(MATMUL_N * sizeof(uint16_t), 0, ACC_SCALE_IDENTITY);
+    gemmini_mxquant_config_mvout(
+        (uint64_t)0,          // scale_dram (not used when reading via mx_read_smem)
+        /*i_bound*/tiles_I,
+        /*j_bound*/tiles_J,
+        /*k_bound*/tiles_K,
+        /*scale_act_sel*/0,
+        /*scale_w_sel*/0,
+        /*lut_update_granularity*/1
+    );
+
+    // Step 6: Compute weight-stationary tiled matmul
+    // Must re-issue funct 24 (LOOP_WS_CONFIG_SPAD_AB) before every call via gemmini_loop_ws_spad
+    // B spad end address = BANK_NUM*BANK_ROWS (top of scratchpad)
+    // skips=0x38 suppresses redundant preloads
+    gemmini_loop_ws_spad(
+        tiles_I, tiles_J, tiles_K,
+        /*pad_I*/0, /*pad_J*/0, /*pad_K*/0,
+        /*A*/a_base,
+        /*B*/BANK_NUM * BANK_ROWS,
+        /*D*/0,
+        /*C*/SPAD_DEST,
+        /*A_transpose*/0,
+        /*B_transpose*/0,
+        /*full_C*/0,
+        /*low_D*/0,
+        /*ex_accumulate*/0,
+        /*act*/NO_ACTIVATION,
+        /*a_spad_id*/0,
+        /*b_spad_id*/0,
+        /*is_resadd*/0,
+        /*skips*/0x38
+    );
+
+    // Step 7: Read result from mx_smem to DRAM
+    // BF16 packed 4 per uint64, smem word offset = SPAD_DEST * 16
+    gemmini_mx_read_smem(
+        (uint64_t)C,
+        /*smem_off_bf16*/SPAD_DEST * 16,
+        /*num_bf16*/MATMUL_M * MATMUL_N
+    );
+
+    // Fence: must complete before host reads output
+    gemmini_fence();
+}
+
+void gemm(
+    size_t DIM_I, size_t DIM_J, size_t DIM_K,
+    uint8_t A[MATMUL_M][MATMUL_K],
+    uint8_t B[MATMUL_K][MATMUL_N],
+    uint8_t a_scales[GK][MATMUL_M],
+    uint8_t b_scales[GK][MATMUL_N],
+    uint16_t C[MATMUL_M][MATMUL_N])
+{
+    matmul_mx_fp8(A, B, a_scales, b_scales, C);
+}

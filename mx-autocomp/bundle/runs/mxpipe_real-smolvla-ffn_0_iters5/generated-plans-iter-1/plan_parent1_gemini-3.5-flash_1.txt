@@ -1,0 +1,92 @@
+### Strategy Explanation
+
+We will apply **Strategy 2**: **Assign B tiles to a fixed high-address scratchpad region (`b_base = BANK_NUM*BANK_ROWS - ...`) to enable weight-stationary reuse across I tiles.**
+
+#### Analysis of Inefficiencies in Original Code:
+In the original implementation, the loop order is row-major on blocks: `i0` (outer) and `j0` (inner). In each iteration of the inner loop, both matrices $A$ and $B$ (and their scale factors) are loaded from DRAM into the scratchpad. However, the $B$ tiles and $B$ scales loaded for a specific `j0` do not depend on the activation row block index `i0`. By keeping the row-major block loop order, we reload the $B$ weight tiles $BLOCKS_M$ times.
+
+#### Optimization Plan:
+1. **Loop Reordering:** Swap the block loops so that the column/weight block loop (`j0`) is the outer loop, and the row/activation block loop (`i0`) is the inner loop.
+2. **Weight-Stationary Scratchpad Reuse:** 
+   - Load the weight scale factors (`B_s`) and the $B$ tiles once in the outer `j0` loop.
+   - The $B$ tiles are positioned at the fixed high-address scratchpad boundary: `b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM`.
+   - In the inner `i0` loop, only the $A$ scales and $A$ tiles are loaded into the lower scratchpad area (`a_base = 0`).
+   - The hardware fused loop `gemmini_loop_ws_spad` is executed for each $A$ block, reusing the already-resident $B$ tiles.
+3. This eliminates redundant DRAM loads of $B$ weight tiles and scales, reducing weight DRAM traffic by a factor of $BLOCKS_M$.
+
+---
+
+### Optimized Code
+
+```c
+void solution(void) {
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+  uint32_t a_base = 0;
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+  int SPAD_DEST = 128;
+
+  // Outer loop over weight/column blocks
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+    // Load B scales once per weight block
+    for (int g = 0; g < MATMUL_K / 32; g++) {
+      memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+    }
+    gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+    // MVIN B tiles once to the fixed high-address scratchpad region
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+    for (int j = 0; j < tiles; j++) {
+      for (int k = 0; k < tiles_K; k++) {
+        gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                              b_base + (k * tiles + j) * DIM, DIM, DIM);
+      }
+    }
+
+    // Inner loop over activation/row blocks
+    for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      // Load A scales
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+      }
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+
+      // MVIN A tiles
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++) {
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+        }
+      }
+
+      // Configure requantizer
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+
+      // Execute matmul reusing the resident B tiles
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Read back results
+      if (mrows == BLK && ncols == BLK) {
+        gemmini_mx_read_smem(&C_hw[i0 * BLK][j0 * BLK / BF16_PER_WORD],
+                             SPAD_DEST * 16, BLK * BLK);
+      } else {
+        for (int r = 0; r < mrows; r++) {
+          gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                               SPAD_DEST * 16 + r * BLK, ncols);
+        }
+      }
+    }
+  }
+  gemmini_fence();
+}
+```

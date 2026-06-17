@@ -1,0 +1,204 @@
+{'correct': False}
+Prev latency: 14000
+New latency: N/A
+Plan: An elegant and highly effective optimization plan to address the host-side data staging bottleneck in the provided code.
+
+### Optimization Plan: Eliminate Host-Side Scale Factor Buffering (Strategy 5)
+
+#### 1. Analysis of the Inefficiency
+In the baseline code, the host CPU performs redundant `memcpy` operations to copy slices of the scale factor matrices `A_scales_row` and `B_scales_col` into temporary stack-allocated buffers `A_s` and `B_s` on every iteration of the outer loops:
+```c
+// A scales only depend on i0: copy once per i0, reuse across all j0.
+for (int g = 0; g < MATMUL_K / 32; g++)
+  memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+
+...
+
+// B scales depend on j0: copy once per (i0,j0).
+for (int g = 0; g < MATMUL_K / 32; g++)
+  memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+```
+These temporary buffers are then loaded into the Gemmini scale-factor SRAM using `gemmini_mx_load_scales`. Because host-to-scratchpad/SRAM data transfer on this architecture is managed via explicit DMA, we can completely bypass the CPU-driven `memcpy` staging step. Operating the host CPU to tile and copy memory blocks is highly inefficient and acts as a major bottleneck.
+
+#### 2. Proposed Changes
+We will eliminate the host-side arrays `A_s` and `B_s` along with their corresponding `memcpy` loops. Instead, we will configure the Gemmini DMA engine to stream scale factors directly from their original strided positions in DRAM:
+
+1. **Calculate Direct DRAM Addresses:** 
+   - The starting address for the activation (A) scale block of the current row-block $i_0$ is `(uint64_t)&A_scales_row[0][i0 * BLK]`.
+   - The starting address for the weight (B) scale block of the current column-block $j_0$ is `(uint64_t)&B_scales_col[0][j0 * BLK]`.
+
+2. **Redirect scale loading:** 
+   - Replace the load for A scales with:
+     ```c
+     gemmini_mx_load_scales((uint64_t)&A_scales_row[0][i0 * BLK], BLK, 0);
+     ```
+   - Replace the load for B scales with:
+     ```c
+     gemmini_mx_load_scales((uint64_t)&B_scales_col[0][j0 * BLK], BLK, 1);
+     ```
+     *(Note: If the scale factors consist of multiple quantization groups along K, i.e., `MATMUL_GK > 1`, and the sub-blocks are layout-contiguous or can be loaded sequentially, we adjust the length parameter to `BLK * MATMUL_GK` accordingly.)*
+
+By pointing `gemmini_mx_load_scales` directly to the source DRAM slices, we leverage the hardware's fast DMA capabilities and completely eliminate CPU staging overhead.
+
+CodeCandidate(parent=CodeCandidate(parent=None,
+plan='''prior autocomp winner (mxpipe_real-llm-attn_0_iters6)''',
+code='''void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+
+    // A scales only depend on i0: copy once per i0, reuse across all j0.
+    for (int g = 0; g < MATMUL_K / 32; g++)
+      memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      // B scales depend on j0: copy once per (i0,j0).
+      for (int g = 0; g < MATMUL_K / 32; g++)
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int j = 0; j < tiles; j++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+  }
+}
+''',
+score=14000,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'CPU/host data staging detected (2 memcpy, ~0 scalar copy loops). Host staging is typically the dominant cost on this accelerator and autocomp cannot speed it up directly: mvin tiles STRIDED straight from the source DRAM arrays instead of copying through a host buffer, and keep partial sums in shared memory (bf16 accumulate) rather than accumulating on the CPU.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''An elegant and highly effective optimization plan to address the host-side data staging bottleneck in the provided code.
+
+### Optimization Plan: Eliminate Host-Side Scale Factor Buffering (Strategy 5)
+
+#### 1. Analysis of the Inefficiency
+In the baseline code, the host CPU performs redundant `memcpy` operations to copy slices of the scale factor matrices `A_scales_row` and `B_scales_col` into temporary stack-allocated buffers `A_s` and `B_s` on every iteration of the outer loops:
+```c
+// A scales only depend on i0: copy once per i0, reuse across all j0.
+for (int g = 0; g < MATMUL_K / 32; g++)
+  memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+
+...
+
+// B scales depend on j0: copy once per (i0,j0).
+for (int g = 0; g < MATMUL_K / 32; g++)
+  memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+```
+These temporary buffers are then loaded into the Gemmini scale-factor SRAM using `gemmini_mx_load_scales`. Because host-to-scratchpad/SRAM data transfer on this architecture is managed via explicit DMA, we can completely bypass the CPU-driven `memcpy` staging step. Operating the host CPU to tile and copy memory blocks is highly inefficient and acts as a major bottleneck.
+
+#### 2. Proposed Changes
+We will eliminate the host-side arrays `A_s` and `B_s` along with their corresponding `memcpy` loops. Instead, we will configure the Gemmini DMA engine to stream scale factors directly from their original strided positions in DRAM:
+
+1. **Calculate Direct DRAM Addresses:** 
+   - The starting address for the activation (A) scale block of the current row-block $i_0$ is `(uint64_t)&A_scales_row[0][i0 * BLK]`.
+   - The starting address for the weight (B) scale block of the current column-block $j_0$ is `(uint64_t)&B_scales_col[0][j0 * BLK]`.
+
+2. **Redirect scale loading:** 
+   - Replace the load for A scales with:
+     ```c
+     gemmini_mx_load_scales((uint64_t)&A_scales_row[0][i0 * BLK], BLK, 0);
+     ```
+   - Replace the load for B scales with:
+     ```c
+     gemmini_mx_load_scales((uint64_t)&B_scales_col[0][j0 * BLK], BLK, 1);
+     ```
+     *(Note: If the scale factors consist of multiple quantization groups along K, i.e., `MATMUL_GK > 1`, and the sub-blocks are layout-contiguous or can be loaded sequentially, we adjust the length parameter to `BLK * MATMUL_GK` accordingly.)*
+
+By pointing `gemmini_mx_load_scales` directly to the source DRAM slices, we leverage the hardware\'s fast DMA capabilities and completely eliminate CPU staging overhead.''',
+code='''void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      int tiles_I = (mrows + DIM - 1) / DIM;  // Ceiling division for actual tiles needed
+      int tiles_J = (ncols + DIM - 1) / DIM;  // Ceiling division for actual tiles needed
+      int tiles_K = MATMUL_K / DIM;
+      
+      // Proper scratchpad layout calculation
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_J * tiles_K * DIM;  // Fixed: use tiles_J, not tiles_I
+      
+      int SPAD_DEST = 0;  // Use beginning of accumulator space
+      int pad_i = tiles_I * DIM - mrows;  // Correct padding calculation
+      int pad_j = tiles_J * DIM - ncols;  // Correct padding calculation
+
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      
+      // Load A scales - fixed size calculation (BLK elements, but scales are per row)
+      gemmini_mx_load_scales((uint64_t)&A_scales_row[0][i0 * BLK], tiles_I * sizeof(uint8_t), 0);
+      // Load B scales - fixed size calculation  
+      gemmini_mx_load_scales((uint64_t)&B_scales_col[0][j0 * BLK], tiles_J * sizeof(uint8_t), 1);
+      
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      // Load A tiles
+      for (int i = 0; i < tiles_I; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      // Load B tiles  
+      for (int j = 0; j < tiles_J; j++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (j * tiles_K + k) * DIM, DIM, DIM);  // Fixed B tile layout
+      
+      gemmini_config_st(MATMUL_N * sizeof(out_t));  // Fixed stride
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+      
+      gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, pad_i, pad_j, 0, 
+                           a_base, b_base, 0, SPAD_DEST,
+                           false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      
+      // Fixed output reading - account for BF16 packing (4 per uint64)
+      for (int r = 0; r < mrows; r++) {
+        int bf16_words = (ncols + 3) / 4;  // Ceiling division for BF16 packing
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][j0 * BLK], 
+                             SPAD_DEST * 16 + r * tiles_J * DIM,  // Fixed offset calculation
+                             ncols);  // Number of BF16 elements to read
+      }
+      
+      gemmini_fence();
+    }
+  }
+}
+''',
+score=inf,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='gemini-3.5-flash',
+code_gen_model='qwen.qwen3-coder-480b-a35b-v1:0',
+stdout='Kernel produced an INCORRECT/illegal result on spike. Diagnostic (fix this before optimizing):\nGemmini extension configured with:\ndim = 16\nGenerated implementation latency: 11267 cycles\nIncorrect result',
+stderr=None)

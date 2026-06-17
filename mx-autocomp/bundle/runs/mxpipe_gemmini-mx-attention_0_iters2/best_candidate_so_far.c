@@ -1,0 +1,128 @@
+void solution(void) {
+  // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&Q_scales_row, sizeof(Q_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&KT_scales_col, sizeof(KT_scales_col), 1);
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) { int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM); }
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) { int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM); }
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+    gemmini_fence();
+  }
+
+  // ---- 2) FLOAT-FREE integer softmax + fp8 requant (4 rows at a time) ----
+  for (int i = 0; i < ATT_S; i += 4) {
+    // Storage for 4 rows
+    int64_t q[4][ATT_S];
+    int64_t mq[4];
+    int64_t p[4][ATT_S];
+    int64_t sm[4];
+    int ls[4];
+    uint64_t inv_sm[4];
+
+    // Initialize max values
+    mq[0] = mq[1] = mq[2] = mq[3] = -((int64_t)1 << 62);
+
+    // Unpack 4 rows simultaneously + find max for each row
+    for (int j = 0; j < ATT_S; j += 4) {
+      uint64_t w0 = S1_hw[i + 0][j / 4];
+      uint64_t w1 = S1_hw[i + 1][j / 4];
+      uint64_t w2 = S1_hw[i + 2][j / 4];
+      uint64_t w3 = S1_hw[i + 3][j / 4];
+      for (int l = 0; l < 4; l++) {
+        int shift = l * 16;
+        int64_t qq0 = mx_ibf16_to_q((uint16_t)((w0 >> shift) & 0xFFFF));
+        int64_t qq1 = mx_ibf16_to_q((uint16_t)((w1 >> shift) & 0xFFFF));
+        int64_t qq2 = mx_ibf16_to_q((uint16_t)((w2 >> shift) & 0xFFFF));
+        int64_t qq3 = mx_ibf16_to_q((uint16_t)((w3 >> shift) & 0xFFFF));
+        q[0][j + l] = qq0; if (qq0 > mq[0]) mq[0] = qq0;
+        q[1][j + l] = qq1; if (qq1 > mq[1]) mq[1] = qq1;
+        q[2][j + l] = qq2; if (qq2 > mq[2]) mq[2] = qq2;
+        q[3][j + l] = qq3; if (qq3 > mq[3]) mq[3] = qq3;
+      }
+    }
+
+    // Compute iexp + sum for 4 rows simultaneously
+    sm[0] = sm[1] = sm[2] = sm[3] = 0;
+    for (int j = 0; j < ATT_S; j++) {
+      int64_t pv0 = mx_iexp(q[0][j] - mq[0]);
+      int64_t pv1 = mx_iexp(q[1][j] - mq[1]);
+      int64_t pv2 = mx_iexp(q[2][j] - mq[2]);
+      int64_t pv3 = mx_iexp(q[3][j] - mq[3]);
+      p[0][j] = pv0; sm[0] += pv0;
+      p[1][j] = pv1; sm[1] += pv1;
+      p[2][j] = pv2; sm[2] += pv2;
+      p[3][j] = pv3; sm[3] += pv3;
+    }
+
+    // Compute log2 + reciprocal for 4 rows
+    for (int r = 0; r < 4; r++) {
+      ls[r] = mx_ilog2((uint64_t)sm[r]);
+      inv_sm[r] = (((uint64_t)1 << (ls[r] + MX_FRAC)) + ((uint64_t)sm[r] >> 1)) / (uint64_t)sm[r];
+    }
+
+    // Scale computation: iterate over groups, process all 4 rows per group
+    for (int g = 0; g < GROUPS_S; g++) {
+      int jstart = g * 32;
+      int jend = (g + 1) * 32;
+
+      for (int r = 0; r < 4; r++) {
+        int row = i + r;
+        int64_t gmax = 0;
+        for (int j = jstart; j < jend; j++) if (p[r][j] > gmax) gmax = p[r][j];
+        if (gmax == 0) {
+          P_scales[g][row] = 0;
+          for (int j = jstart; j < jend; j++) P_q[row][j] = 0;
+          continue;
+        }
+        int e = mx_ilog2((uint64_t)gmax) - ls[r] - MX_P_TARGET_LOG2;
+        P_scales[g][row] = (uint8_t)(e + 127);
+        for (int j = jstart; j < jend; j++)
+          P_q[row][j] = mx_ienc_fp8(p[r][j], inv_sm[r], ls[r], e);
+      }
+    }
+  }
+
+  // ---- 3) O = P @ V on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+    gemmini_mx_load_scales((uint64_t)&V_scales_col, sizeof(V_scales_col), 1);
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) { int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM); }
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) { int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM); }
+    gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+    gemmini_fence();
+  }
+}

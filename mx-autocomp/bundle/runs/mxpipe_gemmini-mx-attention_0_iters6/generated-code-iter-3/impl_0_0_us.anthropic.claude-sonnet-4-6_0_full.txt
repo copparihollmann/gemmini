@@ -1,0 +1,191 @@
+Looking at the original code, I need to analyze the performance bottlenecks and optimize:
+
+1. **Scratchpad/accumulator sizing**: The original uses correct sizes but I should verify tile fits
+2. **MVIN batching**: Original already uses bb=2 batching, but B matrix mvin uses wrong port (should use mvin2 for B)
+3. **Softmax optimization**: The 4-row unrolling is good, but can be tightened
+4. **Scale loading**: Already correct
+5. **Key fix**: B tiles should use `gemmini_extended_mvin2` (separate port) to allow overlap with A loads
+
+Let me verify scratchpad constraints:
+- For Q@K^T: tiles_I=ATT_S/16, tiles_J=ATT_S/16, tiles_K=ATT_D/16
+- For P@V: tiles_I=ATT_S/16, tiles_J=ATT_D/16, tiles_K=ATT_S/16
+
+The main optimizations:
+1. Use `gemmini_extended_mvin2` for B tiles to use separate DMA port
+2. Use `gemmini_extended3_config_ld` with proper IDs for separate stride configs
+3. Keep MAX_BLOCK_LEN=4 batching
+4. Tighten the softmax inner loops
+
+```c
+void solution(void) {
+  // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                1, 1, 0, 0, false, 0, 0, 3, 0);
+
+    gemmini_mx_load_scales((uint64_t)&Q_scales_row,  sizeof(Q_scales_row),  0);
+    gemmini_mx_load_scales((uint64_t)&KT_scales_col, sizeof(KT_scales_col), 1);
+
+    // Load A (Q) tiles using mvin port 0, stride = ATT_D bytes
+    gemmini_extended3_config_ld(ATT_D * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+    for (int i = 0; i < tiles_I; i++) {
+      for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+        int bb = tiles_K - k < MAX_BLOCK_LEN ? tiles_K - k : MAX_BLOCK_LEN;
+        gemmini_extended_mvin(
+            (void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+            a_base + (i * tiles_K + k) * DIM,
+            bb * DIM, DIM);
+      }
+    }
+
+    // Load B (KT) tiles using mvin2 port 1, stride = ATT_S bytes
+    gemmini_extended3_config_ld(ATT_S * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+    for (int k = 0; k < tiles_K; k++) {
+      for (int j = 0; j < tiles_J; j += MAX_BLOCK_LEN) {
+        int bb = tiles_J - j < MAX_BLOCK_LEN ? tiles_J - j : MAX_BLOCK_LEN;
+        gemmini_extended_mvin2(
+            (void*)(((elem_t*)KT_in) + k * DIM * ATT_S + j * DIM),
+            b_base + (k * tiles_J + j) * DIM,
+            bb * DIM, DIM);
+      }
+    }
+
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                 tiles_I, tiles_J, tiles_K,
+                                 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+                         a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                         false, false, false, false, false,
+                         NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+    gemmini_fence();
+  }
+
+  // ---- 2) FLOAT-FREE integer softmax + fp8 requant (4 rows at a time) ----
+  for (int i = 0; i < ATT_S; i += 4) {
+    int64_t q[4][ATT_S];
+    int64_t mq[4];
+    int64_t p[4][ATT_S];
+    int64_t sm[4];
+    int      ls[4];
+    uint64_t inv_sm[4];
+
+    mq[0] = mq[1] = mq[2] = mq[3] = -((int64_t)1 << 62);
+
+    // Unpack 4 rows + find per-row max
+    for (int j = 0; j < ATT_S; j += 4) {
+      uint64_t w0 = S1_hw[i + 0][j / 4];
+      uint64_t w1 = S1_hw[i + 1][j / 4];
+      uint64_t w2 = S1_hw[i + 2][j / 4];
+      uint64_t w3 = S1_hw[i + 3][j / 4];
+      for (int l = 0; l < 4; l++) {
+        int shift = l * 16;
+        int64_t qq0 = mx_ibf16_to_q((uint16_t)((w0 >> shift) & 0xFFFF));
+        int64_t qq1 = mx_ibf16_to_q((uint16_t)((w1 >> shift) & 0xFFFF));
+        int64_t qq2 = mx_ibf16_to_q((uint16_t)((w2 >> shift) & 0xFFFF));
+        int64_t qq3 = mx_ibf16_to_q((uint16_t)((w3 >> shift) & 0xFFFF));
+        q[0][j + l] = qq0; if (qq0 > mq[0]) mq[0] = qq0;
+        q[1][j + l] = qq1; if (qq1 > mq[1]) mq[1] = qq1;
+        q[2][j + l] = qq2; if (qq2 > mq[2]) mq[2] = qq2;
+        q[3][j + l] = qq3; if (qq3 > mq[3]) mq[3] = qq3;
+      }
+    }
+
+    // Compute iexp + sum for 4 rows
+    sm[0] = sm[1] = sm[2] = sm[3] = 0;
+    for (int j = 0; j < ATT_S; j++) {
+      int64_t pv0 = mx_iexp(q[0][j] - mq[0]);
+      int64_t pv1 = mx_iexp(q[1][j] - mq[1]);
+      int64_t pv2 = mx_iexp(q[2][j] - mq[2]);
+      int64_t pv3 = mx_iexp(q[3][j] - mq[3]);
+      p[0][j] = pv0; sm[0] += pv0;
+      p[1][j] = pv1; sm[1] += pv1;
+      p[2][j] = pv2; sm[2] += pv2;
+      p[3][j] = pv3; sm[3] += pv3;
+    }
+
+    // log2 + reciprocal for 4 rows
+    for (int r = 0; r < 4; r++) {
+      ls[r]     = mx_ilog2((uint64_t)sm[r]);
+      inv_sm[r] = (((uint64_t)1 << (ls[r] + MX_FRAC)) + ((uint64_t)sm[r] >> 1))
+                  / (uint64_t)sm[r];
+    }
+
+    // Scale + quantize: iterate over groups, all 4 rows per group
+    for (int g = 0; g < GROUPS_S; g++) {
+      int jstart = g * 32;
+      int jend   = jstart + 32;
+      for (int r = 0; r < 4; r++) {
+        int row = i + r;
+        int64_t gmax = 0;
+        for (int j = jstart; j < jend; j++)
+          if (p[r][j] > gmax) gmax = p[r][j];
+        if (gmax == 0) {
+          P_scales[g][row] = 0;
+          for (int j = jstart; j < jend; j++) P_q[row][j] = 0;
+          continue;
+        }
+        int e = mx_ilog2((uint64_t)gmax) - ls[r] - MX_P_TARGET_LOG2;
+        P_scales[g][row] = (uint8_t)(e + 127);
+        for (int j = jstart; j < jend; j++)
+          P_q[row][j] = mx_ienc_fp8(p[r][j], inv_sm[r], ls[r], e);
+      }
+    }
+  }
+
+  // ---- 3) O = P @ V on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                1, 1, 0, 0, false, 0, 0, 3, 0);
+
+    gemmini_mx_load_scales((uint64_t)&P_scales,    sizeof(P_scales),    0);
+    gemmini_mx_load_scales((uint64_t)&V_scales_col, sizeof(V_scales_col), 1);
+
+    // Load A (P) tiles using mvin port 0, stride = ATT_S bytes
+    gemmini_extended3_config_ld(ATT_S * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+    for (int i = 0; i < tiles_I; i++) {
+      for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+        int bb = tiles_K - k < MAX_BLOCK_LEN ? tiles_K - k : MAX_BLOCK_LEN;
+        gemmini_extended_mvin(
+            (void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),
+            a_base + (i * tiles_K + k) * DIM,
+            bb * DIM, DIM);
+      }
+    }
+
+    // Load B (V) tiles using mvin2 port 1, stride = ATT_D bytes
+    gemmini_extended3_config_ld(ATT_D * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+    for (int k = 0; k < tiles_K; k++) {
+      for (int j = 0; j < tiles_J; j += MAX_BLOCK_LEN) {
+        int bb = tiles_J - j < MAX_BLOCK_LEN ? tiles_J - j : MAX_BLOCK_LEN;
+        gemmini_extended_mvin2(
+            (void*)(((elem_t*)V_in) + k * DIM * ATT_D + j * DIM),
+            b_base + (k * tiles_J + j) * DIM,
+            bb * DIM, DIM);
+      }
+    }
+
+    gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                 tiles_I, tiles_J, tiles_K,
+                                 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+                         a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                         false, false, false, false, false,
+                         NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+    gemmini_fence();
+  }
+}
+```

@@ -1,0 +1,76 @@
+```c
+void solution(void) {
+    // Small tile-sized A buffer: only DIM×DIM = 256 bytes, fits entirely in L1 cache
+    static elem_t A_tile[DIM][DIM] __attribute__((aligned(64)));
+
+    // Step 1: Configure execution — weight-stationary, FP8 inputs, BF16 output
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                1, 1, 0, 0, false, 0, 0, 3, 0);
+
+    // Step 2: Load scale factors (sel=0 for A/activation, sel=1 for B/weight)
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+    // Step 4a: Configure mvin port 0 (id=0) for A tiles
+    // Stride = DIM bytes because A_tile is a compact DIM×DIM buffer
+    gemmini_extended3_config_ld(DIM * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+
+    // Fused im2col + mvin: compute one DIM×DIM A tile, immediately mvin it
+    // Each A_tile element is written once and consumed by DMA immediately,
+    // keeping the 256-byte buffer hot in L1 cache throughout.
+    for (int i = 0; i < tiles_I; i++) {
+        for (int k = 0; k < tiles_K; k++) {
+            // Fill A_tile[DIM][DIM] with im2col data for tile (i, k)
+            for (int r = 0; r < DIM; r++) {
+                int row = i * DIM + r;      // global patch row index
+                int pi  = row / PATCHES_X;
+                int pj  = row % PATCHES_X;
+                for (int s = 0; s < DIM; s++) {
+                    int col = k * DIM + s;  // global K-column index
+                    int c   = col / (CONV_KSZ * CONV_KSZ);
+                    int rem = col % (CONV_KSZ * CONV_KSZ);
+                    int dy  = rem / CONV_KSZ;
+                    int dx  = rem % CONV_KSZ;
+                    A_tile[r][s] = X_in[c][pi * CONV_KSZ + dy][pj * CONV_KSZ + dx];
+                }
+            }
+            // Immediately DMA this tile into the scratchpad at the correct address
+            uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+            gemmini_extended_mvin((void*)A_tile, sp_addr, DIM, DIM);
+        }
+    }
+
+    // Step 4b: Configure mvin port 1 (id=1) for B tiles
+    // B_in is laid out row-major with MATMUL_K columns, so stride = MATMUL_K bytes
+    gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+    // Load B tiles: b_base is at the top of the scratchpad, growing downward
+    for (int k = 0; k < tiles_K; k++) {
+        for (int j = 0; j < tiles_J; j++) {
+            gemmini_extended_mvin2(
+                (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+                b_base + (j * tiles_K + k) * DIM,
+                DIM, DIM);
+        }
+    }
+
+    // Step 5: Configure output stride and requantizer bounds
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                 tiles_I, tiles_J, tiles_K,
+                                 /*scale_act_sel*/0, /*scale_w_sel*/0,
+                                 /*lut_update_granularity*/1);
+
+    // Step 6: Execute fused weight-stationary tiled matmul in hardware
+    // LOOP_WS_CONFIG_SPAD_AB (funct 24) is re-issued inside gemmini_loop_ws_spad
+    // via the macro expansion — the one-shot mx_loop_spad_marker is set each call
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+                         a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                         false, false, false, false, false,
+                         NO_ACTIVATION, 0, 0, false, 0x38);
+
+    // Step 7: Drain BF16 results from mx_smem to DRAM, then fence
+    gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+    gemmini_fence();
+}
+```

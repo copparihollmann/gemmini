@@ -1,0 +1,383 @@
+{'correct': True, 'test_results': {0: True}, 'compiled': True, 'latency': 1607}
+Prev latency: 1607
+New latency: 1607
+Plan: ## Analysis of the Current Code
+
+Looking at the original code, I need to identify the key inefficiency to address with a single strategy.
+
+The current code:
+1. Loads A tiles in an `i × k` loop
+2. Loads B tiles in a `k × j` loop
+3. Issues a single `gemmini_loop_ws_spad` covering all `tiles_I × tiles_J × tiles_K`
+
+The critical observation: **`gemmini_config_ld` is called once per matrix (outside loops), and then all tiles are mvin'd.** This is already reasonably structured, but the `gemmini_config_ld` for A uses `MATMUL_K * sizeof(elem_t)` as stride, and for B uses `MATMUL_N * sizeof(elem_t)`. These are correct.
+
+However, looking at the mvin loops more carefully:
+
+- **A tiles**: outer loop is `i`, inner is `k` — correct for row-major A
+- **B tiles**: outer loop is `k`, inner is `j` — correct for row-major B
+
+The `gemmini_config_ld` is being called **inside no loop** — it's already hoisted. But wait, looking more carefully at strategy **8: set `ex_accumulate` flag** and strategy **10: reorder I/J/K loop nest to maximize weight-stationary B-tile reuse** — these don't directly apply since we use the fused hardware loop.
+
+The most impactful strategy here is **strategy 6: reuse loaded B (weight) tiles across multiple I-tile iterations without re-mvin**. But since we use `gemmini_loop_ws_spad` which handles the full tiled loop in hardware, B tiles are already reused in hardware.
+
+**The real inefficiency**: The `gemmini_config_ld` for B is set to `MATMUL_N * sizeof(elem_t)` but then A's config is set first and B's second. More importantly, examining the `gemmini_extended_mvin` calls — **there are no `gemmini_fence()` calls between mvins**, which is fine, but the mvin loops themselves could be restructured.
+
+The key issue I see is that **`gemmini_config_ld` is called twice** (once for A, once for B), with all A mvins grouped together and all B mvins grouped together. Strategy **13** directly addresses this: restructure to issue all A mvins, then all B mvins, with proper config sequencing to minimize bubbles.
+
+But actually, the most impactful single strategy given the scratchpad utilization feedback and the note that this is phase 2 is **strategy 8: set `ex_accumulate=true` in `gemmini_loop_ws_spad` to accumulate across K tiles without intermediate mvout**.
+
+Wait — looking again at the existing call: `ex_accumulate` is already `false`. For a single fused loop call covering all K tiles, the hardware accumulates internally. So `ex_accumulate=false` is correct for a single call.
+
+**The clear winner is strategy 13**: restructure the mvin loops to issue all A-tile mvins for a single i-row before issuing B-tile mvins, then configure properly. But more concretely: the current code issues **two separate `gemmini_config_ld` calls** with all A mvins between them, then all B mvins. The B mvins use `mvin` (port 0) just like A. We should use **`gemmini_extended_mvin2`** for B tiles to allow A and B loads to potentially overlap, and restructure to interleave them.
+
+## Selected Strategy: Strategy 13 — Restructure mvin loops to use separate ports and interleave A/B loading
+
+## Plan
+
+**The core change**: Use `gemmini_extended_mvin2` (port 1) for B tile loads instead of `gemmini_extended_mvin` (port 0). This allows A and B tile DMA transfers to proceed concurrently since they use independent ports. Additionally, configure both load ports upfront (A config via port 0, B config via port 1 using `gemmini_extended3_config_ld` with `id=1`), then issue all A mvins via `gemmini_extended_mvin` and all B mvins via `gemmini_extended_mvin2` in an interleaved fashion — issuing the A tile for row `i` immediately followed by the corresponding B tiles, so the systolic array's input buffers receive both operands as soon as possible and DMA bandwidth is shared across both ports simultaneously.
+
+**Concrete steps**:
+
+1. Configure load port 0 for A: `gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), SCALE_IDENTITY, false, 0)` (id=0)
+2. Configure load port 1 for B: `gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), SCALE_IDENTITY, false, 1)` (id=1)
+3. Issue all A mvins via `gemmini_extended_mvin` (uses port 0)
+4. Issue all B mvins via `gemmini_extended_mvin2` (uses port 1)
+
+By configuring both ports once (outside all loops) and using dedicated ports for A vs B, the hardware's two independent DMA engines can service both streams without serialization. The `gemmini_config_ld` (which maps to `gemmini_extended3_config_ld(..., id=0)`) and the id=1 config are both issued before any mvin, eliminating the mid-sequence reconfiguration bubble that currently exists between the A mvin loop and the B mvin loop.
+
+CodeCandidate(parent=CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED baseline from Rakanic fork kernel matmul_tiled_fp8_128x128x256 (fp8:e4m3).
+void solution(void) {
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+#ifdef SPIKE_SIM
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+#else
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
+#endif
+
+  // ---- MVIN A: tile (i,k) -> a_base + (i*tiles_K + k)*DIM ----
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+
+  // ---- MVIN B: tile (k,j) -> b_base + (j*tiles_K + k)*DIM ----
+  for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j++) {
+      elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+//      printf("j: %d, k: %d, sp_addr: %d \n", j, k, sp_addr);
+//      printf("first elem: %x \n", dram_ptr[0]);
+      gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  int SPAD_DEST = 0;
+
+  gemmini_config_st(DIM * sizeof(elem_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // ---- Compute ----
+  gemmini_loop_ws_spad(
+      tiles_I, tiles_J, tiles_K,
+      0, 0, 0,
+      a_base,
+      BANK_NUM * BANK_ROWS,
+      0,
+      SPAD_DEST,
+      false, false,
+      false, false, false,
+      NO_ACTIVATION,
+      0, 0,
+      false,
+      0x38);
+
+//  for (int i = 0; i < tiles_I; i++) {
+//    for (int j = 0; j < tiles_J; j++) {
+//      uint32_t acc_tile_addr = acc_addr + (i * tiles_J + j) * DIM;
+//      out_t *dram_ptr = &C_hw[i * DIM][j * DIM];
+//      gemmini_mvout((void *) dram_ptr, acc_tile_addr);
+//    }
+//  }
+
+
+//  gemmini_mvout((void*)&C_hw[0][0], 128 )
+
+  gemmini_fence();
+
+//  uint64_t* smem_addr = ((uint64_t*)SMEM) + SPAD_DEST * 2 + 448 / 8;
+//  printf("SMEM at address %x = %lx \n", ((uint64_t*)SMEM), *((uint64_t*)SMEM));
+//  printf("SMEM at address %x = %lx \n", smem_addr, *smem_addr);
+//  printf("SMEM at address %x = %lx \n", smem_addr + 2, *(smem_addr+2));
+
+
+#ifdef SPIKE_SIM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+#else
+  printf("Moving out:\n");
+  for (int i = 0; i < tiles_J*tiles_I*2; i++) {
+      gemmini_mvout((void*)((uint64_t*) C_hw + i*2*DIM), SPAD_DEST + i*DIM);
+  }
+  gemmini_fence();
+#endif
+
+  // ---- Debug print tile (0,0) ----
+//  printf("=== Tile (0,0) - acc_addr=0x%08x ===\n", acc_addr);
+//  for (int i = 0; i < DIM; i++) {
+//    for (int j = 0; j < DIM; j++) {
+//      printf("C_hw[%d][%d] = 0x%016lx\n", i, j, (unsigned long)C_hw[i][j]);
+//    }
+//  }
+
+  // ---- Elementwise check against C_out_bf16 ----
+  }
+''',
+score=1607,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'Accelerator-bound: compute and data-movement look balanced; tune tiling / scratchpad occupancy for more overlap.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''## Analysis of the Current Code
+
+Looking at the current code, I can identify the following structure:
+
+1. `gemmini_extended3_config_ex` — configured once (good)
+2. `gemmini_mx_load_scales` — called once (good)
+3. MVIN A loop (i, k)
+4. MVIN B loop (k, j)
+5. `gemmini_config_st` + `gemmini_mxquant_config_mvout`
+6. `gemmini_loop_ws_spad`
+7. `gemmini_fence()` — **premature fence before `gemmini_mx_read_smem`**
+8. `gemmini_mx_read_smem`
+
+## Selected Strategy: #11 — Eliminate the premature `gemmini_fence()` before `gemmini_mx_read_smem` on the SPIKE path
+
+### Why This Applies
+
+In the SPIKE_SIM path, the code currently does:
+```c
+gemmini_loop_ws_spad(...);
+gemmini_fence();                                    // <-- premature fence
+// ...
+gemmini_mx_read_smem(&C_hw[0][0], ...);           // then reads
+```
+
+The `gemmini_fence()` is a **full memory barrier** that stalls the host CPU until all in-flight accelerator operations complete. Placing it *between* `gemmini_loop_ws_spad` and `gemmini_mx_read_smem` forces the pipeline to drain completely before the read command is even issued. This adds unnecessary stall cycles because `gemmini_mx_read_smem` itself already enforces ordering — the hardware processes instructions in-order, so `MX_READ_SMEM` will naturally execute after `LOOP_WS` completes without needing an explicit fence in between.
+
+The fence that **is required** (by Rule 9) belongs *after* `gemmini_mx_read_smem`, before the host CPU reads `C_hw` from DRAM. That fence is currently missing on the SPIKE path.
+
+### Plan
+
+1. **Remove** the `gemmini_fence()` call that appears between `gemmini_loop_ws_spad` and the `#ifdef SPIKE_SIM` block.
+2. **Add** `gemmini_fence()` *after* `gemmini_mx_read_smem` on the SPIKE path, so the host CPU correctly waits for the DMA drain to complete before consuming `C_hw`.
+3. The non-SPIKE path already has its own `gemmini_fence()` after the mvout loop — leave that unchanged.
+
+This removes one full pipeline stall and moves the necessary fence to the correct position, reducing latency by eliminating the idle cycles between the loop completion and the smem read command being issued.''',
+code='''void solution(void) {
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+#ifdef SPIKE_SIM
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+#else
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
+#endif
+
+  // ---- MVIN A: tile (i,k) -> a_base + (i*tiles_K + k)*DIM ----
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+
+  // ---- MVIN B: tile (k,j) -> b_base + (j*tiles_K + k)*DIM ----
+  for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j++) {
+      elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+      gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  int SPAD_DEST = 0;
+
+  gemmini_config_st(DIM * sizeof(elem_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // ---- Compute ----
+  gemmini_loop_ws_spad(
+      tiles_I, tiles_J, tiles_K,
+      0, 0, 0,
+      a_base,
+      BANK_NUM * BANK_ROWS,
+      0,
+      SPAD_DEST,
+      false, false,
+      false, false, false,
+      NO_ACTIVATION,
+      0, 0,
+      false,
+      0x38);
+
+#ifdef SPIKE_SIM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+#else
+  for (int i = 0; i < tiles_J*tiles_I*2; i++) {
+      gemmini_mvout((void*)((uint64_t*) C_hw + i*2*DIM), SPAD_DEST + i*DIM);
+  }
+  gemmini_fence();
+#endif
+
+}
+''',
+score=1607,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'Accelerator-bound: compute and data-movement look balanced; tune tiling / scratchpad occupancy for more overlap.'],
+plan_gen_model='us.anthropic.claude-sonnet-4-6',
+code_gen_model='us.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None),
+plan='''## Analysis of the Current Code
+
+Looking at the original code, I need to identify the key inefficiency to address with a single strategy.
+
+The current code:
+1. Loads A tiles in an `i × k` loop
+2. Loads B tiles in a `k × j` loop
+3. Issues a single `gemmini_loop_ws_spad` covering all `tiles_I × tiles_J × tiles_K`
+
+The critical observation: **`gemmini_config_ld` is called once per matrix (outside loops), and then all tiles are mvin\'d.** This is already reasonably structured, but the `gemmini_config_ld` for A uses `MATMUL_K * sizeof(elem_t)` as stride, and for B uses `MATMUL_N * sizeof(elem_t)`. These are correct.
+
+However, looking at the mvin loops more carefully:
+
+- **A tiles**: outer loop is `i`, inner is `k` — correct for row-major A
+- **B tiles**: outer loop is `k`, inner is `j` — correct for row-major B
+
+The `gemmini_config_ld` is being called **inside no loop** — it\'s already hoisted. But wait, looking more carefully at strategy **8: set `ex_accumulate` flag** and strategy **10: reorder I/J/K loop nest to maximize weight-stationary B-tile reuse** — these don\'t directly apply since we use the fused hardware loop.
+
+The most impactful strategy here is **strategy 6: reuse loaded B (weight) tiles across multiple I-tile iterations without re-mvin**. But since we use `gemmini_loop_ws_spad` which handles the full tiled loop in hardware, B tiles are already reused in hardware.
+
+**The real inefficiency**: The `gemmini_config_ld` for B is set to `MATMUL_N * sizeof(elem_t)` but then A\'s config is set first and B\'s second. More importantly, examining the `gemmini_extended_mvin` calls — **there are no `gemmini_fence()` calls between mvins**, which is fine, but the mvin loops themselves could be restructured.
+
+The key issue I see is that **`gemmini_config_ld` is called twice** (once for A, once for B), with all A mvins grouped together and all B mvins grouped together. Strategy **13** directly addresses this: restructure to issue all A mvins, then all B mvins, with proper config sequencing to minimize bubbles.
+
+But actually, the most impactful single strategy given the scratchpad utilization feedback and the note that this is phase 2 is **strategy 8: set `ex_accumulate=true` in `gemmini_loop_ws_spad` to accumulate across K tiles without intermediate mvout**.
+
+Wait — looking again at the existing call: `ex_accumulate` is already `false`. For a single fused loop call covering all K tiles, the hardware accumulates internally. So `ex_accumulate=false` is correct for a single call.
+
+**The clear winner is strategy 13**: restructure the mvin loops to issue all A-tile mvins for a single i-row before issuing B-tile mvins, then configure properly. But more concretely: the current code issues **two separate `gemmini_config_ld` calls** with all A mvins between them, then all B mvins. The B mvins use `mvin` (port 0) just like A. We should use **`gemmini_extended_mvin2`** for B tiles to allow A and B loads to potentially overlap, and restructure to interleave them.
+
+## Selected Strategy: Strategy 13 — Restructure mvin loops to use separate ports and interleave A/B loading
+
+## Plan
+
+**The core change**: Use `gemmini_extended_mvin2` (port 1) for B tile loads instead of `gemmini_extended_mvin` (port 0). This allows A and B tile DMA transfers to proceed concurrently since they use independent ports. Additionally, configure both load ports upfront (A config via port 0, B config via port 1 using `gemmini_extended3_config_ld` with `id=1`), then issue all A mvins via `gemmini_extended_mvin` and all B mvins via `gemmini_extended_mvin2` in an interleaved fashion — issuing the A tile for row `i` immediately followed by the corresponding B tiles, so the systolic array\'s input buffers receive both operands as soon as possible and DMA bandwidth is shared across both ports simultaneously.
+
+**Concrete steps**:
+
+1. Configure load port 0 for A: `gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), SCALE_IDENTITY, false, 0)` (id=0)
+2. Configure load port 1 for B: `gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), SCALE_IDENTITY, false, 1)` (id=1)
+3. Issue all A mvins via `gemmini_extended_mvin` (uses port 0)
+4. Issue all B mvins via `gemmini_extended_mvin2` (uses port 1)
+
+By configuring both ports once (outside all loops) and using dedicated ports for A vs B, the hardware\'s two independent DMA engines can service both streams without serialization. The `gemmini_config_ld` (which maps to `gemmini_extended3_config_ld(..., id=0)`) and the id=1 config are both issued before any mvin, eliminating the mid-sequence reconfiguration bubble that currently exists between the A mvin loop and the B mvin loop.''',
+code='''void solution(void) {
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+#ifdef SPIKE_SIM
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+#else
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
+#endif
+
+  // Configure load port 0 for A tiles (stride = MATMUL_K bytes per row)
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), SCALE_IDENTITY, false, 0);
+
+  // Configure load port 1 for B tiles (stride = MATMUL_N bytes per row)
+  gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), SCALE_IDENTITY, false, 1);
+
+  // Issue all A tile mvins via port 0 (gemmini_extended_mvin)
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  // Issue all B tile mvins via port 1 (gemmini_extended_mvin2)
+  // This allows A and B DMA transfers to proceed concurrently on independent ports
+  for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j++) {
+      elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+      gemmini_extended_mvin2((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  int SPAD_DEST = 0;
+
+  gemmini_config_st(DIM * sizeof(elem_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // ---- Compute ----
+  gemmini_loop_ws_spad(
+      tiles_I, tiles_J, tiles_K,
+      0, 0, 0,
+      a_base,
+      BANK_NUM * BANK_ROWS,
+      0,
+      SPAD_DEST,
+      false, false,
+      false, false, false,
+      NO_ACTIVATION,
+      0, 0,
+      false,
+      0x38);
+
+#ifdef SPIKE_SIM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+#else
+  for (int i = 0; i < tiles_J*tiles_I*2; i++) {
+      gemmini_mvout((void*)((uint64_t*) C_hw + i*2*DIM), SPAD_DEST + i*DIM);
+  }
+  gemmini_fence();
+#endif
+
+}
+''',
+score=None,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='us.anthropic.claude-sonnet-4-6',
+code_gen_model='us.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None)

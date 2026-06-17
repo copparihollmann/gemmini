@@ -1,0 +1,42 @@
+## Analysis
+
+Looking at the original code, I can identify the key inefficiency targeted by **Strategy 5: consolidate scale factor arrays to minimize `gemmini_mx_load_scales` call count across tiled loop iterations**.
+
+The original code does this inside every `(i0, j0)` block iteration:
+1. **Two `memcpy` calls** to copy subsets of `A_scales_row` and `B_scales_col` into staging buffers `A_s` and `B_s`
+2. **Two `gemmini_mx_load_scales` calls** to load those staging buffers
+
+The `memcpy` staging is flagged as "CPU/host data staging detected" and is explicitly called out as a dominant cost. The memcpys extract the per-block slice of scales for the current `(i0, j0)` tile pair, then load that slice. This happens on every iteration of the outer `(i0, j0)` loop.
+
+## Key Observation
+
+Looking at the scale dimensions:
+- `A_scales_row[GK][M]` — indexed by K-group and M-row; the A scales depend only on `i0`, not `j0`
+- `B_scales_col[GK][N]` — indexed by K-group and N-col; the B scales depend only on `j0`, not `i0`
+
+The original code re-loads **both** A and B scales on every `(i0, j0)` iteration, even though:
+- A scales only change when `i0` changes (not when `j0` changes)
+- B scales only change when `j0` changes (not when `i0` changes)
+
+Additionally, the `memcpy` into staging buffers `A_s`/`B_s` is unnecessary overhead — we can load scales **directly from the source arrays** (strided sub-regions) if we restructure the loop to separate concerns, or more simply, avoid redundant reloads.
+
+## Plan: Strategy 5 — Consolidate Scale Factor Loads
+
+**The plan:**
+
+1. **Eliminate the `memcpy` staging entirely** by loading scale factors directly from `A_scales_row` and `B_scales_col` without copying to intermediate buffers.
+
+2. **Restructure the loop order** to `i0` outer, `j0` inner, and **hoist the A scale load out of the `j0` loop** — since A scales only depend on `i0`, they only need to be loaded once per `i0` iteration, not once per `(i0, j0)` pair.
+
+3. **For the B scale load**, it must remain inside the `j0` loop since B scales change per `j0`. However, we eliminate the `memcpy` overhead by loading directly from the source pointer: `&B_scales_col[0][j0 * BLK]` (computing the right DRAM address).
+
+4. **For A scales**, load directly from `&A_scales_row[0][i0 * BLK]` outside the `j0` loop. Since the scale memory layout is `A_scales_row[GK][M]`, the stride between GK entries is `M` bytes — we need to either load all GK rows contiguously or pass the correct sized slice. The current staging copies `BLK` bytes per GK row into a contiguous `A_s[GK][BLK]`. Instead, we can pass `A_scales_row[0] + i0 * BLK` with the full row size and load `BLK` bytes per group — but since the hardware `gemmini_mx_load_scales` takes a flat DRAM address + length, we need the data to be contiguous. The cleanest approach is to build a temporary contiguous A-scale buffer once per `i0` (not per `j0`), saving `BLOCKS_N - 1` redundant A-scale loads per row of blocks.
+
+**Concretely**, the change is:
+- Move the A-scale `memcpy` + `gemmini_mx_load_scales` for A **outside** the `j0` loop (inside `i0` only)
+- Keep B-scale `memcpy` + `gemmini_mx_load_scales` for B inside the `j0` loop
+- Also **hoist `gemmini_extended3_config_ex`** and `gemmini_flush` outside the `(i0, j0)` loops since they don't depend on tile position and are redundantly re-issued every iteration
+
+This reduces `gemmini_mx_load_scales` calls from `2 * BLOCKS_M * BLOCKS_N` to `BLOCKS_M + BLOCKS_M * BLOCKS_N = BLOCKS_M * (1 + BLOCKS_N)`, and eliminates `BLOCKS_M * (BLOCKS_N - 1)` A-scale memcpy+load pairs. The `gemmini_flush` and `gemmini_extended3_config_ex` are reduced from `BLOCKS_M * BLOCKS_N` calls to 1 each.
+
+The programming model ordering is preserved: within each `(i0, j0)` iteration, scales are loaded (A from the hoisted call, B from the per-`j0` call) before `mvin` and before `gemmini_loop_ws_spad`. Since the A scale load for `i0` is issued before the `j0` loop begins, and the hardware scale memory persists until overwritten (and isn't overwritten within the `j0` loop for sel=0), it is valid for all `j0` iterations at fixed `i0`.

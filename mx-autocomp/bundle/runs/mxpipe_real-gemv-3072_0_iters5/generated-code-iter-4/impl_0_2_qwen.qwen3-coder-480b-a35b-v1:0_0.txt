@@ -1,0 +1,65 @@
+#include <string.h>
+#include <stdint.h>
+
+void solution(void) {
+  // Flush accelerator state before starting
+  gemmini_flush(0);
+
+  // 1. Configure execution format and dataflow (WS)
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                              1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // 2. Stage and load A scales (constant across all J columns)
+  // GK = 96 scale groups (MATMUL_K/32 = 3072/32 = 96), BLK_M = 16 (1 tile)
+  static uint8_t A_s_local[96][16];
+  for (int g = 0; g < 96; g++) {
+    memcpy(&A_s_local[g][0], &A_scales_row[g][0], 16);
+  }
+  gemmini_mx_load_scales((uint64_t)A_s_local, 96 * 16, 0);
+
+  // 3. Load entire A matrix into scratchpad once
+  uint32_t a_base = 0;
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int k = 0; k < 192; k++) {
+    gemmini_extended_mvin((void*)(A_in + k * 16),
+                          a_base + k * 16, 16, 16);
+  }
+
+  // 4. Configure constant write-back stride
+  gemmini_config_st(MATMUL_N * sizeof(out_t));
+
+  // Temp buffer for column B scales
+  static uint8_t B_s_local[96][16];
+
+  // 5. Stream B columns, compute, and read out
+  for (int j0 = 0; j0 < 64; j0++) {
+    // Stage B scales for current 16-column block
+    for (int g = 0; g < 96; g++) {
+      memcpy(&B_s_local[g][0], &B_scales_col[g][j0 * 16], 16);
+    }
+    gemmini_mx_load_scales((uint64_t)B_s_local, 96 * 16, 1);
+
+    // Load current B column block directly from DRAM
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+    uint32_t b_base = BANK_NUM * BANK_ROWS - 192 * 1 * DIM; // 8192 - 3072 = 5120
+    for (int k = 0; k < 192; k++) {
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * 16) * MATMUL_N + (j0 * 16)),
+                            b_base + k * 16, 16, 16);
+    }
+
+    // Configure requantizer bounds and scale DRAM pointer (offsetted by j0)
+    gemmini_mxquant_config_mvout((uint64_t)(scale_factors + j0 * 16), 1, 1, 192, 0, 0, 1);
+
+    // Compute fused WS loop in hardware
+    int SPAD_DEST = 128;
+    gemmini_loop_ws_spad(1, 1, 192, 15, 0, 0,
+                         a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                         false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+    // Read back results straight to DRAM output (packed 4 BF16s per word)
+    gemmini_mx_read_smem(&C_hw[0][(j0 * 16) / BF16_PER_WORD], SPAD_DEST * 16, 16);
+  }
+
+  // Final single synchronization fence
+  gemmini_fence();
+}

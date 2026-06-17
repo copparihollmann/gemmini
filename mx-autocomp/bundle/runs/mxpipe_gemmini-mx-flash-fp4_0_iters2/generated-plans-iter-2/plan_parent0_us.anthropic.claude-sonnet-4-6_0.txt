@@ -1,0 +1,73 @@
+## Analysis
+
+Looking at the original code, I can identify the key inefficiency targeted by **strategy 5: reorder I/J/K loop nest to maximize weight-stationary B-tile reuse across I iterations**.
+
+### Current Structure
+
+The code has two hardware matmul calls per token block `t`:
+1. **QK^T**: `Q[ATT_S × ATT_D]` × `KT[ATT_D × BT]` → `S1[ATT_S × BT]`
+2. **PV**: `P[ATT_S × BT]` × `V[BT × ATT_D]` → `O[ATT_S × ATT_D]`
+
+Both use `gemmini_loop_ws_spad` which is a fused hardware loop — so the I/J/K ordering within that single hardware call is fixed. However, the **host-side scalar softmax + P-quantization loop** runs entirely on the CPU and is a major bottleneck.
+
+### Real Bottleneck: The Scalar CPU Loop
+
+Looking more carefully at the profiler hint: **"~4 scalar copy loops"** and the dominant cost is the host staging. The inner softmax loop iterates `ATT_S × (BT + ATT_D)` = 128 × (64 + 64) = 128 × 128 = 16,384 operations with floating-point emulation via `mx_ibf16_to_q`, `mx_iexp`, `mx_ilog2`, `mx_enc_P`, etc. This is the bottleneck.
+
+But the strategy hint says to focus on **strategy 5**: B-tile reuse across I iterations.
+
+### The Actual Strategy 5 Opportunity
+
+In the **PV matmul** (second hardware call):
+- `tiles_I = ATT_S/DIM/2 = 128/16/2 = 4`  
+- `tiles_J = ATT_D/DIM/2 = 64/16/2 = 2`
+- `tiles_K = BT/DIM = 64/16 = 4`
+
+The V matrix tiles are loaded fresh each iteration of `t`. For fixed `t`, all `tiles_I=4` row-tile groups of P share the **same** V tiles. The current code loads V tiles once and the hardware loop handles B-reuse internally — that's already good.
+
+For the **QK^T matmul**:
+- `tiles_I = ATT_S/DIM/2 = 4`
+- `tiles_J = BT/DIM/2 = 2`  
+- `tiles_K = ATT_D/DIM = 4`
+
+Q is the same across all `t` iterations. Currently Q is reloaded every `t`. By loading Q **once before the `t` loop** and reusing those scratchpad tiles across all `NT` iterations, we eliminate `(NT-1)` full Q mvin sequences.
+
+## Plan
+
+**Hoist the Q mvin outside the `t` loop to reuse Q tiles across all token-block iterations.**
+
+Concretely:
+1. Move `gemmini_config_ld(ATT_D*sizeof(elem_t))` and the Q mvin loop outside the `t` loop, loading Q tiles into `a_base=0` once.
+2. Inside the `t` loop, skip the Q mvin — only reload KT scales and KT tiles.
+3. For the PV matmul, P changes every `t` so it must still be loaded inside the loop. But we can use a **different `a_base`** for P that doesn't overlap Q's scratchpad region.
+
+### Scratchpad layout check
+
+- Q tiles: `tiles_I * tiles_K = 4 * 4 = 16` tiles × DIM = 256 rows at `a_base=0` (rows 0–255)
+- KT tiles for QK^T: `tiles_K * tiles_J = 4 * 2 = 8` tiles × DIM = 128 rows; `b_base = 8192 - 128 = 8064` (rows 8064–8191)
+- No overlap: 256 << 8064 ✓
+
+For PV:
+- P tiles: `tiles_I * tiles_K = 4 * 4 = 16` tiles × DIM = 256 rows; place at `p_base = 256` (rows 256–511)
+- V tiles: `tiles_K * tiles_J = 4 * 2 = 8` tiles × DIM = 128 rows; `b_base = 8192 - 128 = 8064` (rows 8064–8191)
+- No overlap with Q (rows 0–255) since P is at 256–511 ✓
+- Constraint check: `(tiles_I*tiles_K + tiles_J*tiles_K)*DIM = (16+8)*16 = 384 ≤ 8192` ✓
+
+This eliminates `NT` Q mvin calls (saving `tiles_I * tiles_K = 16` mvin instructions × NT iterations) and one `gemmini_config_ld` + one `gemmini_flush` + one `gemmini_extended3_config_ex` per iteration for the QK^T setup.
+
+However, `gemmini_flush(0)` inside the loop resets accelerator state — we **cannot** simply hoist the mvin before the flush since the flush clears scratchpad. We must restructure so that Q is loaded **after** the first flush but outside the t-loop, then **not flush again** between iterations (or restructure the flush placement).
+
+### Revised Plan
+
+- Issue `gemmini_flush(0)` once before the `t` loop.
+- Load Q tiles once (after the flush, before the loop).
+- Inside the loop:
+  - For QK^T: configure formats/scales, load KT tiles only, run the loop.
+  - For PV: configure formats/scales, load P tiles (at `p_base=256`) and V tiles, run the loop.
+  - **No `gemmini_flush` inside the loop** — flushes drain the pipeline but also reset state; replace with just re-issuing `gemmini_extended3_config_ex` as needed (which is already done).
+
+Actually, looking at the code: `gemmini_flush(0)` with argument 0 means "don't skip" — it drains the pipeline. Removing it risks ordering hazards. The safe approach: keep one flush before the outer loop, remove the two inner flushes (since each new `gemmini_extended3_config_ex` + mvin sequence establishes fresh state without needing a full flush, and the prior `gemmini_fence()` already ensures completion).
+
+The `gemmini_fence()` after each `gemmini_mx_read_smem` already serializes completion. So removing `gemmini_flush` inside the loop (replacing with just the fence that already exists) is safe.
+
+This saves: `2 * NT` flush calls + `tiles_I * tiles_K * NT = 16 * NT` Q mvin instructions.

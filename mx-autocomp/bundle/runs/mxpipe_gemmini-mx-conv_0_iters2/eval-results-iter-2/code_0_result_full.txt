@@ -1,0 +1,516 @@
+{'correct': True, 'test_results': {0: True}, 'compiled': True, 'latency': 49146}
+Prev latency: 7963
+New latency: 49146
+Plan: ## Analysis
+
+Looking at the current code, the key inefficiency is in the mvin loop structure:
+
+```c
+for (int k = 0; k < tiles_K; k++) {
+    // A tiles for all i-rows at this k-slice → port 1 (k_MVIN)
+    for (int i = 0; i < tiles_I; i++)
+        gemmini_extended_mvin(...A..., a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    // B tiles for all j-columns at this k-slice → port 2 (k_MVIN2)
+    for (int j = 0; j < tiles_J; j++)
+        gemmini_extended_mvin2(...B..., b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+}
+```
+
+**The B tiles are being loaded once per K-slice**, which is already correct behavior since `gemmini_loop_ws_spad` is a single fused hardware call. However, the im2col loop writes `A_buf` entirely before any DMA begins. **Strategy 13** applies: tile the im2col loop over K-blocks so that each block of `A_buf` rows (for a given k-slice) is written to memory and immediately DMA'd, allowing the CPU im2col work for the next block to overlap with Gemmini DMA for the current block, keeping the written data hot in L1 cache.
+
+## Plan: Strategy 13 — Tile the im2col loop over K to pipeline CPU writes with Gemmini DMA
+
+**Current structure:**
+1. Complete ALL of im2col (writes entire `A_buf[PATCHES][K]`) — touches all of A_buf
+2. Then start all DMA mvins
+
+**Problem:** The full `A_buf` is large (e.g., 64×64 = 4096 bytes for fp8), and by the time DMA starts for late K-slices, the early-K data may have been evicted from L1. More importantly, the CPU sits idle during DMA and DMA sits idle during im2col — they are fully serialized.
+
+**New structure:** Merge the im2col k-block loop with the mvin k-block loop:
+
+```
+for k in 0..tiles_K:
+    # CPU: compute im2col for this k-block (c, dy, dx range)
+    for i in 0..tiles_I:
+        for (c, dy, dx) in k-block:
+            A_buf[i*DIM .. (i+1)*DIM][k_col_start .. k_col_end] = ...
+    # DMA: immediately mvin A tiles for this k-block (data still hot in L1)
+    for i in 0..tiles_I:
+        gemmini_extended_mvin(A_buf + ..., a_base + (i*tiles_K+k)*DIM, DIM, DIM)
+    # DMA: mvin B tiles for this k-block on port 2 (overlaps next im2col iteration)
+    for j in 0..tiles_J:
+        gemmini_extended_mvin2(B_in + ..., b_base + (j*tiles_K+k)*DIM, DIM, DIM)
+```
+
+Each K-block's A data is DMA'd immediately after being written, while it's still hot in L1/L2 cache. The B mvin on port 2 overlaps with the next iteration's im2col CPU work.
+
+**Concrete changes:**
+1. Restructure the im2col nested loops to iterate over `k`-blocks (each k-block corresponds to one `tiles_K` slice: `c*CONV_KSZ*CONV_KSZ + dy*CONV_KSZ + dx` maps to a column range `[k*DIM, (k+1)*DIM)`).
+2. Inside each k-block, compute im2col for all `i` patch rows and exactly the columns in that k-block.
+3. Immediately follow with `gemmini_extended_mvin` for all `i` tiles of that k-block (port 0).
+4. Follow with `gemmini_extended_mvin2` for all `j` tiles of that k-block (port 1), which can overlap with the next iteration's im2col.
+5. The rest of the sequence (config_st, mxquant_config_mvout, loop_ws_spad, mx_read_smem, fence) is unchanged.
+
+This requires computing the mapping from flat column index `col = k*DIM + offset` back to `(c, dy, dx)` to know which input pixels to copy in each k-block.
+
+Here is the rewritten code:
+
+```c
+void solution(void) {
+    // Tile the im2col + mvin together over K-blocks:
+    // Each k-block covers DIM columns of A_buf, corresponding to a range of (c, dy, dx).
+    // We compute im2col for that k-block and immediately DMA it, keeping data hot in cache.
+
+    // Configure port 0 (mvin, id=0) for A tiles
+    gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+    // Configure port 1 (mvin2, id=1) for B tiles
+    gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+    // Process each K-block: im2col then immediate mvin
+    for (int k = 0; k < tiles_K; k++) {
+        int col_start = k * DIM;
+        // Compute im2col for this k-block: columns [col_start, col_start+DIM)
+        // col = c * CONV_KSZ * CONV_KSZ + dy * CONV_KSZ + dx
+        for (int col = col_start; col < col_start + DIM; col++) {
+            int tmp = col;
+            int dx = tmp % CONV_KSZ; tmp /= CONV_KSZ;
+            int dy = tmp % CONV_KSZ; tmp /= CONV_KSZ;
+            int c  = tmp;
+            for (int pi = 0; pi < CONV_H / CONV_KSZ; pi++)
+                for (int pj = 0; pj < PATCHES_X; pj++)
+                    A_buf[pi * PATCHES_X + pj][col] =
+                        X_in[c][pi * CONV_KSZ + dy][pj * CONV_KSZ + dx];
+        }
+
+        // Immediately DMA the A tiles for this k-block (data still hot in cache)
+        for (int i = 0; i < tiles_I; i++)
+            gemmini_extended_mvin(
+                (void*)(((elem_t*)A_buf) + i * DIM * MATMUL_K + col_start),
+                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+        // DMA B tiles for this k-block on port 2 (overlaps with next im2col block)
+        for (int j = 0; j < tiles_J; j++)
+            gemmini_extended_mvin2(
+                (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + col_start),
+                b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+    }
+
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+    gemmini_fence();
+}
+```
+
+Wait — I must respect the programming model ordering rule: `gemmini_extended3_config_ex` → `gemmini_mx_load_scales` → mvins → `gemmini_mxquant_config_mvout` → `gemmini_loop_ws_spad` → `gemmini_mx_read_smem` → `gemmini_fence`. The config and scale loads must come before the mvins. Let me correct the ordering:
+
+```c
+void solution(void) {
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+    // Configure port 0 (mvin, id=0) for A tiles
+    gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+    // Configure port 1 (mvin2, id=1) for B tiles
+    gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+    // Tile im2col over K-blocks and immediately DMA each block:
+    // col = c * CONV_KSZ^2 + dy * CONV_KSZ + dx maps to k-block k = col / DIM
+    for (int k = 0; k < tiles_K; k++) {
+        int col_start = k * DIM;
+
+        // im2col: compute A_buf columns [col_start, col_start+DIM) for all patch rows
+        for (int col = col_start; col < col_start + DIM; col++) {
+            int tmp = col;
+            int dx = tmp % CONV_KSZ; tmp /= CONV_KSZ;
+            int dy = tmp % CONV_KSZ; tmp /= CONV_KSZ;
+            int c  = tmp;
+            for (int pi = 0; pi < CONV_H / CONV_KSZ; pi++)
+                for (int pj = 0; pj < PATCHES_X; pj++)
+                    A_buf[pi * PATCHES_X + pj][col] =
+                        X_in[c][pi * CONV_KSZ + dy][pj * CONV_KSZ + dx];
+        }
+
+        // Immediately DMA A tiles for this k-block (cache-hot data)
+        for (int i = 0; i < tiles_I; i++)
+            gemmini_extended_mvin(
+                (void*)(((elem_t*)A_buf) + i * DIM * MATMUL_K + col_start),
+                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+        // DMA B tiles for this k-block on port 2 (overlaps with next im2col iteration)
+        for (int j = 0; j < tiles_J; j++)
+            gemmini_extended_mvin2(
+                (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + col_start),
+                b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+    }
+
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+    gemmini_fence();
+}
+```
+
+CodeCandidate(parent=CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED baseline MX patch-embed conv kernel (C=2 H=64 k=8 OC=32).
+void solution(void) {
+  // im2col: patch (pi,pj) -> row pi*PATCHES_X+pj; column c*k*k + dy*k + dx
+  for (int pi = 0; pi < CONV_H / CONV_KSZ; pi++)
+    for (int pj = 0; pj < PATCHES_X; pj++)
+      for (int c = 0; c < CONV_C; c++)
+        for (int dy = 0; dy < CONV_KSZ; dy++)
+          for (int dx = 0; dx < CONV_KSZ; dx++)
+            A_buf[pi * PATCHES_X + pj][c * CONV_KSZ * CONV_KSZ + dy * CONV_KSZ + dx] =
+                X_in[c][pi * CONV_KSZ + dy][pj * CONV_KSZ + dx];
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)A_buf) + i * DIM * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+  for (int j = 0; j < tiles_J; j++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+                            b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+''',
+score=8210,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''## Analysis of the Original Code
+
+The original code uses a single `gemmini_extended_mvin` port for **both** A and B tiles, issuing them sequentially in two separate loops:
+
+```c
+// Loop 1: A tiles via mvin (port 1)
+for (int i = 0; i < tiles_I; i++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(...A..., a_base + (i*tiles_K + k)*DIM, DIM, DIM);
+
+// Loop 2: B tiles also via mvin (port 1) -- SERIALIZED with A
+for (int j = 0; j < tiles_J; j++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(...B..., b_base + (j*tiles_K + k)*DIM, DIM, DIM);
+```
+
+Both A and B DMA transfers are serialized on the same `k_MVIN` port. The hardware has **three independent mvin ports** (`k_MVIN`, `k_MVIN2`, `k_MVIN3`), so A and B loads can be issued concurrently to different ports and overlap in the DMA engine.
+
+## Selected Strategy: #12 — Use `gemmini_extended_mvin2` for B tiles while simultaneously issuing `gemmini_extended_mvin` for A tiles
+
+### Plan
+
+**What to change:** Replace all `gemmini_extended_mvin` calls for B tiles with `gemmini_extended_mvin2`. Issue A-tile mvins on port 1 (`k_MVIN`) and B-tile mvins on port 2 (`k_MVIN2`) in an **interleaved** loop so both DMA channels are kept busy simultaneously.
+
+**Concrete steps:**
+
+1. **Merge the two separate A and B mvin loops into a single combined loop** over `k` (and `i`/`j`), interleaving A-side and B-side DMA commands so the hardware can overlap them:
+
+```c
+// Configure stride for both ports (same stride: MATMUL_K * sizeof(elem_t))
+gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0); // id=0 → port A
+gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1); // id=1 → port B (mvin2)
+```
+
+2. **Issue A and B mvins in an interleaved pattern.** For each `(k)` slice, send all A-row tiles on port 1 then all B-column tiles on port 2 (or interleave more tightly). The key is that `k_MVIN` and `k_MVIN2` are independent command queues in hardware, so they proceed in parallel:
+
+```c
+for (int k = 0; k < tiles_K; k++) {
+  // A tiles for all i-rows, this k-slice → port 1
+  for (int i = 0; i < tiles_I; i++)
+    gemmini_extended_mvin(A_ptr(i,k), a_base + (i*tiles_K + k)*DIM, DIM, DIM);
+  // B tiles for all j-columns, this k-slice → port 2 (overlaps with A above)
+  for (int j = 0; j < tiles_J; j++)
+    gemmini_extended_mvin2(B_ptr(j,k), b_base + (j*tiles_K + k)*DIM, DIM, DIM);
+}
+```
+
+3. **Use `gemmini_extended3_config_ld` with `id` parameter** to configure the stride for port 2 (`id=1`) separately before issuing mvin2 commands, since mvin2 reads its own stride register.
+
+4. **Keep everything else unchanged**: `gemmini_extended3_config_ex`, scale loads, `gemmini_mxquant_config_mvout`, `gemmini_loop_ws_spad`, `gemmini_mx_read_smem`, and `gemmini_fence()` all remain in the same order and with the same arguments — only the DMA issue pattern changes.
+
+This transformation is safe because the scratchpad addresses for A and B are disjoint (A occupies `[a_base, a_base + tiles_I*tiles_K*DIM)` and B occupies `[b_base, b_base + tiles_J*tiles_K*DIM)` at the top), so concurrent DMA into separate regions cannot conflict. The `gemmini_loop_ws_spad` waits for all pending mvins before executing, so correctness is preserved.''',
+code='''void solution(void) {
+  // im2col: patch (pi,pj) -> row pi*PATCHES_X+pj; column c*k*k + dy*k + dx
+  for (int pi = 0; pi < CONV_H / CONV_KSZ; pi++)
+    for (int pj = 0; pj < PATCHES_X; pj++)
+      for (int c = 0; c < CONV_C; c++)
+        for (int dy = 0; dy < CONV_KSZ; dy++)
+          for (int dx = 0; dx < CONV_KSZ; dx++)
+            A_buf[pi * PATCHES_X + pj][c * CONV_KSZ * CONV_KSZ + dy * CONV_KSZ + dx] =
+                X_in[c][pi * CONV_KSZ + dy][pj * CONV_KSZ + dx];
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Configure port 0 (mvin, id=0) for A tiles
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+  // Configure port 1 (mvin2, id=1) for B tiles
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+  // Interleaved A and B mvin loop: for each k-slice, issue A tiles on port 1
+  // and B tiles on port 2 so both DMA channels proceed in parallel
+  for (int k = 0; k < tiles_K; k++) {
+    // A tiles for all i-rows at this k-slice → port 1 (k_MVIN)
+    for (int i = 0; i < tiles_I; i++)
+      gemmini_extended_mvin((void*)(((elem_t*)A_buf) + i * DIM * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    // B tiles for all j-columns at this k-slice → port 2 (k_MVIN2), overlaps with A above
+    for (int j = 0; j < tiles_J; j++)
+      gemmini_extended_mvin2((void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+                             b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+''',
+score=7963,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='us.anthropic.claude-sonnet-4-6',
+code_gen_model='us.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None),
+plan='''## Analysis
+
+Looking at the current code, the key inefficiency is in the mvin loop structure:
+
+```c
+for (int k = 0; k < tiles_K; k++) {
+    // A tiles for all i-rows at this k-slice → port 1 (k_MVIN)
+    for (int i = 0; i < tiles_I; i++)
+        gemmini_extended_mvin(...A..., a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    // B tiles for all j-columns at this k-slice → port 2 (k_MVIN2)
+    for (int j = 0; j < tiles_J; j++)
+        gemmini_extended_mvin2(...B..., b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+}
+```
+
+**The B tiles are being loaded once per K-slice**, which is already correct behavior since `gemmini_loop_ws_spad` is a single fused hardware call. However, the im2col loop writes `A_buf` entirely before any DMA begins. **Strategy 13** applies: tile the im2col loop over K-blocks so that each block of `A_buf` rows (for a given k-slice) is written to memory and immediately DMA\'d, allowing the CPU im2col work for the next block to overlap with Gemmini DMA for the current block, keeping the written data hot in L1 cache.
+
+## Plan: Strategy 13 — Tile the im2col loop over K to pipeline CPU writes with Gemmini DMA
+
+**Current structure:**
+1. Complete ALL of im2col (writes entire `A_buf[PATCHES][K]`) — touches all of A_buf
+2. Then start all DMA mvins
+
+**Problem:** The full `A_buf` is large (e.g., 64×64 = 4096 bytes for fp8), and by the time DMA starts for late K-slices, the early-K data may have been evicted from L1. More importantly, the CPU sits idle during DMA and DMA sits idle during im2col — they are fully serialized.
+
+**New structure:** Merge the im2col k-block loop with the mvin k-block loop:
+
+```
+for k in 0..tiles_K:
+    # CPU: compute im2col for this k-block (c, dy, dx range)
+    for i in 0..tiles_I:
+        for (c, dy, dx) in k-block:
+            A_buf[i*DIM .. (i+1)*DIM][k_col_start .. k_col_end] = ...
+    # DMA: immediately mvin A tiles for this k-block (data still hot in L1)
+    for i in 0..tiles_I:
+        gemmini_extended_mvin(A_buf + ..., a_base + (i*tiles_K+k)*DIM, DIM, DIM)
+    # DMA: mvin B tiles for this k-block on port 2 (overlaps next im2col iteration)
+    for j in 0..tiles_J:
+        gemmini_extended_mvin2(B_in + ..., b_base + (j*tiles_K+k)*DIM, DIM, DIM)
+```
+
+Each K-block\'s A data is DMA\'d immediately after being written, while it\'s still hot in L1/L2 cache. The B mvin on port 2 overlaps with the next iteration\'s im2col CPU work.
+
+**Concrete changes:**
+1. Restructure the im2col nested loops to iterate over `k`-blocks (each k-block corresponds to one `tiles_K` slice: `c*CONV_KSZ*CONV_KSZ + dy*CONV_KSZ + dx` maps to a column range `[k*DIM, (k+1)*DIM)`).
+2. Inside each k-block, compute im2col for all `i` patch rows and exactly the columns in that k-block.
+3. Immediately follow with `gemmini_extended_mvin` for all `i` tiles of that k-block (port 0).
+4. Follow with `gemmini_extended_mvin2` for all `j` tiles of that k-block (port 1), which can overlap with the next iteration\'s im2col.
+5. The rest of the sequence (config_st, mxquant_config_mvout, loop_ws_spad, mx_read_smem, fence) is unchanged.
+
+This requires computing the mapping from flat column index `col = k*DIM + offset` back to `(c, dy, dx)` to know which input pixels to copy in each k-block.
+
+Here is the rewritten code:
+
+```c
+void solution(void) {
+    // Tile the im2col + mvin together over K-blocks:
+    // Each k-block covers DIM columns of A_buf, corresponding to a range of (c, dy, dx).
+    // We compute im2col for that k-block and immediately DMA it, keeping data hot in cache.
+
+    // Configure port 0 (mvin, id=0) for A tiles
+    gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+    // Configure port 1 (mvin2, id=1) for B tiles
+    gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+    // Process each K-block: im2col then immediate mvin
+    for (int k = 0; k < tiles_K; k++) {
+        int col_start = k * DIM;
+        // Compute im2col for this k-block: columns [col_start, col_start+DIM)
+        // col = c * CONV_KSZ * CONV_KSZ + dy * CONV_KSZ + dx
+        for (int col = col_start; col < col_start + DIM; col++) {
+            int tmp = col;
+            int dx = tmp % CONV_KSZ; tmp /= CONV_KSZ;
+            int dy = tmp % CONV_KSZ; tmp /= CONV_KSZ;
+            int c  = tmp;
+            for (int pi = 0; pi < CONV_H / CONV_KSZ; pi++)
+                for (int pj = 0; pj < PATCHES_X; pj++)
+                    A_buf[pi * PATCHES_X + pj][col] =
+                        X_in[c][pi * CONV_KSZ + dy][pj * CONV_KSZ + dx];
+        }
+
+        // Immediately DMA the A tiles for this k-block (data still hot in cache)
+        for (int i = 0; i < tiles_I; i++)
+            gemmini_extended_mvin(
+                (void*)(((elem_t*)A_buf) + i * DIM * MATMUL_K + col_start),
+                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+        // DMA B tiles for this k-block on port 2 (overlaps with next im2col block)
+        for (int j = 0; j < tiles_J; j++)
+            gemmini_extended_mvin2(
+                (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + col_start),
+                b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+    }
+
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+    gemmini_fence();
+}
+```
+
+Wait — I must respect the programming model ordering rule: `gemmini_extended3_config_ex` → `gemmini_mx_load_scales` → mvins → `gemmini_mxquant_config_mvout` → `gemmini_loop_ws_spad` → `gemmini_mx_read_smem` → `gemmini_fence`. The config and scale loads must come before the mvins. Let me correct the ordering:
+
+```c
+void solution(void) {
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+    // Configure port 0 (mvin, id=0) for A tiles
+    gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+    // Configure port 1 (mvin2, id=1) for B tiles
+    gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+    // Tile im2col over K-blocks and immediately DMA each block:
+    // col = c * CONV_KSZ^2 + dy * CONV_KSZ + dx maps to k-block k = col / DIM
+    for (int k = 0; k < tiles_K; k++) {
+        int col_start = k * DIM;
+
+        // im2col: compute A_buf columns [col_start, col_start+DIM) for all patch rows
+        for (int col = col_start; col < col_start + DIM; col++) {
+            int tmp = col;
+            int dx = tmp % CONV_KSZ; tmp /= CONV_KSZ;
+            int dy = tmp % CONV_KSZ; tmp /= CONV_KSZ;
+            int c  = tmp;
+            for (int pi = 0; pi < CONV_H / CONV_KSZ; pi++)
+                for (int pj = 0; pj < PATCHES_X; pj++)
+                    A_buf[pi * PATCHES_X + pj][col] =
+                        X_in[c][pi * CONV_KSZ + dy][pj * CONV_KSZ + dx];
+        }
+
+        // Immediately DMA A tiles for this k-block (cache-hot data)
+        for (int i = 0; i < tiles_I; i++)
+            gemmini_extended_mvin(
+                (void*)(((elem_t*)A_buf) + i * DIM * MATMUL_K + col_start),
+                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+        // DMA B tiles for this k-block on port 2 (overlaps with next im2col iteration)
+        for (int j = 0; j < tiles_J; j++)
+            gemmini_extended_mvin2(
+                (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + col_start),
+                b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+    }
+
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+    gemmini_fence();
+}
+```''',
+code='''void solution(void) {
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+    // Configure port 0 (mvin, id=0) for A tiles
+    gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+    // Configure port 1 (mvin2, id=1) for B tiles
+    gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+    // Tile im2col over K-blocks and immediately DMA each block:
+    // col = c * CONV_KSZ^2 + dy * CONV_KSZ + dx maps to k-block k = col / DIM
+    for (int k = 0; k < tiles_K; k++) {
+        int col_start = k * DIM;
+
+        // im2col: compute A_buf columns [col_start, col_start+DIM) for all patch rows
+        for (int col = col_start; col < col_start + DIM; col++) {
+            int tmp = col;
+            int dx = tmp % CONV_KSZ; tmp /= CONV_KSZ;
+            int dy = tmp % CONV_KSZ; tmp /= CONV_KSZ;
+            int c  = tmp;
+            for (int pi = 0; pi < CONV_H / CONV_KSZ; pi++)
+                for (int pj = 0; pj < PATCHES_X; pj++)
+                    A_buf[pi * PATCHES_X + pj][col] =
+                        X_in[c][pi * CONV_KSZ + dy][pj * CONV_KSZ + dx];
+        }
+
+        // Immediately DMA A tiles for this k-block (cache-hot data)
+        for (int i = 0; i < tiles_I; i++)
+            gemmini_extended_mvin(
+                (void*)(((elem_t*)A_buf) + i * DIM * MATMUL_K + col_start),
+                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+        // DMA B tiles for this k-block on port 2 (overlaps with next im2col iteration)
+        for (int j = 0; j < tiles_J; j++)
+            gemmini_extended_mvin2(
+                (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + col_start),
+                b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+    }
+
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+    gemmini_fence();
+}
+''',
+score=None,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='us.anthropic.claude-sonnet-4-6',
+code_gen_model='us.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None)

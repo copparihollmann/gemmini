@@ -1,0 +1,551 @@
+{'correct': False, 'test_results': {0: False}, 'compiled': True, 'stdout': 'Kernel produced an INCORRECT/illegal result on spike. Diagnostic (fix this before optimizing):
+Gemmini extension configured with:
+dim = 16
+Incorrect result'}
+Prev latency: 18858
+New latency: N/A
+Plan: An elegant and highly effective way to optimize this kernel is by applying **Strategy 2: Double Buffering** to the scratchpad memory.
+
+### Optimization Plan
+
+1. **Tiling Strategy**:
+   The original program computes a $64 \times 64$ sub-matrix (`ti = 4`, `tj = 4`, `tk = 16`) out of the full $128 \times 128 \times 256$ matmul. To implement double buffering, we divide this $64 \times 64$ computation into two $64 \times 32$ sub-blocks (`ti = 4`, `tj = 2`, `tk = 16`).
+
+2. **Scratchpad Partitioning**:
+   We divide the $8192$-row scratchpad into two logical halves of $4096$ rows each:
+   - **Buffer 0**: `ab_0 = 0`, `bb_0 = 4096 - tk * tj_sub * DIM` = $3584$.
+   - **Buffer 1**: `ab_1 = 4096`, `bb_1 = 8192 - tk * tj_sub * DIM` = $7680$.
+   
+   For each sub-block, A tiles require $1024$ rows and B tiles require $512$ rows, fitting perfectly within the $4096$-row half-scratchpad limits without any overlap.
+
+3. **Software Pipelining**:
+   - **Preamble**: Start loading both A and B tiles for Block 0 into Buffer 0.
+   - **Parallel Execution**: While Block 0 is computing on the systolic array, we start streaming the A and B tiles for Block 1 into Buffer 1. This completely hides the load latency of Block 1 behind the compute of Block 0.
+   - **Sub-block Compute**: Run the compute for each block sequentially, and drain the output to DRAM row-by-row to correctly handle the non-contiguous nature of the sub-block layout.
+
+4. **Correctness & Constraints**:
+   - The output of each $64 \times 32$ block is stored at `SDST = 128` and then written back row-by-row into `C_hw` using `gemmini_mx_read_smem` to preserve exact semantic equivalence.
+   - All format parameters, scale memory configs, and exact systolic dimensions (DIM=16) are strictly maintained.
+
+---
+
+### Optimized C Code
+
+```c
+#include <stdint.h>
+#include "include/gemmini_testutils.h"
+
+#define DIM 16
+#define MATMUL_M 128
+#define MATMUL_N 128
+#define MATMUL_K 256
+#define OUT_COLS 128
+
+typedef uint8_t elem_t;
+typedef uint8_t out_t;
+
+// Helper function to load a 64x32 sub-block of A and B tiles into a double-buffer
+static inline void load_block_double_buffered(int bj, int buf_idx) {
+    uint32_t ab = buf_idx * 4096;
+    // B base starts at the top of the 4096-row half-scratchpad, growing downward
+    uint32_t bb = (buf_idx + 1) * 4096 - 16 * 2 * 16; 
+
+    // MVIN A: Batched by 2 along K (cols = 2 * DIM)
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i = 0; i < 4; i++) {
+        for (int k = 0; k < 16; k += 2) {
+            gemmini_extended_mvin(
+                (void*)(((elem_t*)A_in_hw) + i * DIM * MATMUL_K + k * DIM),
+                ab + (i * 16 + k) * DIM,
+                2 * DIM,
+                DIM
+            );
+        }
+    }
+
+    // MVIN B: Unbatched along K
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2);
+    for (int k = 0; k < 16; k++) {
+        for (int j = 0; j < 2; j++) {
+            gemmini_extended_mvin(
+                (void*)(((elem_t*)B_in) + k * DIM * (MATMUL_N / 2) + (bj + j) * DIM),
+                bb + (k * 2 + j) * DIM,
+                DIM,
+                DIM
+            );
+        }
+    }
+}
+
+void solution(void) {
+    // Treat C_hw flatly as a uint16_t array (BF16 output) for robust row-by-row addressing
+    uint16_t *C_ptr = (uint16_t*) C_hw;
+    int SDST = 128;
+
+    // 1. Configure execution: weight-stationary, MX requantize to bf16 output
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 2, 0, 0, false, 2, 2, 3, 0);
+
+    // 2. Load scale factors once upfront
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+
+    // 3. Preamble: Load Block 0 into Buffer 0
+    load_block_double_buffered(0, 0);
+
+    // 4. Start loading Block 1 into Buffer 1 in parallel with Block 0's compute
+    load_block_double_buffered(2, 1);
+
+    // 5. Compute Block 0 (using Buffer 0 operands)
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, 4, 2, 16, 0, 0, 1);
+    gemmini_loop_ws_spad(
+        4, 2, 16,
+        0, 0, 0,
+        0,     // A base in Buffer 0
+        4096,  // B end in Buffer 0
+        0,
+        SDST,
+        false, false,
+        false, false, false,
+        NO_ACTIVATION,
+        0, 0,
+        false,
+        0x38
+    );
+
+    // Read Block 0 results from SMEM to C_hw (columns 0 to 31)
+    for (int r = 0; r < 64; r++) {
+        gemmini_mx_read_smem(C_ptr + r * MATMUL_N + 0, SDST * 16 + r * 32, 32);
+    }
+
+    // 6. Compute Block 1 (using Buffer 1 operands)
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, 4, 2, 16, 0, 0, 1);
+    gemmini_loop_ws_spad(
+        4, 2, 16,
+        0, 0, 0,
+        4096,  // A base in Buffer 1
+        8192,  // B end in Buffer 1
+        0,
+        SDST,
+        false, false,
+        false, false, false,
+        NO_ACTIVATION,
+        0, 0,
+        false,
+        0x38
+    );
+
+    // Read Block 1 results from SMEM to C_hw (columns 32 to 63)
+    for (int r = 0; r < 64; r++) {
+        gemmini_mx_read_smem(C_ptr + r * MATMUL_N + 32, SDST * 16 + r * 32, 32);
+    }
+
+    // 7. Sync CPU and Gemmini coprocessor
+    gemmini_fence();
+}
+```
+
+CodeCandidate(parent=CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED baseline MX matmul kernel (128x128x256, fp4:e2m1).
+void solution(void) {
+  {
+    int ti = MATMUL_M / DIM / 2, tj = MATMUL_N / DIM / 2, tk = MATMUL_K / DIM;
+    uint32_t ab = 0;
+    uint32_t bb = BANK_NUM * BANK_ROWS - tk * tj * DIM;
+    int SDST = 128;
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 2, 2, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti, tj, tk, 0, 0, 1);
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i = 0; i < ti; i++)
+      for (int k = 0; k < tk; k++)
+        gemmini_extended_mvin((void*)(((elem_t*)A_in_hw) + i*DIM*MATMUL_K + k*DIM), ab + (i*tk + k)*DIM, DIM, DIM);
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2);
+    for (int k = 0; k < tk; k++)
+      for (int j = 0; j < tj; j++)
+        gemmini_extended_mvin((void*)(((elem_t*)B_in) + k*DIM*(MATMUL_N/2) + j*DIM), bb + (k*tj + j)*DIM, DIM, DIM);
+    gemmini_loop_ws_spad(ti, tj, tk, 0, 0, 0, ab, BANK_NUM * BANK_ROWS, 0, SDST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&C_hw[0][0], SDST * 16, MATMUL_M * MATMUL_N);
+    gemmini_fence();
+  }
+}
+''',
+score=18909,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'Accelerator-bound: compute and data-movement look balanced; tune tiling / scratchpad occupancy for more overlap.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''An elegant and highly effective optimization plan for this stage is to apply **Strategy 7: batch the mvin with block_mvin**.
+
+### Inefficiency Analysis
+In the baseline code, the activation matrix $A$ is loaded tile-by-tile in the inner loop:
+```c
+for (int i = 0; i < ti; i++)
+  for (int k = 0; k < tk; k++)
+    gemmini_extended_mvin((void*)(((elem_t*)A_in_hw) + i*DIM*MATMUL_K + k*DIM), ab + (i*tk + k)*DIM, DIM, DIM);
+```
+This issues a separate `gemmini_extended_mvin` command for every single $16 \times 16$ tile. Since $tk = 16$ and $ti = 4$, this results in $64$ individual DMA load instructions for matrix $A$ alone. Each instruction incurs host-coprocessor round-trip latency, control overhead, and command queue slots.
+
+### Optimization Plan
+We will batch the DMA load of matrix $A$ along the $K$ dimension by a factor of 2 (setting `batch = 2`), loading $32$ columns of data ($2 \times \text{DIM}$) in a single instruction.
+
+1. **Step the Loop by 2**: Change the inner loop over $k$ to increment by 2 (`k += 2`).
+2. **Increase Columns in `mvin`**: Update the `cols` parameter of `gemmini_extended_mvin` from `DIM` to `2 * DIM` (32 columns).
+3. **Configure Scratchpad Stride**: In Gemmini, writing a 32-column row into a 16-column scratchpad row causes the two tiles to be interleaved row-by-row. To handle this layout during compute, we must change the scratchpad reading stride of A from `1` to `2`. We achieve this by modifying the 6th argument (`A_stride`) of `gemmini_extended3_config_ex` to `2`.
+
+This reduces the total `mvin` instructions for matrix $A$ by 50% without violating any hardware limits or correctness checks.
+
+### Optimized Code
+
+```c
+// AUTO-GENERATED optimized MX matmul kernel (128x128x256, fp4:e2m1).
+void solution(void) {
+  {
+    int ti = MATMUL_M / DIM / 2, tj = MATMUL_N / DIM / 2, tk = MATMUL_K / DIM;
+    uint32_t ab = 0;
+    uint32_t bb = BANK_NUM * BANK_ROWS - tk * tj * DIM;
+    int SDST = 128;
+    
+    // Configure execution with A_stride = 2 to match the batched scratchpad layout
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 2, 0, 0, false, 2, 2, 3, 0);
+    
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti, tj, tk, 0, 0, 1);
+    
+    // MVIN A: Batched by 2 along the K dimension (cols = 2 * DIM)
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i = 0; i < ti; i++) {
+      for (int k = 0; k < tk; k += 2) {
+        gemmini_extended_mvin((void*)(((elem_t*)A_in_hw) + i*DIM*MATMUL_K + k*DIM), ab + (i*tk + k)*DIM, 2 * DIM, DIM);
+      }
+    }
+    
+    // MVIN B remains unbatched as B_stride is fixed to 1 in weight-stationary mode
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2);
+    for (int k = 0; k < tk; k++) {
+      for (int j = 0; j < tj; j++) {
+        gemmini_extended_mvin((void*)(((elem_t*)B_in) + k*DIM*(MATMUL_N/2) + j*DIM), bb + (k*tj + j)*DIM, DIM, DIM);
+      }
+    }
+    
+    gemmini_loop_ws_spad(ti, tj, tk, 0, 0, 0, ab, BANK_NUM * BANK_ROWS, 0, SDST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&C_hw[0][0], SDST * 16, MATMUL_M * MATMUL_N);
+    gemmini_fence();
+  }
+}
+```''',
+code='''// AUTO-GENERATED optimized MX matmul kernel (128x128x256, fp4:e2m1).
+void solution(void) {
+  {
+    int ti = MATMUL_M / DIM / 2, tj = MATMUL_N / DIM / 2, tk = MATMUL_K / DIM;
+    uint32_t ab = 0;
+    uint32_t bb = BANK_NUM * BANK_ROWS - tk * tj * DIM;
+    int SDST = 128;
+    
+    // Configure execution with A_stride = 2 to match the batched scratchpad layout
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 2, 0, 0, false, 2, 2, 3, 0);
+    
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti, tj, tk, 0, 0, 1);
+    
+    // MVIN A: Batched by 2 along the K dimension (cols = 2 * DIM)
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i = 0; i < ti; i++) {
+      for (int k = 0; k < tk; k += 2) {
+        gemmini_extended_mvin((void*)(((elem_t*)A_in_hw) + i*DIM*MATMUL_K + k*DIM), ab + (i*tk + k)*DIM, 2 * DIM, DIM);
+      }
+    }
+    
+    // MVIN B remains unbatched as B_stride is fixed to 1 in weight-stationary mode
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2);
+    for (int k = 0; k < tk; k++) {
+      for (int j = 0; j < tj; j++) {
+        gemmini_extended_mvin((void*)(((elem_t*)B_in) + k*DIM*(MATMUL_N/2) + j*DIM), bb + (k*tj + j)*DIM, DIM, DIM);
+      }
+    }
+    
+    gemmini_loop_ws_spad(ti, tj, tk, 0, 0, 0, ab, BANK_NUM * BANK_ROWS, 0, SDST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&C_hw[0][0], SDST * 16, MATMUL_M * MATMUL_N);
+    gemmini_fence();
+  }
+}
+''',
+score=18858,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'Accelerator-bound: compute and data-movement look balanced; tune tiling / scratchpad occupancy for more overlap.'],
+plan_gen_model='gemini-3.5-flash',
+code_gen_model='qwen.qwen3-coder-480b-a35b-v1:0',
+stdout=None,
+stderr=None),
+plan='''An elegant and highly effective way to optimize this kernel is by applying **Strategy 2: Double Buffering** to the scratchpad memory.
+
+### Optimization Plan
+
+1. **Tiling Strategy**:
+   The original program computes a $64 \times 64$ sub-matrix (`ti = 4`, `tj = 4`, `tk = 16`) out of the full $128 \times 128 \times 256$ matmul. To implement double buffering, we divide this $64 \times 64$ computation into two $64 \times 32$ sub-blocks (`ti = 4`, `tj = 2`, `tk = 16`).
+
+2. **Scratchpad Partitioning**:
+   We divide the $8192$-row scratchpad into two logical halves of $4096$ rows each:
+   - **Buffer 0**: `ab_0 = 0`, `bb_0 = 4096 - tk * tj_sub * DIM` = $3584$.
+   - **Buffer 1**: `ab_1 = 4096`, `bb_1 = 8192 - tk * tj_sub * DIM` = $7680$.
+   
+   For each sub-block, A tiles require $1024$ rows and B tiles require $512$ rows, fitting perfectly within the $4096$-row half-scratchpad limits without any overlap.
+
+3. **Software Pipelining**:
+   - **Preamble**: Start loading both A and B tiles for Block 0 into Buffer 0.
+   - **Parallel Execution**: While Block 0 is computing on the systolic array, we start streaming the A and B tiles for Block 1 into Buffer 1. This completely hides the load latency of Block 1 behind the compute of Block 0.
+   - **Sub-block Compute**: Run the compute for each block sequentially, and drain the output to DRAM row-by-row to correctly handle the non-contiguous nature of the sub-block layout.
+
+4. **Correctness & Constraints**:
+   - The output of each $64 \times 32$ block is stored at `SDST = 128` and then written back row-by-row into `C_hw` using `gemmini_mx_read_smem` to preserve exact semantic equivalence.
+   - All format parameters, scale memory configs, and exact systolic dimensions (DIM=16) are strictly maintained.
+
+---
+
+### Optimized C Code
+
+```c
+#include <stdint.h>
+#include "include/gemmini_testutils.h"
+
+#define DIM 16
+#define MATMUL_M 128
+#define MATMUL_N 128
+#define MATMUL_K 256
+#define OUT_COLS 128
+
+typedef uint8_t elem_t;
+typedef uint8_t out_t;
+
+// Helper function to load a 64x32 sub-block of A and B tiles into a double-buffer
+static inline void load_block_double_buffered(int bj, int buf_idx) {
+    uint32_t ab = buf_idx * 4096;
+    // B base starts at the top of the 4096-row half-scratchpad, growing downward
+    uint32_t bb = (buf_idx + 1) * 4096 - 16 * 2 * 16; 
+
+    // MVIN A: Batched by 2 along K (cols = 2 * DIM)
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i = 0; i < 4; i++) {
+        for (int k = 0; k < 16; k += 2) {
+            gemmini_extended_mvin(
+                (void*)(((elem_t*)A_in_hw) + i * DIM * MATMUL_K + k * DIM),
+                ab + (i * 16 + k) * DIM,
+                2 * DIM,
+                DIM
+            );
+        }
+    }
+
+    // MVIN B: Unbatched along K
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2);
+    for (int k = 0; k < 16; k++) {
+        for (int j = 0; j < 2; j++) {
+            gemmini_extended_mvin(
+                (void*)(((elem_t*)B_in) + k * DIM * (MATMUL_N / 2) + (bj + j) * DIM),
+                bb + (k * 2 + j) * DIM,
+                DIM,
+                DIM
+            );
+        }
+    }
+}
+
+void solution(void) {
+    // Treat C_hw flatly as a uint16_t array (BF16 output) for robust row-by-row addressing
+    uint16_t *C_ptr = (uint16_t*) C_hw;
+    int SDST = 128;
+
+    // 1. Configure execution: weight-stationary, MX requantize to bf16 output
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 2, 0, 0, false, 2, 2, 3, 0);
+
+    // 2. Load scale factors once upfront
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+
+    // 3. Preamble: Load Block 0 into Buffer 0
+    load_block_double_buffered(0, 0);
+
+    // 4. Start loading Block 1 into Buffer 1 in parallel with Block 0\'s compute
+    load_block_double_buffered(2, 1);
+
+    // 5. Compute Block 0 (using Buffer 0 operands)
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, 4, 2, 16, 0, 0, 1);
+    gemmini_loop_ws_spad(
+        4, 2, 16,
+        0, 0, 0,
+        0,     // A base in Buffer 0
+        4096,  // B end in Buffer 0
+        0,
+        SDST,
+        false, false,
+        false, false, false,
+        NO_ACTIVATION,
+        0, 0,
+        false,
+        0x38
+    );
+
+    // Read Block 0 results from SMEM to C_hw (columns 0 to 31)
+    for (int r = 0; r < 64; r++) {
+        gemmini_mx_read_smem(C_ptr + r * MATMUL_N + 0, SDST * 16 + r * 32, 32);
+    }
+
+    // 6. Compute Block 1 (using Buffer 1 operands)
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, 4, 2, 16, 0, 0, 1);
+    gemmini_loop_ws_spad(
+        4, 2, 16,
+        0, 0, 0,
+        4096,  // A base in Buffer 1
+        8192,  // B end in Buffer 1
+        0,
+        SDST,
+        false, false,
+        false, false, false,
+        NO_ACTIVATION,
+        0, 0,
+        false,
+        0x38
+    );
+
+    // Read Block 1 results from SMEM to C_hw (columns 32 to 63)
+    for (int r = 0; r < 64; r++) {
+        gemmini_mx_read_smem(C_ptr + r * MATMUL_N + 32, SDST * 16 + r * 32, 32);
+    }
+
+    // 7. Sync CPU and Gemmini coprocessor
+    gemmini_fence();
+}
+```''',
+code='''#include <stdint.h>
+#include "include/gemmini_testutils.h"
+
+#define DIM 16
+#define MATMUL_M 128
+#define MATMUL_N 128
+#define MATMUL_K 256
+#define OUT_COLS 128
+
+typedef uint8_t elem_t;
+typedef uint8_t out_t;
+
+void solution(void) {
+    // Double buffering: split N dimension into two 64-element chunks
+    const int ti = MATMUL_M / DIM;           // 128/16 = 8
+    const int tj_total = MATMUL_N / DIM;     // 128/16 = 8  
+    const int tj_half = tj_total / 2;        // 8/2 = 4
+    const int tk = MATMUL_K / DIM;           // 256/16 = 16
+    
+    // Scratchpad partitioning (8192 rows total, split into two 4096-row buffers)
+    const uint32_t ab_buf0 = 0;              // Buffer 0 A base
+    const uint32_t ab_buf1 = 4096;           // Buffer 1 A base
+    const uint32_t bb_buf0 = 4096 - tk * tj_half * DIM;  // Buffer 0 B base (top of first half)
+    const uint32_t bb_buf1 = 8192 - tk * tj_half * DIM;  // Buffer 1 B base (top of second half)
+    
+    const int SDST = 128;
+    
+    // 1. Configure execution
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 2, 2, 3, 0);
+    
+    // 2. Load scale factors once
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+    
+    // 3. Configure output stride
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    
+    // ===== First sub-block (N=0..63) =====
+    
+    // Load A tiles for first sub-block into buffer 0
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i = 0; i < ti; i++) {
+        for (int k = 0; k < tk; k++) {
+            gemmini_extended_mvin(
+                (void*)(((elem_t*)A_in_hw) + i * DIM * MATMUL_K + k * DIM),
+                ab_buf0 + (i * tk + k) * DIM,
+                DIM, DIM
+            );
+        }
+    }
+    
+    // Load B tiles for first sub-block into buffer 0
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2);
+    for (int k = 0; k < tk; k++) {
+        for (int j = 0; j < tj_half; j++) {
+            gemmini_extended_mvin(
+                (void*)(((elem_t*)B_in) + k * DIM * (MATMUL_N / 2) + j * DIM),
+                bb_buf0 + (k * tj_half + j) * DIM,
+                DIM, DIM
+            );
+        }
+    }
+    
+    // Start loading second sub-block data into buffer 1 while first computes
+    
+    // Load A tiles for second sub-block into buffer 1
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i = 0; i < ti; i++) {
+        for (int k = 0; k < tk; k++) {
+            gemmini_extended_mvin(
+                (void*)(((elem_t*)A_in_hw) + i * DIM * MATMUL_K + k * DIM),
+                ab_buf1 + (i * tk + k) * DIM,
+                DIM, DIM
+            );
+        }
+    }
+    
+    // Load B tiles for second sub-block into buffer 1
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2);
+    for (int k = 0; k < tk; k++) {
+        for (int j = 0; j < tj_half; j++) {
+            gemmini_extended_mvin(
+                (void*)(((elem_t*)B_in) + k * DIM * (MATMUL_N / 2) + (j + tj_half) * DIM),
+                bb_buf1 + (k * tj_half + j) * DIM,
+                DIM, DIM
+            );
+        }
+    }
+    
+    // Compute first sub-block (buffer 0)
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti, tj_half, tk, 0, 0, 1);
+    gemmini_loop_ws_spad(ti, tj_half, tk, 0, 0, 0, 
+                        ab_buf0, 4096, 0, SDST,
+                        false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    
+    // Drain first sub-block results (columns 0-63)
+    uint16_t *C_ptr = (uint16_t*)C_hw;
+    for (int r = 0; r < MATMUL_M; r++) {
+        gemmini_mx_read_smem(C_ptr + r * MATMUL_N + 0, SDST * 16 + r * 64, 64);
+    }
+    
+    // Compute second sub-block (buffer 1)
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti, tj_half, tk, 0, 0, 1);
+    gemmini_loop_ws_spad(ti, tj_half, tk, 0, 0, 0,
+                        ab_buf1, 8192, 0, SDST,
+                        false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    
+    // Drain second sub-block results (columns 64-127)
+    for (int r = 0; r < MATMUL_M; r++) {
+        gemmini_mx_read_smem(C_ptr + r * MATMUL_N + 64, SDST * 16 + r * 64, 64);
+    }
+    
+    // Final synchronization
+    gemmini_fence();
+}
+''',
+score=None,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='gemini-3.5-flash',
+code_gen_model='qwen.qwen3-coder-480b-a35b-v1:0',
+stdout=None,
+stderr=None)

@@ -1,0 +1,315 @@
+{'correct': False}
+Prev latency: 10305
+New latency: N/A
+Plan: ## Analysis of the Current Code
+
+The current code has `gemmini_flush(0)` and `gemmini_extended3_config_ex(...)` inside the outer `i0`/`j0` loop. Since the MX format fields (FP8, weight-stationary, BF16 output) are **completely invariant** across all tiles — they never change between iterations — this re-issues the full CONFIG_EX instruction on every block iteration unnecessarily.
+
+For a problem with `BLOCKS_M × BLOCKS_N` outer iterations, this means `gemmini_flush` and `gemmini_extended3_config_ex` are each called `BLOCKS_M × BLOCKS_N` times when they only need to be called once.
+
+## Selected Strategy: Hoist `gemmini_extended3_config_ex` Outside All Loops
+
+### Plan
+
+**Move `gemmini_flush(0)` and `gemmini_extended3_config_ex(...)` to before the `i0`/`j0` outer loops.**
+
+Specifically:
+1. Before the `for (int i0 = 0; ...)` loop begins, issue `gemmini_flush(0)` once.
+2. Immediately after the flush, issue `gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0)` once.
+3. Remove both calls from inside the `i0`/`j0` loop body.
+
+The CONFIG_EX fields being hoisted are:
+- `WEIGHT_STATIONARY` — same for every block
+- format fields `act_mx_fmt=0, wgt_mx_fmt=0, out_mx_fmt=3, uselut=0` — same FP8→BF16 for every block
+- strides `A_stride=1, C_stride=1` — same for every block
+- transpose flags `0, 0` — same for every block
+
+None of these change across the `i0`/`j0` iteration space. The per-block scale loads (`gemmini_mx_load_scales`), mvin strides, and compute calls that **do** vary per block remain inside the loop.
+
+**The programming model ordering is preserved:** the hoisted `config_ex` still appears before the first `gemmini_mx_load_scales` call (which remains inside the loop), satisfying the required sequence: config_ex → load_scales → mvin → mxquant_config_mvout → loop_ws_spad → read_smem → fence.
+
+This eliminates `BLOCKS_M × BLOCKS_N - 1` redundant `gemmini_flush` + `gemmini_extended3_config_ex` instruction pairs. For `BLOCKS_M=4` (ceil(50/16)) and `BLOCKS_N=8` (ceil(256/32)), that's 31 redundant flush+config pairs removed, reducing instruction dispatch overhead and pipeline drain cost from each `gemmini_flush`.
+
+CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED outer-tiled MX matmul baseline (50x256x512).
+void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+   for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Partial last M/N block: compute only the real rows/cols, pad the rest.
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+      // PROF cpu_stage
+      // Stage only the tiny per-32-group scales; A/B data is mvin\'d DIRECTLY
+      // from DRAM (no host-side block memcpy — that was 98% of the cycles).
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+      // PROF accel
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K (full block-aligned tiles)
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+      for (int j = 0; j < tiles; j++)                    // B[k][j0*BLK+j] -> slot (k*tiles + j)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      // Accelerator-centric readout: per-row hardware DMA from smem straight into the
+      // bf16-packed row-major output (block-internal smem row stride is BLK).
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+}
+''',
+score=10305,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'CPU/host data staging detected (2 memcpy, ~0 scalar copy loops). Host staging is typically the dominant cost on this accelerator and autocomp cannot speed it up directly: mvin tiles STRIDED straight from the source DRAM arrays instead of copying through a host buffer, and keep partial sums in shared memory (bf16 accumulate) rather than accumulating on the CPU.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''## Analysis of the Current Code
+
+The current code has `gemmini_flush(0)` and `gemmini_extended3_config_ex(...)` inside the outer `i0`/`j0` loop. Since the MX format fields (FP8, weight-stationary, BF16 output) are **completely invariant** across all tiles — they never change between iterations — this re-issues the full CONFIG_EX instruction on every block iteration unnecessarily.
+
+For a problem with `BLOCKS_M × BLOCKS_N` outer iterations, this means `gemmini_flush` and `gemmini_extended3_config_ex` are each called `BLOCKS_M × BLOCKS_N` times when they only need to be called once.
+
+## Selected Strategy: Hoist `gemmini_extended3_config_ex` Outside All Loops
+
+### Plan
+
+**Move `gemmini_flush(0)` and `gemmini_extended3_config_ex(...)` to before the `i0`/`j0` outer loops.**
+
+Specifically:
+1. Before the `for (int i0 = 0; ...)` loop begins, issue `gemmini_flush(0)` once.
+2. Immediately after the flush, issue `gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0)` once.
+3. Remove both calls from inside the `i0`/`j0` loop body.
+
+The CONFIG_EX fields being hoisted are:
+- `WEIGHT_STATIONARY` — same for every block
+- format fields `act_mx_fmt=0, wgt_mx_fmt=0, out_mx_fmt=3, uselut=0` — same FP8→BF16 for every block
+- strides `A_stride=1, C_stride=1` — same for every block
+- transpose flags `0, 0` — same for every block
+
+None of these change across the `i0`/`j0` iteration space. The per-block scale loads (`gemmini_mx_load_scales`), mvin strides, and compute calls that **do** vary per block remain inside the loop.
+
+**The programming model ordering is preserved:** the hoisted `config_ex` still appears before the first `gemmini_mx_load_scales` call (which remains inside the loop), satisfying the required sequence: config_ex → load_scales → mvin → mxquant_config_mvout → loop_ws_spad → read_smem → fence.
+
+This eliminates `BLOCKS_M × BLOCKS_N - 1` redundant `gemmini_flush` + `gemmini_extended3_config_ex` instruction pairs. For `BLOCKS_M=4` (ceil(50/16)) and `BLOCKS_N=8` (ceil(256/32)), that\'s 31 redundant flush+config pairs removed, reducing instruction dispatch overhead and pipeline drain cost from each `gemmini_flush`.''',
+code='''#include <stdint.h>
+#include <string.h>
+#include "gemmini.h"
+#include "gemmini_params.h"
+
+// Matrix dimensions - must be multiples of DIM=16
+#define MATMUL_M 64
+#define MATMUL_N 64
+#define MATMUL_K 64
+
+#define DIM 16
+#define BANK_NUM 4
+#define BANK_ROWS 2048
+#define ACC_ROWS 256
+#define TOTAL_SPAD_ROWS (BANK_NUM * BANK_ROWS)  // 8192
+
+// Tile counts
+#define TILES_I (MATMUL_M / DIM)  // 4
+#define TILES_J (MATMUL_N / DIM)  // 4
+#define TILES_K (MATMUL_K / DIM)  // 4
+
+// Scratchpad layout:
+// B tiles at top: b_base = TOTAL_SPAD_ROWS - tiles_K*tiles_J*DIM
+// A tiles at bottom: a_base = 0
+#define B_TILES (TILES_K * TILES_J)   // 16 tiles
+#define A_TILES (TILES_I * TILES_K)   // 16 tiles
+
+#define b_base (TOTAL_SPAD_ROWS - TILES_K * TILES_J * DIM)  // 8192 - 256 = 7936
+#define a_base 0
+
+// Output destination in mx_smem (word offset)
+#define SPAD_DEST 0
+
+// MX format: FP8 E4M3 input, BF16 output
+// act_mx_fmt=0 (FP8 E4M3), wgt_mx_fmt=0 (FP8 E4M3), out_mx_fmt=3 (BF16)
+// uselut=0 for FP8
+
+// Scale factors: one per MX block along K dimension
+// GK = tiles_K (number of scale groups along K)
+// A_scales: [tiles_I][tiles_K] -> one scale per row-block per K-block
+// B_scales: [tiles_J][tiles_K] -> one scale per col-block per K-block
+
+static uint8_t A_scales_flat[TILES_I * TILES_K];  // [GK][M_blocks] row-major
+static uint8_t B_scales_flat[TILES_J * TILES_K];  // [GK][N_blocks] row-major
+
+void matmul_mx_fp8(
+    const uint8_t *A,      // [MATMUL_M][MATMUL_K] FP8 E4M3
+    const uint8_t *B,      // [MATMUL_N][MATMUL_K] FP8 E4M3 (weight-stationary, B is K-major)
+    const uint8_t *A_scales, // [TILES_I * TILES_K] e8m0 scales for A
+    const uint8_t *B_scales, // [TILES_J * TILES_K] e8m0 scales for B
+    uint16_t *C_out        // [MATMUL_M][MATMUL_N] BF16 output
+) {
+    // Verify no overlap: A uses rows [0, A_TILES*DIM) = [0, 256)
+    // B uses rows [b_base, b_base + B_TILES*DIM) = [7936, 8192)
+    // No overlap confirmed.
+
+    // =========================================================================
+    // Step 1: Configure execution (FP8 E4M3 inputs, BF16 output, no LUT)
+    // =========================================================================
+    gemmini_extended3_config_ex(
+        WEIGHT_STATIONARY,  // dataflow
+        0,                  // sys_act (no activation)
+        0,                  // sys_shift
+        ACC_SCALE_IDENTITY, // acc_scale
+        1,                  // C_stride
+        MATMUL_K,           // A_stride (row stride of A in elements)
+        0,                  // A_transpose
+        0,                  // B_transpose
+        false,              // set_only_strides
+        0,                  // act_mx_fmt: FP8 E4M3
+        0,                  // wgt_mx_fmt: FP8 E4M3
+        3,                  // out_mx_fmt: BF16
+        0                   // uselut: not needed for FP8
+    );
+
+    // =========================================================================
+    // Step 2: Load scale factors
+    // A scales: sel=0 (activation/A scales)
+    // B scales: sel=1 (weight/B scales)
+    // =========================================================================
+    gemmini_mx_load_scales(
+        (uint64_t)A_scales,
+        (uint64_t)(TILES_I * TILES_K * sizeof(uint8_t)),
+        0   // sel=0: A (activation) scales
+    );
+    gemmini_mx_load_scales(
+        (uint64_t)B_scales,
+        (uint64_t)(TILES_J * TILES_K * sizeof(uint8_t)),
+        1   // sel=1: B (weight) scales
+    );
+
+    // =========================================================================
+    // Step 3: No LUT needed for FP8 (uselut=0)
+    // =========================================================================
+
+    // =========================================================================
+    // Step 4: MVIN tiles of A and B into scratchpad
+    // A tile layout: a_base + (i*tiles_K + k)*DIM
+    // B tile layout: b_base + (j*tiles_K + k)*DIM
+    // =========================================================================
+
+    // Configure load for A: stride = MATMUL_K * sizeof(elem_t) = 64 bytes
+    gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+
+    // Load all A tiles: A[i*DIM : (i+1)*DIM][k*DIM : (k+1)*DIM]
+    for (int i = 0; i < TILES_I; i++) {
+        for (int k = 0; k < TILES_K; k++) {
+            uint32_t spad_addr = a_base + (i * TILES_K + k) * DIM;
+            const uint8_t *dram_ptr = A + (i * DIM * MATMUL_K) + (k * DIM);
+            gemmini_extended_mvin(
+                (uint64_t)dram_ptr,
+                spad_addr,
+                DIM,   // cols
+                DIM    // rows
+            );
+        }
+    }
+
+    // Configure load for B: stride = MATMUL_K * sizeof(elem_t) = 64 bytes
+    // B is stored as [N][K], so each row of B is K elements wide
+    gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+    // Load all B tiles: B[j*DIM : (j+1)*DIM][k*DIM : (k+1)*DIM]
+    for (int j = 0; j < TILES_J; j++) {
+        for (int k = 0; k < TILES_K; k++) {
+            uint32_t spad_addr = b_base + (j * TILES_K + k) * DIM;
+            const uint8_t *dram_ptr = B + (j * DIM * MATMUL_K) + (k * DIM);
+            gemmini_extended_mvin2(
+                (uint64_t)dram_ptr,
+                spad_addr,
+                DIM,   // cols
+                DIM    // rows
+            );
+        }
+    }
+
+    // =========================================================================
+    // Step 5: Configure requantized mvout
+    // scale_dram points to a flat scale factor array
+    // i_bound=tiles_I, j_bound=tiles_J, k_bound=tiles_K must match loop below
+    // =========================================================================
+    gemmini_extended_config_st(MATMUL_N * sizeof(uint16_t), 0, ACC_SCALE_IDENTITY);
+
+    gemmini_mxquant_config_mvout(
+        (uint64_t)0,     // scale_dram: not used for BF16 output (out_fmt=3)
+        TILES_I,          // i_bound
+        TILES_J,          // j_bound
+        TILES_K,          // k_bound
+        0,                // scale_act_sel: use scale buffer 0 (A scales)
+        0,                // scale_w_sel: use scale buffer 0 (B scales)
+        1                 // lut_update_granularity
+    );
+
+    // =========================================================================
+    // Step 6: Compute - weight-stationary tiled matmul
+    // funct 24 (LOOP_WS_CONFIG_SPAD_AB) is ONE-SHOT: must be re-issued
+    // before every gemmini_loop_ws_spad call via the macro itself
+    // =========================================================================
+    gemmini_loop_ws_spad(
+        TILES_I,          // I
+        TILES_J,          // J
+        TILES_K,          // K
+        0, 0, 0,          // pad_I, pad_J, pad_K
+        a_base,           // A spad base address
+        TOTAL_SPAD_ROWS,  // B spad end address (b_base is implicit: TOTAL_SPAD_ROWS - tiles_K*tiles_J*DIM)
+        0,                // D spad address (no bias)
+        SPAD_DEST,        // C output destination in mx_smem
+        false,            // A_transpose
+        false,            // B_transpose
+        false,            // full_C
+        false,            // low_D
+        false,            // ex_accumulate
+        NO_ACTIVATION,    // act
+        0,                // a_spad_id (no double-buffering)
+        0,                // b_spad_id (no double-buffering)
+        false,            // is_resadd
+        0x38              // skips bitmask
+    );
+
+    // =========================================================================
+    // Step 7: Read results from mx_smem to DRAM
+    // BF16 packed 4 per uint64; smem_off_bf16 = SPAD_DEST * 16
+    // num_bf16 = total output elements
+    // =========================================================================
+    gemmini_mx_read_smem(
+        (uint64_t)C_out,
+        SPAD_DEST * 16,        // smem word offset
+        MATMUL_M * MATMUL_N    // number of BF16 values
+    );
+    gemmini_fence();
+}
+''',
+score=inf,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='global.anthropic.claude-sonnet-4-6',
+code_gen_model='global.anthropic.claude-sonnet-4-6',
+stdout='Kernel produced an INCORRECT/illegal result on spike. Diagnostic (fix this before optimizing):\nGemmini extension configured with:\ndim = 16\nGenerated implementation latency: 2 cycles\nIncorrect result',
+stderr=None)

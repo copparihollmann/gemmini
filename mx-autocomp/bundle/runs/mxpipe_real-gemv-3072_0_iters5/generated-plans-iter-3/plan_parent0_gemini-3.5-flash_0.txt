@@ -1,0 +1,82 @@
+### Optimization Plan
+
+We will apply **Strategy 6: Consolidate scale factor arrays to minimize `gemmini_mx_load_scales` call count across tiled loop iterations**.
+
+#### Analysis of Inefficiencies
+In the baseline implementation, both the activation scale factors (`A_scales_row`) and weight scale factors (`B_scales_col`) are copied via host `memcpy` into staging buffers (`A_s` and `B_s`) and loaded into Gemmini's scale memory via `gemmini_mx_load_scales` inside the innermost tiling loop over `j0` (representing columns of $B$).
+- **Redundant Copies & Loads of A Scales**: The activation scale factors `A_scales_row` solely depend on the row block index `i0`. Re-staging and reloading them inside the `j0` loop for every column block of $B$ is highly redundant and consumes excessive host CPU cycles and coprocessor load bandwidth.
+
+#### Optimization Strategy
+1. **Hoist Activation Scale Staging and Loading**: Move the `memcpy` of `A_s` and its corresponding `gemmini_mx_load_scales(..., 0)` call outside the `j0` loop into the outer `i0` loop. Since these scales persist in Gemmini's internal scale memory until overwritten, we only load them once per row block.
+2. **Move Persistent Configurations**: Hoist `gemmini_flush(0)` and `gemmini_extended3_config_ex` to the start of the function, since execution configurations and formats are static across all tiles.
+
+---
+
+### Optimized Code
+
+```c
+// AUTO-GENERATED outer-tiled MX matmul optimized (1x1024x3072).
+void solution(void) {
+  // 1. Configure the MX Gemmini mode once at the beginning
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    // Partial last M/N block: compute only the real rows/cols, pad the rest.
+    int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+
+    // Hoisted: Stage and load A scale factors once per row block
+    for (int g = 0; g < MATMUL_K / 32; g++) {
+      memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+    }
+    gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      // Stage and load B scale factors (depends on column block j0)
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      // MVIN A tiles directly from DRAM
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K (full block-aligned tiles)
+      for (int i = 0; i < tiles; i++) {
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+        }
+      }
+
+      // MVIN B tiles directly from DRAM
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+      for (int j = 0; j < tiles; j++) {                  // B[k][j0*BLK+j] -> slot (k*tiles + j)
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+        }
+      }
+
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Readout packed results from shared memory
+      for (int r = 0; r < mrows; r++) {
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      }
+      gemmini_fence();
+    }
+  }
+}
+```

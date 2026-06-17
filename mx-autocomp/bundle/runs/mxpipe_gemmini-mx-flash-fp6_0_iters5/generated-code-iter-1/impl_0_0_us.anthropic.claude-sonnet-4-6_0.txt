@@ -1,0 +1,237 @@
+void solution(void) {
+  // Initialize O_acc, Mr, Lr
+  for(int i = 0; i < ATT_S; i++) {
+    Mr[i] = -1e30f;
+    Lr[i] = 0.f;
+    for(int d = 0; d < ATT_D; d++) O_acc[i][d] = 0.f;
+  }
+
+  // Tile counts for QK^T: (ATT_S x BT) = (S x BT) with inner dim ATT_D
+  const int tiQK = ATT_S / DIM;   // tiles_I for Q rows (full, no /2 since fp6 dual packing handled by hw)
+  // Wait - original uses ti=ATT_S/DIM/2, tj=BT/DIM/2, tk=ATT_D/DIM
+  // fp6 dual packing: each elem_t holds 2 fp6 values, so stride/2
+  // Keep original tiling to preserve correctness
+  const int ti_qk = ATT_S / DIM / 2;
+  const int tj_qk = BT / DIM / 2;
+  const int tk_qk = ATT_D / DIM;
+
+  const int ti_pv = ATT_S / DIM / 2;
+  const int tj_pv = ATT_D / DIM / 2;
+  const int tk_pv = BT / DIM;
+
+  // Configure execution once for QK^T (fp6 e3m2 for both act and wgt, BF16 out, uselut=1)
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false,
+      /*act_mx_fmt*/1, /*wgt_mx_fmt*/1, /*out_mx_fmt*/3, /*uselut*/1);
+
+  // Load Q scales (constant across all tiles t)
+  gemmini_mx_load_scales((uint64_t)&Q_scales_row, sizeof(Q_scales_row), 0);
+
+  // Load Q LUT (constant across all tiles t)
+  gemmini_mx_load_lut((uint64_t)Q_lp, 1, 1);
+
+  // Pre-load Q tiles into scratchpad (constant across all t)
+  // A tiles at a_base=0, layout: a_base + (i*tk_qk + k)*DIM
+  {
+    uint32_t a_base = 0;
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for(int i = 0; i < ti_qk; i++) {
+      for(int k = 0; k < tk_qk; k++) {
+        gemmini_extended_mvin(
+          (void*)(((elem_t*)Q_hw) + i * DIM * ATT_D + k * DIM),
+          a_base + (i * tk_qk + k) * DIM,
+          DIM, DIM);
+      }
+    }
+  }
+
+  for(int t = 0; t < NT; t++) {
+    // --- QK^T matmul: S = Q * K^T ---
+    {
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tk_qk * tj_qk * DIM;
+
+      // Repack KT scales for this tile block
+      for(int g = 0; g < ATT_D / 32; g++)
+        for(int n = 0; n < BT; n++)
+          KTsc[g * BT + n] = KT_scales_col[g][t * BT + n];
+
+      // Load KT scales (B side)
+      gemmini_mx_load_scales((uint64_t)KTsc, (ATT_D / 32) * BT, 1);
+
+      // Load KT LUT (B side, sel=0)
+      gemmini_mx_load_lut((uint64_t)KT_lp, 1, 0);
+
+      // Load K^T tiles into scratchpad (B side)
+      // b_base + (k*tj_qk + j)*DIM
+      gemmini_config_ld(ATT_S * sizeof(elem_t) / 2);
+      for(int k = 0; k < tk_qk; k++) {
+        for(int j = 0; j < tj_qk; j++) {
+          gemmini_extended_mvin2(
+            (void*)(((elem_t*)KT_in) + k * DIM * (ATT_S / 2) + (t * BT) / 2 + j * DIM),
+            b_base + (k * tj_qk + j) * DIM,
+            DIM, DIM);
+        }
+      }
+
+      // Configure output stride and requantizer
+      gemmini_config_st((BT / BF16_PER_WORD) * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+          ti_qk, tj_qk, tk_qk,
+          /*scale_act_sel*/0, /*scale_w_sel*/0,
+          /*lut_update_granularity*/8);
+
+      // Compute QK^T
+      gemmini_loop_ws_spad(ti_qk, tj_qk, tk_qk, 0, 0, 0,
+          a_base, BANK_NUM * BANK_ROWS, 0, 128,
+          false, false, false, false, false,
+          NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Drain BF16 results
+      gemmini_mx_read_smem(&S1_hw[0][0], 128 * 16, ATT_S * BT);
+      gemmini_fence();
+    }
+
+    // --- Online softmax + FP6 quantization of P ---
+    for(int i = 0; i < ATT_S; i++) {
+      float row[BT];
+      float mn = Mr[i];
+
+      // Find row max
+      for(int j = 0; j < BT; j++) {
+        uint16_t b = (uint16_t)((S1_hw[i][j / 4] >> ((j % 4) * 16)) & 0xFFFF);
+        row[j] = bf16f(b);
+        if(row[j] > mn) mn = row[j];
+      }
+
+      // Online softmax correction
+      float corr = expf2(Mr[i] - mn);
+      float ln = Lr[i] * corr;
+
+      for(int j = 0; j < BT; j++) {
+        row[j] = expf2(row[j] - mn);
+        ln += row[j];
+      }
+
+      // Scale O_acc by correction factor
+      for(int d = 0; d < ATT_D; d++) O_acc[i][d] *= corr;
+
+      Mr[i] = mn;
+      Lr[i] = ln;
+
+      // Quantize row to FP6 E3M2 and compute per-group scales
+      for(int g = 0; g < GBT; g++) {
+        float gm = 0.f;
+        for(int j = g * 32; j < g * 32 + 32; j++) {
+          float a = fabsf2(row[j]);
+          if(a > gm) gm = a;
+        }
+        int e = 0;
+        if(gm > 0.f) e = fexp2(gm / 0.5f) + 1;
+        float isc = pow2i(-e);
+        P_scales[g][i] = (uint8_t)(e + 127);
+
+        for(int j = g * 32; j < g * 32 + 32; j++) {
+          uint8_t idx = enc(row[j] * isc);
+          if((i & 1) == 0)
+            P_hw[i >> 1][j] = (P_hw[i >> 1][j] & 0xF0) | idx;
+          else
+            P_hw[i >> 1][j] = (P_hw[i >> 1][j] & 0x0F) | (idx << 4);
+        }
+      }
+    }
+
+    // --- PV matmul: O += P * V ---
+    {
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tk_pv * tj_pv * DIM;
+
+      // Configure execution for PV (fp6 act, fp6 wgt, BF16 out, uselut=1)
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+          1, 1, 0, 0, false,
+          /*act_mx_fmt*/1, /*wgt_mx_fmt*/1, /*out_mx_fmt*/3, /*uselut*/1);
+
+      // Load P scales (A side)
+      gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+
+      // Load V scales (B side)
+      gemmini_mx_load_scales((uint64_t)&V_scales_col[t * GBT][0], GBT * ATT_D, 1);
+
+      // Load LUTs for PV
+      gemmini_mx_load_lut((uint64_t)V_lp, 1, 0);
+      gemmini_mx_load_lut((uint64_t)P_lp, 1, 1);
+
+      // Load P tiles (A side) into scratchpad
+      gemmini_config_ld(BT * sizeof(elem_t));
+      for(int i = 0; i < ti_pv; i++) {
+        for(int k = 0; k < tk_pv; k++) {
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)P_hw) + i * DIM * BT + k * DIM),
+            a_base + (i * tk_pv + k) * DIM,
+            DIM, DIM);
+        }
+      }
+
+      // Load V tiles (B side) into scratchpad
+      gemmini_config_ld(ATT_D * sizeof(elem_t) / 2);
+      for(int k = 0; k < tk_pv; k++) {
+        for(int j = 0; j < tj_pv; j++) {
+          gemmini_extended_mvin2(
+            (void*)(((elem_t*)V_in) + (t * BT + k * DIM) * (ATT_D / 2) + j * DIM),
+            b_base + (k * tj_pv + j) * DIM,
+            DIM, DIM);
+        }
+      }
+
+      // Configure output stride and requantizer
+      gemmini_config_st((ATT_D / BF16_PER_WORD) * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+          ti_pv, tj_pv, tk_pv,
+          /*scale_act_sel*/0, /*scale_w_sel*/0,
+          /*lut_update_granularity*/8);
+
+      // Compute PV
+      gemmini_loop_ws_spad(ti_pv, tj_pv, tk_pv, 0, 0, 0,
+          a_base, BANK_NUM * BANK_ROWS, 0, 128,
+          false, false, false, false, false,
+          NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Drain BF16 results
+      gemmini_mx_read_smem(&O_hw[0][0], 128 * 16, ATT_S * ATT_D);
+      gemmini_fence();
+
+      // Accumulate into O_acc
+      for(int i = 0; i < ATT_S; i++) {
+        for(int d = 0; d < ATT_D; d++) {
+          uint16_t b = (uint16_t)((O_hw[i][d / 4] >> ((d % 4) * 16)) & 0xFFFF);
+          O_acc[i][d] += bf16f(b);
+        }
+      }
+    }
+
+    // After first tile, reload Q config for next QK^T iteration
+    if(t < NT - 1) {
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+          1, 1, 0, 0, false,
+          /*act_mx_fmt*/1, /*wgt_mx_fmt*/1, /*out_mx_fmt*/3, /*uselut*/1);
+      gemmini_mx_load_scales((uint64_t)&Q_scales_row, sizeof(Q_scales_row), 0);
+      gemmini_mx_load_lut((uint64_t)Q_lp, 1, 1);
+      // Reload Q tiles into scratchpad for next iteration
+      gemmini_config_ld(ATT_D * sizeof(elem_t));
+      for(int i = 0; i < ti_qk; i++) {
+        for(int k = 0; k < tk_qk; k++) {
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)Q_hw) + i * DIM * ATT_D + k * DIM),
+            0 + (i * tk_qk + k) * DIM,
+            DIM, DIM);
+        }
+      }
+    }
+  }
+
+  // Final normalization
+  for(int i = 0; i < ATT_S; i++) {
+    float il = 1.f / Lr[i];
+    for(int d = 0; d < ATT_D; d++) O_acc[i][d] *= il;
+  }
+}

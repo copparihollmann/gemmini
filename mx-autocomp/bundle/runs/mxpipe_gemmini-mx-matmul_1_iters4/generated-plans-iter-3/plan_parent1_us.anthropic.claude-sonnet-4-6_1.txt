@@ -1,0 +1,38 @@
+## Analysis of the Original Code
+
+The original code for a 32×32×32 FP8 matmul (tiles_I=2, tiles_J=2, tiles_K=2) does:
+
+1. `gemmini_extended3_config_ex` — once (good)
+2. `gemmini_mx_load_scales` for A and B — once (good)
+3. Two separate loops: first loads all A tiles with `gemmini_extended_mvin`, then loads all B tiles again with `gemmini_extended_mvin`
+4. `gemmini_mxquant_config_mvout`
+5. `gemmini_loop_ws_spad`
+6. `gemmini_mx_read_smem` + `gemmini_fence()`
+
+**Key inefficiency**: Both A and B tile loops use `gemmini_extended_mvin` (the same port `k_MVIN`). The hardware provides **three independent mvin ports**: `gemmini_extended_mvin` (port 0), `gemmini_extended_mvin2` (port 1), and `gemmini_extended_mvin3` (port 2). By using only one port sequentially, A and B loads are serialized. Loading B tiles via `mvin2` while A tiles are being loaded via `mvin` allows the DMA engines to work in parallel, reducing total mvin latency.
+
+## Selected Strategy: **Strategy 10** — Use `mvin2`/`mvin3` ports to parallelize A and B tile loads into scratchpad simultaneously
+
+## Plan
+
+**What to change**: Replace the sequential two-pass loading (first all A tiles, then all B tiles) with an interleaved loading pattern that issues A tile loads via `gemmini_extended_mvin` (port 0) and B tile loads via `gemmini_extended_mvin2` (port 1) in the same loop iteration.
+
+**Specific changes**:
+
+1. Before the interleaved loop, issue `gemmini_config_ld` (which configures port 0 stride for A) and also configure port 1 stride for B using `gemmini_extended3_config_ld(..., id=1)` (stride = `MATMUL_K * sizeof(elem_t)`, same as A since both A and B are `MATMUL_M × MATMUL_K` and `MATMUL_K × MATMUL_N` column-major FP8 arrays with the same DIM).
+
+2. Merge the two separate `for (i) for (k)` and `for (j) for (k)` loops. Since tiles_I == tiles_J == 2 and tiles_K == 2, iterate over the combined space: for each `i` (or `j`) and `k`, issue the A mvin on port 0 and the B mvin on port 1 in the same loop body. When tiles_I ≠ tiles_J, iterate up to `max(tiles_I, tiles_J)` and guard with bounds checks.
+
+3. The stride for A tiles is `MATMUL_K * sizeof(elem_t)` bytes (row stride of A matrix). The stride for B tiles is also `MATMUL_K * sizeof(elem_t)` bytes (row stride of B matrix, given B is stored as `[MATMUL_K][MATMUL_N]` in the reference code with stride `MATMUL_M`). Configure port 1 with `gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1)`.
+
+4. In the merged loop body, issue:
+   - `gemmini_extended_mvin(A_ptr, a_spad_addr, DIM, DIM)` for port 0 (when i < tiles_I)
+   - `gemmini_extended_mvin2(B_ptr, b_spad_addr, DIM, DIM)` for port 1 (when j < tiles_J)
+
+   Since tiles_I == tiles_J here (both = 2), there are no out-of-bounds issues. For generality, use `min(tiles_I, tiles_J)` iterations for the paired section and finish the remainder sequentially.
+
+5. Keep everything else (config_ex, load_scales, mxquant_config_mvout, loop_ws_spad, mx_read_smem, fence) identical and in the same order.
+
+**Why this is correct**: Both `mvin` and `mvin2` write to different scratchpad address regions (A goes to `a_base` area, B goes to `b_base` area with no overlap guaranteed by the scratchpad layout constraint), so there are no write conflicts. The `gemmini_loop_ws_spad` only starts after all mvins complete (the Gemmini instruction queue ensures in-order execution relative to the compute instruction). The programming model sequence is preserved exactly.
+
+**Expected benefit**: The two DMA engines work concurrently, roughly halving the mvin phase latency for the case where tiles_I ≈ tiles_J.

@@ -1,0 +1,56 @@
+## Analysis of the Current Code
+
+Looking at the original code, I can identify the following structure:
+
+1. `gemmini_extended3_config_ex` — configure execution
+2. `gemmini_mx_load_scales` — load A and B scales
+3. `gemmini_config_ld(MATMUL_K * sizeof(elem_t))` — set A stride, then loop over A tiles
+4. `gemmini_config_ld(MATMUL_N * sizeof(elem_t))` — set B stride, then loop over B tiles
+5. `gemmini_config_st(...)` — configure output stride
+6. `gemmini_mxquant_config_mvout(...)` — configure requantizer
+7. `gemmini_loop_ws_spad(...)` — fused compute
+8. `gemmini_mx_read_smem(...)` + `gemmini_fence()`
+
+## Strategy Selection
+
+**Strategy 9**: Replace the separate `gemmini_config_st` + `gemmini_mxquant_config_mvout` pair with a single pre-configured call hoisted before the mvin loop.
+
+Currently, `gemmini_config_st` and `gemmini_mxquant_config_mvout` are issued *after* all mvin loops. Since the tile counts (`tiles_I`, `tiles_J`, `tiles_K`), output address (`scale_factors`), and stride (`OUT_COLS * sizeof(out_t)`) are all invariant for the entire fixed-size matmul (32×32×32 with fixed DIM=16 gives tiles_I=tiles_J=tiles_K=2), these two configuration calls can be **hoisted before the mvin loops**.
+
+## Plan
+
+- Move `gemmini_config_st(OUT_COLS * sizeof(out_t))` to immediately after `gemmini_mx_load_scales`, before any `gemmini_config_ld` or mvin calls.
+- Move `gemmini_mxquant_config_mvout(...)` to immediately after `gemmini_config_st`, still before the mvin loops.
+- Remove the `gemmini_config_st` and `gemmini_mxquant_config_mvout` calls from their current position (between the B-tile mvin loop and `gemmini_loop_ws_spad`).
+
+This avoids issuing these two configuration instructions as a sequential dependency just before the compute instruction. By hoisting them earlier, the hardware/simulator can process the configuration while the mvin DMA operations are already in flight (or being issued), potentially reducing the critical path between the last mvin and the `gemmini_loop_ws_spad`. The semantic correctness is preserved because these config calls are invariant and must only complete before `gemmini_loop_ws_spad` executes — which is still guaranteed since they are issued first.
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Hoisted: configure output stride and requantizer before mvin loops
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int j = 0; j < tiles_J; j++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + j * DIM),
+                            b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+
+  // config_st and mxquant_config_mvout already issued above
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```

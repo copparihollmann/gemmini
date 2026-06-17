@@ -1,0 +1,58 @@
+## Analysis of the Current Code
+
+The current code iterates over `(i0, j0)` block pairs. For each `(i0, j0)` pair, it:
+1. Loads A scales for row-block `i0`
+2. Loads B scales for column-block `j0`
+3. Mvins all A tiles for block `i0`
+4. Mvins all B tiles for block `j0`
+5. Runs `gemmini_loop_ws_spad`
+6. Reads results
+
+**Key inefficiency addressed by Strategy 1:** For a fixed `j0` (weight/B block), the B tiles are identical across all `i0` iterations. Currently, B tiles are re-mvin'd for every `(i0, j0)` pair, meaning each B tile block is loaded `BLOCKS_M` times. Since the outer loop is `i0` inside `j0` is not — wait, actually the loop is `i0` outer, `j0` inner. So for each `j0`, the B tile block changes, but for each `i0` at a fixed `j0`, the B tiles are the same. The fix is to **swap the loop order to `j0` outer, `i0` inner**, and mvin B tiles once per `j0` outside the `i0` loop.
+
+## Plan: Reuse B Tiles Across I-Tile Iterations (Strategy 1)
+
+### What changes:
+
+1. **Swap the loop order**: Make `j0` the outer loop and `i0` the inner loop. This allows B tiles (which depend only on `j0`) to be mvin'd once per `j0` iteration and reused across all `i0` iterations.
+
+2. **Move B-tile mvin and B-scale staging outside the `i0` loop**: Before entering the `i0` loop, configure the load stride for B, mvin all B tiles for the current `j0` block into the scratchpad, and stage `B_s` scales. These are identical for all `i0` at a fixed `j0`.
+
+3. **Inside the `i0` loop, only mvin A tiles and A scales**: Each `i0` iteration loads a different A row-block, stages `A_s` scales, issues `gemmini_mx_load_scales` for both A and B (B scales are re-loaded since the programming model requires both before `loop_ws_spad`, but the B scale data in `B_s` doesn't change within the `j0` loop — so we call `gemmini_mx_load_scales` for B again with the same buffer, which is cheap), and then runs `gemmini_loop_ws_spad`.
+
+4. **Scratchpad layout**: With `j0` outer and `i0` inner, `b_base` and B tile addresses are fixed for the entire `j0` loop. A tiles occupy `a_base` to `a_base + tiles_I_block * tiles_K * DIM - 1` (where `tiles_I_block = BLK/DIM`). B tiles occupy the top: `b_base = BANK_NUM*BANK_ROWS - tiles_J_block*tiles_K*DIM`. The scratchpad constraint (tiles_I_block*tiles_K + tiles_J_block*tiles_K)*DIM ≤ 8192 must still hold — since both blocks are `BLK/DIM` tiles wide in I/J, this is the same as before.
+
+5. **Re-issue `gemmini_flush` and `gemmini_extended3_config_ex` once per `j0`** (or once total before both loops), since the format doesn't change. To respect the programming model ordering, `gemmini_extended3_config_ex` must come before `gemmini_mx_load_scales`, so it stays at the top of each hardware sequence. Since the format is fixed, it can be issued once before the outer `j0` loop, then scales and mvins happen inside.
+
+   However, the programming model requires the sequence per invocation of `loop_ws_spad`. The safe approach: issue `gemmini_extended3_config_ex` once per `j0` block (outside `i0`), do the B mvin outside `i0`, and inside `i0` do A mvin + both `gemmini_mx_load_scales` calls + `mxquant_config_mvout` + `loop_ws_spad` + `read_smem`. The B-scale call inside `i0` reuses the already-staged `B_s` buffer (same data, no re-memcpy needed — the `B_s` memcpy stays outside `i0`).
+
+6. **`gemmini_flush(0)` moves outside both loops** (called once), since it resets the accelerator state and is expensive.
+
+### Concrete changes to the code structure:
+
+```
+gemmini_flush(0);
+gemmini_extended3_config_ex(...);  // once, outside all loops
+
+for j0 in BLOCKS_N:
+    compute ncols, tiles_j_block
+    stage B_s scales (memcpy, once per j0)
+    compute b_base
+    gemmini_config_ld(B stride)
+    mvin all B tiles for j0 into b_base  // ONCE per j0
+    
+    for i0 in BLOCKS_M:
+        compute mrows, tiles_i_block
+        stage A_s scales (memcpy, once per i0)
+        gemmini_mx_load_scales(A_s, ..., 0)   // A
+        gemmini_mx_load_scales(B_s, ..., 1)   // B (same data, just re-point HW)
+        gemmini_config_ld(A stride)
+        mvin all A tiles for i0 into a_base
+        gemmini_config_st(...)
+        gemmini_mxquant_config_mvout(...)
+        gemmini_loop_ws_spad(...)
+        gemmini_mx_read_smem(...)
+        gemmini_fence()
+```
+
+This eliminates `BLOCKS_M - 1` redundant B mvin operations per `j0` iteration, reducing total B mvin count from `BLOCKS_M * BLOCKS_N` to `BLOCKS_N`, which is a factor-of-`BLOCKS_M` reduction in B data movement. For the 41×512×512 problem, `BLOCKS_M = ceil(41/BLK)`, so the savings are significant.

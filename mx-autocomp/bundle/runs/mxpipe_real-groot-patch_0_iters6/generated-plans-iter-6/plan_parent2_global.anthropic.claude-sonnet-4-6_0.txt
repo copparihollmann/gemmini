@@ -1,0 +1,50 @@
+## Analysis of the Current Code
+
+Looking at the current code, I need to identify the key inefficiency:
+
+The outer loops iterate over `i0` (BLOCKS_M) and `j0` (BLOCKS_N), and **inside each (i0, j0) block**, the code calls:
+1. `gemmini_flush(0)` — full pipeline flush every iteration
+2. `gemmini_extended3_config_ex` — reconfigures every iteration
+3. `gemmini_mx_load_scales` for A and B — reloads scales every (i0, j0) pair
+
+The **redundant computation** is the repeated `gemmini_flush(0)` and `gemmini_extended3_config_ex` calls on every (i0, j0) iteration. These configurations don't change across blocks — the format (FP8, BF16 output), dataflow (weight-stationary), and strides are identical for every block. Flushing the pipeline every block is especially wasteful.
+
+Additionally, `gemmini_mx_load_scales` for **A scales** only depends on `i0` (not `j0`), yet it's reloaded for every `j0` column block — that's `BLOCKS_N` redundant A-scale loads per row block. Similarly, B scales only depend on `j0`.
+
+## Plan: Eliminate Redundant Computation
+
+**Strategy 1: Eliminate redundant computation**
+
+### Changes:
+
+1. **Move `gemmini_flush(0)` and `gemmini_extended3_config_ex` outside all loops** — issue them exactly once before the outer loops begin. The format and dataflow configuration is invariant across all (i0, j0) blocks.
+
+2. **Hoist A-scale loading to the `i0` loop level** — `A_scales` only depend on which row-block `i0` we're in. Currently, A scales are reloaded on every (i0, j0) iteration. By moving `gemmini_mx_load_scales` for A into the `i0` loop (outside the `j0` loop), we reduce A-scale loads from `BLOCKS_M * BLOCKS_N` to `BLOCKS_M`.
+
+3. **Keep B-scale loading inside the `j0` loop** — B scales depend on `j0`, so they must stay there, but they no longer need to be paired with a redundant A reload.
+
+4. **Remove the per-iteration `gemmini_flush`** — flushing resets accelerator state and forces pipeline drain every block. Since configuration is hoisted and doesn't change, flushing is unnecessary after the first setup.
+
+### Specific code changes:
+
+```
+Before the i0 loop:
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+In the i0 loop (outside j0 loop):
+  // copy A scales for this row block
+  for (int g = 0; g < MATMUL_K / 32; g++)
+    memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+  gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+
+In the j0 loop:
+  // copy B scales for this col block
+  for (int g = 0; g < MATMUL_K / 32; g++)
+    memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+  gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+  // (remove gemmini_flush and gemmini_extended3_config_ex from here)
+  // rest of mvin, compute, readout unchanged
+```
+
+This eliminates `(BLOCKS_M * BLOCKS_N - 1)` redundant `gemmini_flush` + `gemmini_extended3_config_ex` calls and `BLOCKS_M * (BLOCKS_N - 1)` redundant A-scale loads, directly reducing latency proportional to how many outer-tile iterations exist.

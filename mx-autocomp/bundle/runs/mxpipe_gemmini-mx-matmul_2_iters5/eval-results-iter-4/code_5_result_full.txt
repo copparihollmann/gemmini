@@ -1,0 +1,186 @@
+{'correct': False, 'test_results': {0: False}, 'compiled': True}
+Prev latency: 610
+New latency: N/A
+Plan: Error: max retries reached
+
+CodeCandidate(parent=CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED baseline MX matmul kernel (64x128x128, fp8:e4m3).
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K
+  for (int i = 0; i < tiles_I; i++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+  // B tile (k,j) = B_in[k][j] (stride N) into scratchpad slot (k*tiles_J + j) —
+  // the layout gemmini\'s MX loop reads (B_t = B_sp + (k*TJ + j)*DIM). The old
+  // (j*tiles_K + k) slot was a transpose: correct only when N==K, garbage otherwise.
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+  for (int j = 0; j < tiles_J; j++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + j * DIM),
+                            b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+''',
+score=611,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''## Analysis of the Current Code
+
+Looking at the baseline code, I can identify the following pattern:
+
+```c
+gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K
+for (int i = 0; i < tiles_I; i++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(...);
+
+gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+for (int j = 0; j < tiles_J; j++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(...);
+```
+
+There are exactly **two** `gemmini_config_ld` calls, one for A (stride = `MATMUL_K`) and one for B (stride = `MATMUL_N`). Both strides are **loop-invariant** — the stride for A never changes across the `(i, k)` loops, and the stride for B never changes across the `(j, k)` loops. The `gemmini_config_ld` is already hoisted outside both loops (one call before A\'s loop nest, one call before B\'s loop nest), so this is already optimal for the current structure.
+
+Wait — re-reading strategy 9 more carefully: "reduce `gemmini_config_ld` calls to one per port by hoisting the single stride configuration outside all loops." The key insight is that A and B use **different ports** (`gemmini_extended_mvin` vs `gemmini_extended_mvin2`). If we use **mvin** for A and **mvin2** for B, they configure separate port registers, meaning we could issue both `gemmini_config_ld` calls once at the top and interleave the mvin/mvin2 calls — but more importantly, the two config_ld calls already don\'t interfere with each other if they target different ports. However, currently both use the same port (mvin), requiring a config_ld switch between them.
+
+## Plan: Strategy 9 — Hoist `gemmini_config_ld` and Use Separate Ports
+
+**The inefficiency:** Both A and B mvins currently use `gemmini_extended_mvin` (port 0), requiring two separate `gemmini_config_ld` calls with different strides that cannot be merged. This also forces sequential loading: all of A first, then all of B.
+
+**The fix:** Use `gemmini_extended_mvin` (port 0/id=0) for A with stride `MATMUL_K`, and `gemmini_extended_mvin2` (port 1/id=1) for B with stride `MATMUL_N`. Each port has its own independent stride register. Issue `gemmini_extended3_config_ld(..., id=0)` for A and `gemmini_extended3_config_ld(..., id=1)` for B **once each, at the top**, before any mvin loop. Then the two loops can be interleaved or run sequentially without any additional `gemmini_config_ld` re-issue.
+
+Concretely:
+1. Replace the `gemmini_config_ld(MATMUL_K * sizeof(elem_t))` before A\'s loop with `gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0)` (id=0, for mvin).
+2. Replace the `gemmini_config_ld(MATMUL_N * sizeof(elem_t))` before B\'s loop with `gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1)` (id=1, for mvin2).
+3. Issue **both** config_ld calls once at the top (before any loop), since they target independent port registers.
+4. Replace `gemmini_extended_mvin` in B\'s loop with `gemmini_extended_mvin2`, so it uses port 1.
+5. The A loop continues to use `gemmini_extended_mvin` (port 0).
+
+This eliminates the need to re-issue `gemmini_config_ld` between the A and B loops, reduces total config instruction count, and sets up both ports simultaneously so that if the hardware can overlap A and B DMA transfers, it will.
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Configure both mvin ports once, hoisted outside all loops
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0); // port 0: A
+  gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1); // port 1: B
+
+  // MVIN A using port 0
+  for (int i = 0; i < tiles_I; i++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+  // MVIN B using port 1 (mvin2), no config_ld needed — already configured above
+  for (int j = 0; j < tiles_J; j++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin2((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + j * DIM),
+                             b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```''',
+code='''void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Configure both mvin ports once, hoisted outside all loops
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0); // port 0: A
+  gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1); // port 1: B
+
+  // MVIN A using port 0
+  for (int i = 0; i < tiles_I; i++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+  // MVIN B using port 1 (mvin2), no config_ld needed — already configured above
+  for (int j = 0; j < tiles_J; j++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin2((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + j * DIM),
+                             b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+''',
+score=610,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='us.anthropic.claude-sonnet-4-6',
+code_gen_model='us.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None),
+plan='''Error: max retries reached''',
+code='''void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Configure mvin port 0 for A (stride = full K row in bytes)
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+  // MVIN A tiles into scratchpad using port 0
+  for (int i = 0; i < tiles_I; i++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin(
+        (void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+        a_base + (i * tiles_K + k) * DIM,
+        DIM, DIM);
+
+  // Configure mvin port 1 for B (stride = full N row in bytes)
+  gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+  // MVIN B tiles into scratchpad using port 1 (mvin2)
+  // B layout: b_base + (j * tiles_K + k) * DIM  (spec-correct ordering)
+  for (int j = 0; j < tiles_J; j++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin2(
+        (void*)(((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM),
+        b_base + (j * tiles_K + k) * DIM,
+        DIM, DIM);
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+                       a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                       false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+''',
+score=None,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='us.anthropic.claude-sonnet-4-6',
+code_gen_model='us.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None)

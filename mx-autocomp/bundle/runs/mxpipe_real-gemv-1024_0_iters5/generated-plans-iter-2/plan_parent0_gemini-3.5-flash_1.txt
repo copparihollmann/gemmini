@@ -1,0 +1,78 @@
+### Optimization Plan: CPU-to-CPU Copy and Outer-Loop Elimination
+
+#### Analysis of Inefficiencies in Phase 1
+1. **Redundant Outer Tiling Loops:** The baseline code implements a tiled iteration space over `BLOCKS_M` and `BLOCKS_N`. For a $64 \times 64 \times 64$ matrix size, both `BLOCKS_M` and `BLOCKS_N` are `1`. The loops over `i0` and `j0` only execute once, making the outer tiling structure entirely redundant and adding overhead.
+2. **CPU/Host Data Staging (`memcpy`):** The baseline copies scale factors from the global `A_scales_row` and `B_scales_col` arrays into static staging buffers (`A_s_pool` and `B_s_pool`) via `memcpy` before loading them. Because the entire computation fits comfortably within the Gemmini scale memory limits and only runs once, this CPU-bound copy is completely unnecessary.
+
+#### Optimization Strategy
+We will simplify the kernel by:
+- Eliminating the redundant outer loops (`i0` and `j0`).
+- Removing the static staging buffers `A_s_pool` and `B_s_pool` and the corresponding `memcpy` operations.
+- Direct-loading the scale factors from `A_scales_row` and `B_scales_col` straight into Gemmini scale memory via `gemmini_mx_load_scales`.
+
+This dramatically reduces CPU cycle overhead, simplifies address calculations, and allows the hardware to execute the matrix multiplication in one shot.
+
+---
+
+### Optimized Code
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+#include "include/matmul_fp8_64x64.h"
+
+void solution(void) {
+  int tiles = BLK / DIM;
+  int tiles_K = MATMUL_K / DIM;
+  uint32_t a_base = 0;
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+  int SPAD_DEST = 128;
+  
+  int mrows = REAL_M;
+  int ncols = REAL_N;
+  int pad_i = BLK - mrows;
+  int pad_j = BLK - ncols;
+
+  // Reset and configure MX format
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // Load scale factors directly from global memory arrays (no CPU-side staging/memcpy)
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, A_S_BYTES, 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, B_S_BYTES, 1);
+
+  // MVIN A: load tiles (i,k) into scratchpad
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i * DIM) * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    }
+  }
+
+  // MVIN B: load tiles (k,j) into scratchpad
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int j = 0; j < tiles; j++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j * DIM)),
+                            b_base + (k * tiles + j) * DIM, DIM, DIM);
+    }
+  }
+
+  // Output configuration and hardware WS execution loop
+  gemmini_config_st(BLK_OUTC * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+
+  gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // Read BF16-packed results from shared memory
+  for (int r = 0; r < mrows; r++) {
+    gemmini_mx_read_smem(&C_hw[r][0], SPAD_DEST * 16 + r * BLK, ncols);
+  }
+
+  // Synchronize host with coprocessor
+  gemmini_fence();
+}
+```

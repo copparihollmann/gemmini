@@ -1,0 +1,75 @@
+## Analysis of the Original Code
+
+The original code loads all A tiles, then all B tiles in separate loops, then configures the output, runs the fused loop, and reads results. The key inefficiency I'll address is:
+
+**The `gemmini_mxquant_config_mvout` and `gemmini_config_st` are issued after all mvin loops complete.** This means the accelerator's issue queue must stall waiting for these configuration instructions before it can begin compute. By hoisting these configurations to *before* the mvin loops, they are committed to the hardware state early, so when `gemmini_loop_ws_spad` is eventually issued, there is no configuration stall at loop entry.
+
+## Selected Strategy
+
+**Strategy 12: Hoist `gemmini_mxquant_config_mvout` and `gemmini_config_st` to before the mvin loops so they are committed to the issue queue before compute starts, eliminating configuration stall at loop entry.**
+
+## Plan
+
+### What to change
+
+In the original code, the ordering is:
+1. `gemmini_extended3_config_ex`
+2. `gemmini_mx_load_scales` (A and B)
+3. mvin all A tiles
+4. mvin all B tiles
+5. **`gemmini_config_st`** ← currently here
+6. **`gemmini_mxquant_config_mvout`** ← currently here
+7. `gemmini_loop_ws_spad`
+8. `gemmini_mx_read_smem` + `gemmini_fence`
+
+### Proposed new ordering
+
+Move `gemmini_config_st` and `gemmini_mxquant_config_mvout` to immediately after `gemmini_mx_load_scales`, before the mvin loops:
+
+1. `gemmini_extended3_config_ex`
+2. `gemmini_mx_load_scales` (A and B)
+3. **`gemmini_config_st`** ← hoisted here
+4. **`gemmini_mxquant_config_mvout`** ← hoisted here
+5. mvin all A tiles
+6. mvin all B tiles
+7. `gemmini_loop_ws_spad`
+8. `gemmini_mx_read_smem` + `gemmini_fence`
+
+### Why this is correct
+
+- `gemmini_config_st` and `gemmini_mxquant_config_mvout` configure output stride and requantizer parameters (`scale_factors`, `tiles_I/J/K`, `lut_update_granularity`). None of these depend on the mvin operations or scratchpad data — they only configure how the *output* of `gemmini_loop_ws_spad` is written back. The values (`tiles_I`, `tiles_J`, `tiles_K`, `scale_factors`) are computed before the mvin loops and do not change.
+- Moving them before the mvin loops does not violate the required programming model sequence: the sequence mandates `gemmini_mxquant_config_mvout` before `gemmini_loop_ws_spad`, which is still satisfied.
+- The mvin loops load A and B data into the scratchpad — these are independent of the output configuration, so reordering is safe.
+
+### Expected benefit
+
+By issuing `gemmini_config_st` and `gemmini_mxquant_config_mvout` earlier, these instructions are in the hardware's command pipeline while the DMA is still loading tiles. When `gemmini_loop_ws_spad` is finally issued, the accelerator already has all configuration state committed and can begin compute without any configuration-induced stall cycles at the transition from mvin to compute.
+
+## Rewritten Code
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Hoisted: commit output configuration before mvin loops start
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+  for (int j = 0; j < tiles_J; j++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+                            b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```

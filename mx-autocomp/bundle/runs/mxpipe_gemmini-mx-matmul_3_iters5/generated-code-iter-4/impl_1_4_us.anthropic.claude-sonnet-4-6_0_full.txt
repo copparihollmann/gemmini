@@ -1,0 +1,75 @@
+Looking at the original code, the issue is with the B tile layout. The original code uses `b_base + (k * tiles_J + j) * DIM` but the architecture spec says B tiles should be laid out as `b_base + (j*tiles_K + k)*DIM`. Let me analyze and fix this while also applying optimizations.
+
+Key observations:
+1. B tile indexing in mvin loop is wrong: should be `b_base + (j*tiles_K + k)*DIM`
+2. The scratchpad/accumulator sizes in the rules differ from the summary (rules say 256KB spad, 64KB acc) - I'll use the rule values but keep BANK_NUM=4, BANK_ROWS=2048 constants
+3. Can batch mvin calls using MAX_BLOCK_LEN=4 to reduce instruction count
+4. Loop order can be optimized to improve locality
+
+```c
+void solution(void) {
+  // Step 1: Configure execution with FP8 formats, BF16 output
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // Step 2: Load scale factors (sel=0 for A activations, sel=1 for B weights)
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Step 3: Configure mvin port 0 (A) stride = K cols (row stride in bytes)
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+
+  // Load all A tiles: layout a_base + (i*tiles_K + k)*DIM
+  // Batch along k-dimension up to MAX_BLOCK_LEN=4 tiles at a time
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+      int batch = tiles_K - k;
+      if (batch > MAX_BLOCK_LEN) batch = MAX_BLOCK_LEN;
+      for (int kb = 0; kb < batch; kb++) {
+        gemmini_extended_mvin(
+          (void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + (k + kb) * DIM),
+          a_base + (i * tiles_K + (k + kb)) * DIM,
+          DIM, DIM);
+      }
+    }
+  }
+
+  // Step 4: Configure mvin port 1 (B) stride = N cols (row stride in bytes)
+  gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+  // Load all B tiles: layout b_base + (j*tiles_K + k)*DIM
+  // Batch along k-dimension up to MAX_BLOCK_LEN=4 tiles at a time
+  for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+      int batch = tiles_K - k;
+      if (batch > MAX_BLOCK_LEN) batch = MAX_BLOCK_LEN;
+      for (int kb = 0; kb < batch; kb++) {
+        gemmini_extended_mvin2(
+          (void*)(((elem_t*)B_in) + (k + kb) * DIM * MATMUL_N + j * DIM),
+          b_base + (j * tiles_K + (k + kb)) * DIM,
+          DIM, DIM);
+      }
+    }
+  }
+
+  // Step 5: Configure output stride and requantizer
+  // i_bound, j_bound, k_bound must exactly match gemmini_loop_ws_spad tile counts
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+      tiles_I, tiles_J, tiles_K,
+      /*scale_act_sel*/0, /*scale_w_sel*/0,
+      /*lut_update_granularity*/tiles_K);
+
+  // Step 6: Execute fused weight-stationary tiled matmul
+  // B spad end address = BANK_NUM*BANK_ROWS (top of scratchpad)
+  // skips=0x38 suppresses redundant sub-operations
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+      a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+      false, false, false, false, false,
+      NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // Step 7: Drain BF16 results from mx_smem to DRAM, then fence
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```

@@ -1,0 +1,551 @@
+{'correct': False}
+Prev latency: 10608
+New latency: N/A
+Plan: ## Analysis of the Current Code
+
+The current code has this structure for each (i0, j0) block pair:
+- Copies scale slices via `memcpy` into `A_s`/`B_s` host buffers
+- Loads scales, mvins A tiles, mvins B tiles, computes
+- Reads output row-by-row with `mrows` separate `gemmini_mx_read_smem` calls
+
+**Strategy 5** directly addresses the identified CPU staging: eliminate the `memcpy` calls by pointing `gemmini_mx_load_scales` directly at the correct slice of `A_scales_row` and `B_scales_col` using pointer arithmetic.
+
+## Plan: Apply Strategy 5 — Eliminate Host-Side `memcpy` for Scale Factors
+
+### What the current code does wrong
+
+```c
+for (int g = 0; g < MATMUL_K / 32; g++) {
+    memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+    memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+}
+// ...
+gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+```
+
+The `memcpy` loops copy `MATMUL_K/32` groups × `BLK` bytes = `(MATMUL_K/32) * BLK` bytes each for A and B scales into staging buffers `A_s` and `B_s`. This is pure CPU memory bandwidth waste — the data already exists in `A_scales_row` and `B_scales_col`.
+
+### The root issue
+
+`gemmini_mx_load_scales` takes a contiguous DRAM address and a `len` (byte count). The staging buffer exists because `A_scales_row[g][i0*BLK]` is not contiguous across `g` — consecutive `g` rows are `MATMUL_M` bytes apart in memory (the full matrix width), not `BLK` bytes apart.
+
+### The fix: check if direct pointer works, and if not, use a single-pass workaround
+
+`A_scales_row` has layout `[GK][M]` where `GK = MATMUL_K/32`. The slice for block `i0` is `A_scales_row[g][i0*BLK .. i0*BLK + BLK - 1]` for each `g`. Since each row of `A_scales_row` has `MATMUL_M` elements, the scales for the `i0` block are **not** contiguous across groups.
+
+However, looking at the hardware architecture: `gemmini_mx_load_scales` loads `len` consecutive bytes from a DRAM address. The scale memory layout expected by the hardware is that scales for all K-groups for a given tile are stored such that the hardware indexes them as `scale_dram + m * N_blocks + bi`. 
+
+The key insight is: **the `memcpy` gathers non-contiguous rows of `A_scales_row`/`B_scales_col` into a contiguous buffer.** Strategy 5 says to eliminate this by pointing directly — but this only works if we can provide a contiguous layout.
+
+### Correct approach
+
+Since `A_scales_row[g]` has stride `MATMUL_M` and we need stride `BLK` in the staging buffer, the `memcpy` is genuinely necessary for correctness *unless* we restructure. However, Strategy 5 is specifically called out as applicable. The key realization is:
+
+- `A_S_BYTES = (MATMUL_K/32) * BLK` total bytes
+- If `BLK == MATMUL_M`, then `A_scales_row[0][i0*BLK]` IS contiguous for all `g` — but only when `i0=0` and there's only one i0 block.
+- In the general case, we must keep a gather but can eliminate `memcpy` by using `gemmini_mx_load_scales` with a **strided gather** — but the hardware only supports contiguous loads.
+
+Given the constraint that the hardware loads must be contiguous, **the minimal correct implementation of Strategy 5** is to replace the row-by-row `memcpy` with a single flat copy loop that writes into the staging buffer more efficiently, or — more impactfully — to recognize that when `MATMUL_M == BLK` (only one i0 block), we can point directly. For the general non-power-of-2 `REAL_M=113` case with `BLOCKS_M > 1`, a direct pointer only works for A if the scales are stored transposed.
+
+**The practical application of Strategy 5**: Replace the two `memcpy` loops with direct pointer arithmetic into `A_scales_row` and `B_scales_col` by **reinterpreting the scale layout**. Since `A_scales_row` is declared as `[GK][MATMUL_M]` and the hardware will load `len` contiguous bytes starting at the pointer, we point directly at `&A_scales_row[0][i0*BLK]` and tell the hardware the correct length — but we must ensure contiguity. The correct approach that truly eliminates CPU work is:
+
+**Pass `&A_scales_row[0][i0*BLK]` with stride-awareness**: Since `A_scales_row[g]` row is `MATMUL_M` bytes wide and we want `BLK` bytes per group, we can only do this without copying if `MATMUL_M == BLK`. Otherwise we keep the gather but merge it into a single `memcpy` of the needed bytes.
+
+### Final concrete plan
+
+Replace the per-group `memcpy` loops with direct pointers when possible, and otherwise use a single contiguous `memcpy` into a flat buffer:
+
+1. **Remove `A_s[g][0]` / `B_s[g][0]` 2D staging arrays**. Replace with flat 1D arrays `uint8_t A_s_flat[A_S_BYTES]` and `uint8_t B_s_flat[B_S_BYTES]`.
+
+2. **Replace the per-group `memcpy` loop** with a single call that assembles the flat buffer (same total bytes, same number of `memcpy` calls, but expressed as pointer arithmetic pointing into the source arrays):
+
+```c
+// Instead of looping with memcpy per g:
+for (int g = 0; g < MATMUL_K / 32; g++) {
+    memcpy(A_s_flat + g * BLK, &A_scales_row[g][i0 * BLK], BLK);
+    memcpy(B_s_flat + g * BLK, &B_scales_col[g][j0 * BLK], BLK);
+}
+gemmini_mx_load_scales((uint64_t)A_s_flat, A_S_BYTES, 0);
+gemmini_mx_load_scales((uint64_t)B_s_flat, B_S_BYTES, 1);
+```
+
+This is exactly what the code already does — the real Strategy 5 opportunity is to ask: **can we avoid the gather entirely?**
+
+The answer is yes if we change the outer loop order and observe that `A_scales_row` is `[GK][MATMUL_M]`. For A scales: the slice we need for block `i0` is bytes at offset `i0*BLK` within each of the `GK` rows. These are NOT contiguous.
+
+**True Strategy 5 implementation**: Restructure `A_scales_row` and `B_scales_col` to be stored in a layout that IS contiguous for each (i0, j0) block — i.e., column-major `[MATMUL_M][GK]` for A — then `&A_scales_row_T[i0*BLK][0]` gives `BLK * GK` contiguous bytes. This requires transposing the golden data layout, which may not be in scope.
+
+**Alternatively and most practically**: Since the `memcpy` accounts for a small fraction of the 10608-cycle latency and this is a phase-2 optimization, the most impactful correct application of Strategy 5 is:
+
+- For **B scales**: note that `B_scales_col` is `[GK][MATMUL_N]`. For each `j0`, the slice `B_scales_col[g][j0*BLK]` for all `g` is also non-contiguous.
+- However, when there is **only one i0 or j0 block** (when `BLK >= REAL_M` or `BLK >= REAL_N`), we CAN point directly.
+
+**The plan that is cleanly implementable and correct**:
+
+Replace the 2D `memcpy` loops with a direct pointer **when the entire matrix fits in one block** (no outer tiling needed), and keep the `memcpy` only for partial blocks. More practically:
+
+Eliminate `A_s` and `B_s` as separate arrays. Instead, load scales **directly from the source arrays** by noting that the `gemmini_mx_load_scales` hardware reads `GK * BLK` bytes — if we provide `&A_scales_row[0][i0*BLK]`, the hardware will read bytes `A_scales_row[0][i0*BLK .. i0*BLK+BLK-1]`, then `A_scales_row[0][i0*BLK+BLK .. ...]` which crosses into the next row. This is WRONG for non-contiguous layouts.
+
+**Conclusion — the correct, minimal plan for Strategy 5**:
+
+The current code does `GK` separate `memcpy` calls per (i0, j0) pair. The optimization is:
+
+1. Observe that for **B scales**, the loop is over `j0` in the outer loop. The B scale for a given `j0` block is used across ALL `i0` iterations. Currently it's re-copied every (i0, j0) iteration.
+
+2. **Hoist the B scale `memcpy` outside the `i0` loop** — since B scales depend only on `j0`, not `i0`, they only need to be gathered once per `j0`, not `BLOCKS_M` times per `j0`. This reduces B-scale `memcpy` work by a factor of `BLOCKS_M`.
+
+3. Similarly, **hoist the A scale `memcpy` outside the `j0` loop** — A scales depend only on `i0`, not `j0`. They only need to be gathered once per `i0`.
+
+But wait — `gemmini_mx_load_scales` must be called before each `gemmini_loop_ws_spad` (per the programming model sequence). So we can't hoist the load instruction itself, but we CAN hoist the `memcpy` that fills the staging buffer, amortizing CPU memory bandwidth.
+
+### Final Plan
+
+**Strategy 5: Eliminate redundant host-side `memcpy` by hoisting scale staging outside the dependent loop.**
+
+**Changes:**
+
+1. Move the A scale staging (`memcpy` into `A_s`) **outside the `j0` loop** (inside `i0` loop only), since A scales for block `i0` are the same for all `j0` values.
+
+2. Move the B scale staging (`memcpy` into `B_s`) **outside the `i0` loop** (inside `j0` loop only), since B scales for block `j0` are the same for all `i0` values.
+
+3. Keep the `gemmini_mx_load_scales` calls inside the (i0, j0) inner body (required by programming model ordering before each `gemmini_loop_ws_spad`), but they now read from already-correct staging buffers that were filled once per block rather than once per (i0×j0) pair.
+
+4. This reduces A-scale `memcpy` work from `BLOCKS_M * BLOCKS_N * GK` calls to `BLOCKS_M * GK` calls, and B-scale `memcpy` work from `BLOCKS_M * BLOCKS_N * GK` to `BLOCKS_N * GK` calls — a factor of `BLOCKS_N` and `BLOCKS_M` reduction respectively.
+
+**Restructured loop skeleton:**
+
+```c
+void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+    
+    // Stage A scales ONCE per i0 block (shared across all j0)
+    for (int g = 0; g < MATMUL_K / 32; g++)
+      memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+    
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+      
+      // Stage B scales ONCE per j0 block (shared across all i0 — but must be inside i0 loop
+      // due to programming model; just don't re-stage per (i0,j0) pair)
+      // Only stage B scales on the FIRST i0 iteration for each j0:
+      if (i0 == 0) {
+        for (int g = 0; g < MATMUL_K / 32; g++)
+          memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+      // ... rest of kernel unchanged ...
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+      // ... mvin, compute, readout ...
+    }
+  }
+}
+```
+
+Wait — this is incorrect because `B_s` must be valid each iteration even when `i0 != 0`, but the `memcpy` was only done at `i0 == 0`. Since `B_s` is not overwritten between iterations, it remains valid. This is correct.
+
+However, this is a modest saving. The more impactful part of Strategy 5 per the problem statement is: **point `gemmini_mx_load_scales` directly at the source arrays, removing the staging buffer and `memcpy` entirely**.
+
+This IS possible if we change the data layout assumption. Since the golden headers define `A_scales_row[GK][M]` and `B_scales_col[GK][N]`, and the hardware `gemmini_mx_load_scales` expects a flat contiguous buffer of `GK * BLK` bytes in row-major `[GK][BLK]` order, we CANNOT avoid the gather when `BLK < M` (multiple i0 blocks).
+
+**For this specific problem**: `REAL_M = 113`, `REAL_N = 256`, `MATMUL_K = 256`. With `BLK` presumably = 64 (from `matmul_tiled_fp8_64x64` header context) or similar, `BLOCKS_N = 256/BLK` and `BLOCKS_M = ceil(113/BLK)`.
+
+If `BLK = 64`: `BLOCKS_N = 4`, `BLOCKS_M = 2` (64+49), `GK = 256/32 = 8`.
+
+Per (i0,j0) iteration currently: `8 * 2 = 16` memcpy calls total (8 for A, 8 for B).
+After hoisting: A staged once per i0 (8 memcpy, done 2 times = 16 total A memcpys — same!), B staged once per j0 with `i0==0` guard (8 memcpy, done 4 times = 32 total... wait that's MORE if BLOCKS_N > BLOCKS_M).
+
+Hmm, let me reconsider. Currently: `BLOCKS_M * BLOCKS_N * GK * 2 = 2 * 4 * 8 * 2 = 128` memcpy calls.
+After hoisting A outside j0, B outside i0:
+- A: `BLOCKS_M * GK = 2 * 8 = 16` memcpy calls
+- B: `BLOCKS_N * GK = 4 * 8 = 32` memcpy calls  
+- Total: 48 memcpy calls vs 128 — **2.67x reduction**.
+
+This is the correct plan. Here is the implementation:
+
+```c
+void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+    
+    // Stage A scales once per i0 (independent of j0)
+    for (int g = 0; g < MATMUL_K / 32; g++)
+      memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      // Stage B scales once per j0 (independent of i0); guard on first i0 pass
+      if (i0 == 0) {
+        for (int g = 0; g < MATMUL_K / 32; g++)
+          memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int j = 0; j < tiles; j++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+  }
+}
+```
+
+This is the complete plan. The B_s buffer remains valid across i0 iterations for the same j0 because it's only written when `i0 == 0` and never modified between iterations. The `gemmini_mx_load_scales` calls still reference the correct (now pre-staged) buffers. Total memcpy count drops from `BLOCKS_M * BLOCKS_N * GK * 2` to `(BLOCKS_M + BLOCKS_N) * GK`, which for this problem size is a factor of ~2.67x reduction in CPU memory staging work.
+
+CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED outer-tiled MX matmul baseline (113x256x256).
+void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+   for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Partial last M/N block: compute only the real rows/cols, pad the rest.
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+      // PROF cpu_stage
+      // Stage only the tiny per-32-group scales; A/B data is mvin\'d DIRECTLY
+      // from DRAM (no host-side block memcpy — that was 98% of the cycles).
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+      // PROF accel
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K (full block-aligned tiles)
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+      for (int j = 0; j < tiles; j++)                    // B[k][j0*BLK+j] -> slot (k*tiles + j)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      // Accelerator-centric readout: per-row hardware DMA from smem straight into the
+      // bf16-packed row-major output (block-internal smem row stride is BLK).
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+}
+''',
+score=10608,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'CPU/host data staging detected (2 memcpy, ~0 scalar copy loops). Host staging is typically the dominant cost on this accelerator and autocomp cannot speed it up directly: mvin tiles STRIDED straight from the source DRAM arrays instead of copying through a host buffer, and keep partial sums in shared memory (bf16 accumulate) rather than accumulating on the CPU.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''## Analysis of the Current Code
+
+The current code has this structure for each (i0, j0) block pair:
+- Copies scale slices via `memcpy` into `A_s`/`B_s` host buffers
+- Loads scales, mvins A tiles, mvins B tiles, computes
+- Reads output row-by-row with `mrows` separate `gemmini_mx_read_smem` calls
+
+**Strategy 5** directly addresses the identified CPU staging: eliminate the `memcpy` calls by pointing `gemmini_mx_load_scales` directly at the correct slice of `A_scales_row` and `B_scales_col` using pointer arithmetic.
+
+## Plan: Apply Strategy 5 — Eliminate Host-Side `memcpy` for Scale Factors
+
+### What the current code does wrong
+
+```c
+for (int g = 0; g < MATMUL_K / 32; g++) {
+    memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+    memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+}
+// ...
+gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+```
+
+The `memcpy` loops copy `MATMUL_K/32` groups × `BLK` bytes = `(MATMUL_K/32) * BLK` bytes each for A and B scales into staging buffers `A_s` and `B_s`. This is pure CPU memory bandwidth waste — the data already exists in `A_scales_row` and `B_scales_col`.
+
+### The root issue
+
+`gemmini_mx_load_scales` takes a contiguous DRAM address and a `len` (byte count). The staging buffer exists because `A_scales_row[g][i0*BLK]` is not contiguous across `g` — consecutive `g` rows are `MATMUL_M` bytes apart in memory (the full matrix width), not `BLK` bytes apart.
+
+### The fix: check if direct pointer works, and if not, use a single-pass workaround
+
+`A_scales_row` has layout `[GK][M]` where `GK = MATMUL_K/32`. The slice for block `i0` is `A_scales_row[g][i0*BLK .. i0*BLK + BLK - 1]` for each `g`. Since each row of `A_scales_row` has `MATMUL_M` elements, the scales for the `i0` block are **not** contiguous across groups.
+
+However, looking at the hardware architecture: `gemmini_mx_load_scales` loads `len` consecutive bytes from a DRAM address. The scale memory layout expected by the hardware is that scales for all K-groups for a given tile are stored such that the hardware indexes them as `scale_dram + m * N_blocks + bi`. 
+
+The key insight is: **the `memcpy` gathers non-contiguous rows of `A_scales_row`/`B_scales_col` into a contiguous buffer.** Strategy 5 says to eliminate this by pointing directly — but this only works if we can provide a contiguous layout.
+
+### Correct approach
+
+Since `A_scales_row[g]` has stride `MATMUL_M` and we need stride `BLK` in the staging buffer, the `memcpy` is genuinely necessary for correctness *unless* we restructure. However, Strategy 5 is specifically called out as applicable. The key realization is:
+
+- `A_S_BYTES = (MATMUL_K/32) * BLK` total bytes
+- If `BLK == MATMUL_M`, then `A_scales_row[0][i0*BLK]` IS contiguous for all `g` — but only when `i0=0` and there\'s only one i0 block.
+- In the general case, we must keep a gather but can eliminate `memcpy` by using `gemmini_mx_load_scales` with a **strided gather** — but the hardware only supports contiguous loads.
+
+Given the constraint that the hardware loads must be contiguous, **the minimal correct implementation of Strategy 5** is to replace the row-by-row `memcpy` with a single flat copy loop that writes into the staging buffer more efficiently, or — more impactfully — to recognize that when `MATMUL_M == BLK` (only one i0 block), we can point directly. For the general non-power-of-2 `REAL_M=113` case with `BLOCKS_M > 1`, a direct pointer only works for A if the scales are stored transposed.
+
+**The practical application of Strategy 5**: Replace the two `memcpy` loops with direct pointer arithmetic into `A_scales_row` and `B_scales_col` by **reinterpreting the scale layout**. Since `A_scales_row` is declared as `[GK][MATMUL_M]` and the hardware will load `len` contiguous bytes starting at the pointer, we point directly at `&A_scales_row[0][i0*BLK]` and tell the hardware the correct length — but we must ensure contiguity. The correct approach that truly eliminates CPU work is:
+
+**Pass `&A_scales_row[0][i0*BLK]` with stride-awareness**: Since `A_scales_row[g]` row is `MATMUL_M` bytes wide and we want `BLK` bytes per group, we can only do this without copying if `MATMUL_M == BLK`. Otherwise we keep the gather but merge it into a single `memcpy` of the needed bytes.
+
+### Final concrete plan
+
+Replace the per-group `memcpy` loops with direct pointers when possible, and otherwise use a single contiguous `memcpy` into a flat buffer:
+
+1. **Remove `A_s[g][0]` / `B_s[g][0]` 2D staging arrays**. Replace with flat 1D arrays `uint8_t A_s_flat[A_S_BYTES]` and `uint8_t B_s_flat[B_S_BYTES]`.
+
+2. **Replace the per-group `memcpy` loop** with a single call that assembles the flat buffer (same total bytes, same number of `memcpy` calls, but expressed as pointer arithmetic pointing into the source arrays):
+
+```c
+// Instead of looping with memcpy per g:
+for (int g = 0; g < MATMUL_K / 32; g++) {
+    memcpy(A_s_flat + g * BLK, &A_scales_row[g][i0 * BLK], BLK);
+    memcpy(B_s_flat + g * BLK, &B_scales_col[g][j0 * BLK], BLK);
+}
+gemmini_mx_load_scales((uint64_t)A_s_flat, A_S_BYTES, 0);
+gemmini_mx_load_scales((uint64_t)B_s_flat, B_S_BYTES, 1);
+```
+
+This is exactly what the code already does — the real Strategy 5 opportunity is to ask: **can we avoid the gather entirely?**
+
+The answer is yes if we change the outer loop order and observe that `A_scales_row` is `[GK][MATMUL_M]`. For A scales: the slice we need for block `i0` is bytes at offset `i0*BLK` within each of the `GK` rows. These are NOT contiguous.
+
+**True Strategy 5 implementation**: Restructure `A_scales_row` and `B_scales_col` to be stored in a layout that IS contiguous for each (i0, j0) block — i.e., column-major `[MATMUL_M][GK]` for A — then `&A_scales_row_T[i0*BLK][0]` gives `BLK * GK` contiguous bytes. This requires transposing the golden data layout, which may not be in scope.
+
+**Alternatively and most practically**: Since the `memcpy` accounts for a small fraction of the 10608-cycle latency and this is a phase-2 optimization, the most impactful correct application of Strategy 5 is:
+
+- For **B scales**: note that `B_scales_col` is `[GK][MATMUL_N]`. For each `j0`, the slice `B_scales_col[g][j0*BLK]` for all `g` is also non-contiguous.
+- However, when there is **only one i0 or j0 block** (when `BLK >= REAL_M` or `BLK >= REAL_N`), we CAN point directly.
+
+**The plan that is cleanly implementable and correct**:
+
+Replace the 2D `memcpy` loops with a direct pointer **when the entire matrix fits in one block** (no outer tiling needed), and keep the `memcpy` only for partial blocks. More practically:
+
+Eliminate `A_s` and `B_s` as separate arrays. Instead, load scales **directly from the source arrays** by noting that the `gemmini_mx_load_scales` hardware reads `GK * BLK` bytes — if we provide `&A_scales_row[0][i0*BLK]`, the hardware will read bytes `A_scales_row[0][i0*BLK .. i0*BLK+BLK-1]`, then `A_scales_row[0][i0*BLK+BLK .. ...]` which crosses into the next row. This is WRONG for non-contiguous layouts.
+
+**Conclusion — the correct, minimal plan for Strategy 5**:
+
+The current code does `GK` separate `memcpy` calls per (i0, j0) pair. The optimization is:
+
+1. Observe that for **B scales**, the loop is over `j0` in the outer loop. The B scale for a given `j0` block is used across ALL `i0` iterations. Currently it\'s re-copied every (i0, j0) iteration.
+
+2. **Hoist the B scale `memcpy` outside the `i0` loop** — since B scales depend only on `j0`, not `i0`, they only need to be gathered once per `j0`, not `BLOCKS_M` times per `j0`. This reduces B-scale `memcpy` work by a factor of `BLOCKS_M`.
+
+3. Similarly, **hoist the A scale `memcpy` outside the `j0` loop** — A scales depend only on `i0`, not `j0`. They only need to be gathered once per `i0`.
+
+But wait — `gemmini_mx_load_scales` must be called before each `gemmini_loop_ws_spad` (per the programming model sequence). So we can\'t hoist the load instruction itself, but we CAN hoist the `memcpy` that fills the staging buffer, amortizing CPU memory bandwidth.
+
+### Final Plan
+
+**Strategy 5: Eliminate redundant host-side `memcpy` by hoisting scale staging outside the dependent loop.**
+
+**Changes:**
+
+1. Move the A scale staging (`memcpy` into `A_s`) **outside the `j0` loop** (inside `i0` loop only), since A scales for block `i0` are the same for all `j0` values.
+
+2. Move the B scale staging (`memcpy` into `B_s`) **outside the `i0` loop** (inside `j0` loop only), since B scales for block `j0` are the same for all `i0` values.
+
+3. Keep the `gemmini_mx_load_scales` calls inside the (i0, j0) inner body (required by programming model ordering before each `gemmini_loop_ws_spad`), but they now read from already-correct staging buffers that were filled once per block rather than once per (i0×j0) pair.
+
+4. This reduces A-scale `memcpy` work from `BLOCKS_M * BLOCKS_N * GK` calls to `BLOCKS_M * GK` calls, and B-scale `memcpy` work from `BLOCKS_M * BLOCKS_N * GK` to `BLOCKS_N * GK` calls — a factor of `BLOCKS_N` and `BLOCKS_M` reduction respectively.
+
+**Restructured loop skeleton:**
+
+```c
+void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+    
+    // Stage A scales ONCE per i0 block (shared across all j0)
+    for (int g = 0; g < MATMUL_K / 32; g++)
+      memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+    
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+      
+      // Stage B scales ONCE per j0 block (shared across all i0 — but must be inside i0 loop
+      // due to programming model; just don\'t re-stage per (i0,j0) pair)
+      // Only stage B scales on the FIRST i0 iteration for each j0:
+      if (i0 == 0) {
+        for (int g = 0; g < MATMUL_K / 32; g++)
+          memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+      // ... rest of kernel unchanged ...
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+      // ... mvin, compute, readout ...
+    }
+  }
+}
+```
+
+Wait — this is incorrect because `B_s` must be valid each iteration even when `i0 != 0`, but the `memcpy` was only done at `i0 == 0`. Since `B_s` is not overwritten between iterations, it remains valid. This is correct.
+
+However, this is a modest saving. The more impactful part of Strategy 5 per the problem statement is: **point `gemmini_mx_load_scales` directly at the source arrays, removing the staging buffer and `memcpy` entirely**.
+
+This IS possible if we change the data layout assumption. Since the golden headers define `A_scales_row[GK][M]` and `B_scales_col[GK][N]`, and the hardware `gemmini_mx_load_scales` expects a flat contiguous buffer of `GK * BLK` bytes in row-major `[GK][BLK]` order, we CANNOT avoid the gather when `BLK < M` (multiple i0 blocks).
+
+**For this specific problem**: `REAL_M = 113`, `REAL_N = 256`, `MATMUL_K = 256`. With `BLK` presumably = 64 (from `matmul_tiled_fp8_64x64` header context) or similar, `BLOCKS_N = 256/BLK` and `BLOCKS_M = ceil(113/BLK)`.
+
+If `BLK = 64`: `BLOCKS_N = 4`, `BLOCKS_M = 2` (64+49), `GK = 256/32 = 8`.
+
+Per (i0,j0) iteration currently: `8 * 2 = 16` memcpy calls total (8 for A, 8 for B).
+After hoisting: A staged once per i0 (8 memcpy, done 2 times = 16 total A memcpys — same!), B staged once per j0 with `i0==0` guard (8 memcpy, done 4 times = 32 total... wait that\'s MORE if BLOCKS_N > BLOCKS_M).
+
+Hmm, let me reconsider. Currently: `BLOCKS_M * BLOCKS_N * GK * 2 = 2 * 4 * 8 * 2 = 128` memcpy calls.
+After hoisting A outside j0, B outside i0:
+- A: `BLOCKS_M * GK = 2 * 8 = 16` memcpy calls
+- B: `BLOCKS_N * GK = 4 * 8 = 32` memcpy calls  
+- Total: 48 memcpy calls vs 128 — **2.67x reduction**.
+
+This is the correct plan. Here is the implementation:
+
+```c
+void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+    
+    // Stage A scales once per i0 (independent of j0)
+    for (int g = 0; g < MATMUL_K / 32; g++)
+      memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      // Stage B scales once per j0 (independent of i0); guard on first i0 pass
+      if (i0 == 0) {
+        for (int g = 0; g < MATMUL_K / 32; g++)
+          memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int j = 0; j < tiles; j++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+  }
+}
+```
+
+This is the complete plan. The B_s buffer remains valid across i0 iterations for the same j0 because it\'s only written when `i0 == 0` and never modified between iterations. The `gemmini_mx_load_scales` calls still reference the correct (now pre-staged) buffers. Total memcpy count drops from `BLOCKS_M * BLOCKS_N * GK * 2` to `(BLOCKS_M + BLOCKS_N) * GK`, which for this problem size is a factor of ~2.67x reduction in CPU memory staging work.''',
+code='''void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+
+    for (int g = 0; g < MATMUL_K / 32; g++)
+      memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      if (i0 == 0) {
+        for (int g = 0; g < MATMUL_K / 32; g++)
+          memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      // Load A tiles via port 0 (mvin), stride = row width of A in DRAM
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+      // Load B tiles via port 0 (mvin) as well — required for MX loop_ws_spad
+      // B is stored column-major in DRAM row: B[k*DIM .. (k+1)*DIM-1][j*DIM .. (j+1)*DIM-1]
+      // DRAM stride for B is MATMUL_N (columns in B matrix)
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int j = 0; j < tiles; j++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+  }
+}
+''',
+score=inf,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='global.anthropic.claude-sonnet-4-6',
+code_gen_model='global.anthropic.claude-sonnet-4-6',
+stdout='Kernel produced an INCORRECT/illegal result on spike. Diagnostic (fix this before optimizing):\nGEMMINI LOOP_WS ILLEGAL: a loop_ws input was loaded via mvin2/mvin3 (port != 0); the MX loop_ws_spad reads A/B from the port-0 scratchpad region on RTL, so this is spike-correct but RTL-WRONG (the fp8-128 dual-port-B winner). Use single-port gemmini_extended_mvin for loop_ws inputs. -- spike<->RTL dual-port divergence (task #38)\nGemmini extension configured with:\ndim = 16',
+stderr=None)

@@ -1,0 +1,220 @@
+Looking at the plan, I need to implement software pipelining with double-buffering to overlap DMA loads of the next block with compute/drain of the current block.
+
+Key parameters:
+- `BLK=32`, `tiles=2`, `tiles_K=32`, `DIM=16`
+- Each buffer needs `(tiles*tiles_K + tiles*tiles_K)*DIM = 2*2*32*16 = 2048` rows
+- Buffer 0: `a_base0=0`, `b_base0 = 8192 - 2*32*16 = 7168`
+- Buffer 1: `a_base1 = 2*32*16 = 1024`, `b_base1 = 7168 - 1024 = 6144`
+- Two scale staging buffers to avoid overwriting in-use scales
+
+The pipeline: LOAD(idx+1) overlaps with COMPUTE(idx) + DRAIN(idx), but we must respect the ordering constraint: config_ex → load_scales → mvin → mxquant_config_mvout → loop_ws_spad → read_smem → fence.
+
+The fence after `mx_read_smem` for block `idx` ensures block `idx`'s compute is done. The `mvin` for block `idx+1` can be issued before this fence since it uses a different scratchpad buffer.
+
+```c
+void solution(void) {
+  const int tiles    = BLK / DIM;          // 2
+  const int tiles_K  = MATMUL_K / DIM;     // 32
+  const int total    = BLOCKS_M * BLOCKS_N;
+
+  // Double-buffer layout in scratchpad (8192 rows total):
+  // Buffer 0: A at [0 .. tiles*tiles_K*DIM-1], B at top going down
+  // Buffer 1: A at [tiles*tiles_K*DIM .. 2*tiles*tiles_K*DIM-1], B just below buffer-0 B
+  const uint32_t a_buf_sz  = (uint32_t)tiles * tiles_K * DIM;   // 1024 rows
+  const uint32_t b_buf_sz  = (uint32_t)tiles * tiles_K * DIM;   // 1024 rows
+
+  const uint32_t a_base0   = 0;
+  const uint32_t b_base0   = BANK_NUM * BANK_ROWS - b_buf_sz;          // 7168
+  const uint32_t a_base1   = a_buf_sz;                                  // 1024
+  const uint32_t b_base1   = b_base0 - b_buf_sz;                       // 6144
+
+  const int SPAD_DEST = 128;
+
+  // Two scale staging buffers so we can memcpy into the idle one
+  // while the accelerator reads the active one.
+  static uint8_t A_s0[MATMUL_K / 32][BLK];
+  static uint8_t B_s0[MATMUL_K / 32][BLK];
+  static uint8_t A_s1[MATMUL_K / 32][BLK];
+  static uint8_t B_s1[MATMUL_K / 32][BLK];
+
+  if (total == 0) return;
+
+  // Helper lambda-style: given flat index, compute i0/j0/mrows/ncols/pad_i/pad_j
+  // We'll compute these inline.
+
+  // ------------------------------------------------------------------
+  // Flush once before the pipeline starts.
+  // ------------------------------------------------------------------
+  gemmini_flush(0);
+
+  // ------------------------------------------------------------------
+  // PROLOGUE: Stage and LOAD block 0 into buffer 0.
+  // ------------------------------------------------------------------
+  {
+    int idx = 0;
+    int i0  = idx / BLOCKS_N;
+    int j0  = idx % BLOCKS_N;
+
+    // CPU: copy scales for block 0 into scale buffer 0
+    for (int g = 0; g < MATMUL_K / 32; g++) {
+      memcpy(&A_s0[g][0], &A_scales_row[g][i0 * BLK], BLK);
+      memcpy(&B_s0[g][0], &B_scales_col[g][j0 * BLK], BLK);
+    }
+
+    uint32_t a_base = a_base0;
+    uint32_t b_base = b_base0;
+
+    // Configure and load scales for block 0
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)A_s0, A_S_BYTES, 0);
+    gemmini_mx_load_scales((uint64_t)B_s0, B_S_BYTES, 1);
+
+    // MVIN A tiles for block 0
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i = 0; i < tiles; i++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+    // MVIN B tiles for block 0
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+    for (int j = 0; j < tiles; j++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin(
+            (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+            b_base + (k * tiles + j) * DIM, DIM, DIM);
+  }
+
+  // ------------------------------------------------------------------
+  // STEADY-STATE: For idx = 0 .. total-2:
+  //   - COMPUTE block idx (using buf = idx & 1)
+  //   - CPU memcpy scales for block idx+1 into the OTHER scale buffer
+  //   - LOAD block idx+1 into the other scratchpad buffer
+  //   - DRAIN block idx (mx_read_smem + fence)
+  // ------------------------------------------------------------------
+  for (int idx = 0; idx < total - 1; idx++) {
+    // ---- Current block info ----
+    int i0_cur  = idx / BLOCKS_N;
+    int j0_cur  = idx % BLOCKS_N;
+    int mrows   = REAL_M - i0_cur * BLK; if (mrows > BLK) mrows = BLK;
+    int ncols   = REAL_N - j0_cur * BLK; if (ncols > BLK) ncols = BLK;
+    int pad_i   = BLK - mrows;
+    int pad_j   = BLK - ncols;
+
+    int buf_cur = idx & 1;
+    uint32_t a_base_cur = buf_cur ? a_base1 : a_base0;
+    uint32_t b_base_cur = buf_cur ? b_base1 : b_base0;
+
+    // ---- Next block info ----
+    int idx_nxt = idx + 1;
+    int i0_nxt  = idx_nxt / BLOCKS_N;
+    int j0_nxt  = idx_nxt % BLOCKS_N;
+    int mrows_nxt = REAL_M - i0_nxt * BLK; if (mrows_nxt > BLK) mrows_nxt = BLK;
+    int ncols_nxt = REAL_N - j0_nxt * BLK; if (ncols_nxt > BLK) ncols_nxt = BLK;
+
+    int buf_nxt = buf_cur ^ 1;
+    uint32_t a_base_nxt = buf_nxt ? a_base1 : a_base0;
+    uint32_t b_base_nxt = buf_nxt ? b_base1 : b_base0;
+
+    // Pointers to the two pairs of scale staging buffers
+    uint8_t (*A_s_cur)[BLK] = buf_cur ? A_s1 : A_s0;
+    uint8_t (*B_s_cur)[BLK] = buf_cur ? B_s1 : B_s0;
+    uint8_t (*A_s_nxt)[BLK] = buf_nxt ? A_s1 : A_s0;
+    uint8_t (*B_s_nxt)[BLK] = buf_nxt ? B_s1 : B_s0;
+    (void)A_s_cur; (void)B_s_cur; // already loaded in prologue / previous iteration
+
+    // ---- COMPUTE phase for block idx ----
+    // config_ex is already set (or re-set here since load for next block
+    // will also call config_ex; we set it here for the current compute).
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                1, 1, 0, 0, false, 0, 0, 3, 0);
+    // Scales were already loaded in the previous LOAD phase.
+    // (No re-issue needed; they persist in hardware state.)
+
+    gemmini_config_st(BLK_OUTC * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                 tiles, tiles, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles, tiles, tiles_K,
+                         pad_i, pad_j, 0,
+                         a_base_cur, (buf_cur ? b_base1 : b_base0) + b_buf_sz,
+                         0, SPAD_DEST,
+                         false, false, false, false, false,
+                         NO_ACTIVATION, 0, 0, false, 0x38);
+
+    // ---- CPU: memcpy scales for next block (runs while accelerator computes) ----
+    if (mrows_nxt > 0 && ncols_nxt > 0) {
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s_nxt[g][0], &A_scales_row[g][i0_nxt * BLK], BLK);
+        memcpy(&B_s_nxt[g][0], &B_scales_col[g][j0_nxt * BLK], BLK);
+      }
+    }
+
+    // ---- LOAD phase for block idx+1 (issued before drain fence) ----
+    // This goes into the hardware queue while the accelerator finishes compute.
+    if (mrows_nxt > 0 && ncols_nxt > 0) {
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                  1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)A_s_nxt, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s_nxt, B_S_BYTES, 1);
+
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin(
+              (void*)(((elem_t*)A_in) + (i0_nxt * BLK + i * DIM) * MATMUL_K + k * DIM),
+              a_base_nxt + (i * tiles_K + k) * DIM, DIM, DIM);
+
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int j = 0; j < tiles; j++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin(
+              (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0_nxt * BLK + j * DIM)),
+              b_base_nxt + (k * tiles + j) * DIM, DIM, DIM);
+    }
+
+    // ---- DRAIN phase for block idx ----
+    for (int r = 0; r < mrows; r++)
+      gemmini_mx_read_smem(
+          &C_hw[i0_cur * BLK + r][(j0_cur * BLK) / BF16_PER_WORD],
+          SPAD_DEST * 16 + r * BLK, ncols);
+    gemmini_fence();
+  }
+
+  // ------------------------------------------------------------------
+  // EPILOGUE: COMPUTE + DRAIN for the last block.
+  // ------------------------------------------------------------------
+  {
+    int idx    = total - 1;
+    int i0_cur = idx / BLOCKS_N;
+    int j0_cur = idx % BLOCKS_N;
+    int mrows  = REAL_M - i0_cur * BLK; if (mrows > BLK) mrows = BLK;
+    int ncols  = REAL_N - j0_cur * BLK; if (ncols > BLK) ncols = BLK;
+    int pad_i  = BLK - mrows;
+    int pad_j  = BLK - ncols;
+
+    int buf_cur      = idx & 1;
+    uint32_t a_base_cur = buf_cur ? a_base1 : a_base0;
+    uint32_t b_top_cur  = (buf_cur ? b_base1 : b_base0) + b_buf_sz;
+
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_config_st(BLK_OUTC * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                 tiles, tiles, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles, tiles, tiles_K,
+                         pad_i, pad_j, 0,
+                         a_base_cur, b_top_cur,
+                         0, SPAD_DEST,
+                         false, false, false, false, false,
+                         NO_ACTIVATION, 0, 0, false, 0x38);
+
+    for (int r = 0; r < mrows; r++)
+      gemmini_mx_read_smem(
+          &C_hw[i0_cur * BLK + r][(j0_cur * BLK) / BF16_PER_WORD],
+          SPAD_DEST * 16 + r * BLK, ncols);
+    gemmini_fence();
+  }
+}
+```

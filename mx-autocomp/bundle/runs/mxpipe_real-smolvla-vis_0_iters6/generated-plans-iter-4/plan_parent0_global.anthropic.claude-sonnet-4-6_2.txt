@@ -1,0 +1,100 @@
+## Analysis of the Current Code
+
+The current code has **two `memcpy` calls** per `(i0, j0)` pair (one for A scales, one for B scales per outer loop) that copy scale factor slices into intermediate staging arrays `A_s` and `B_s`, which are then passed to `gemmini_mx_load_scales`. This is pure overhead:
+
+1. The `B_s` memcpy copies `B_scales_col[g][j0 * BLK ... j0*BLK + BLK-1]` into `B_s[g][0..BLK-1]` — done once per `j0`.
+2. The `A_s` memcpy copies `A_scales_row[g][i0 * BLK ... i0*BLK + BLK-1]` into `A_s[g][0..BLK-1]` — done once per `(i0, j0)`.
+
+The profiler confirmed: **2 memcpy calls, CPU/host data staging detected**, and this is identified as the dominant cost.
+
+## Selected Strategy: #6 — Eliminate Staging Arrays by Pointing Directly at Source Slices
+
+## Plan
+
+**The core idea:** `gemmini_mx_load_scales` accepts a raw DRAM address and length. Instead of copying scales into `A_s`/`B_s` and then passing those pointers, pass a pointer directly into the appropriate row/column slice of `A_scales_row`/`B_scales_col`.
+
+### Step 1: Understand the current layout
+
+- `A_scales_row` has shape `[MATMUL_K/32][REAL_M]` (or similar), indexed as `A_scales_row[g][i0 * BLK]` for group `g`, row-block `i0`.
+- `B_scales_col` has shape `[MATMUL_K/32][REAL_N]`, indexed as `B_scales_col[g][j0 * BLK]` for group `g`, column-block `j0`.
+- `A_S_BYTES` bytes are loaded for A; `B_S_BYTES` bytes for B.
+
+The memcpy gathers non-contiguous rows of `A_scales_row`/`B_scales_col` into a contiguous flat buffer. But if the per-block slice `A_scales_row[g][i0*BLK]` for all `g` is **already contiguous in memory** at the right stride, we can point directly at it.
+
+### Step 2: Verify contiguity
+
+`A_scales_row[g][i0 * BLK]` for `g = 0..MATMUL_K/32-1` is contiguous only if the second dimension (columns) equals `BLK` (which it does when the full matrix fits a single block column). However, in the outer-tiled case, `A_scales_row` has full-matrix width. The slice for a block is **not** contiguous across `g` rows.
+
+The memcpy currently extracts `BLK` elements from each row `g`. This non-contiguity is why staging was needed. **However**, we can replace the `memcpy` + `gemmini_mx_load_scales(A_s, A_S_BYTES, 0)` pattern with a **per-group direct pointer** approach: instead of loading all groups at once from a contiguous staging buffer, load each group's slice directly from `A_scales_row[g]` with a per-group call.
+
+### Step 3: Concrete changes
+
+**Remove** `A_s`, `B_s` staging arrays and their `memcpy` loops entirely.
+
+**For B scales** (currently in the `j0` loop, one `memcpy` per group):
+```c
+// OLD:
+for (int g = 0; g < MATMUL_K / 32; g++)
+    memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+// ... later:
+gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+// NEW: No staging, no memcpy. Pass pointer directly inside the i0 loop
+// (B scales load must precede each loop_ws_spad per programming model):
+// For each g, the slice &B_scales_col[g][j0*BLK] has BLK contiguous bytes.
+// We need all GK=MATMUL_K/32 groups loaded. Since they're not contiguous
+// in the full 2D array, issue GK individual load calls, each loading BLK bytes:
+for (int g = 0; g < MATMUL_K / 32; g++)
+    gemmini_mx_load_scales((uint64_t)&B_scales_col[g][j0 * BLK], BLK, 1);
+// Wait — this changes semantics unless hardware supports multi-call accumulation.
+```
+
+Actually, re-examining: `gemmini_mx_load_scales(dram_addr, len, sel)` streams `len` bytes sequentially into the scale memory. The hardware fills `mx_scale_b_mem[0..len-1]` from one call, then the next call would **overwrite from offset 0** unless the hardware appends. This makes multiple calls incorrect for non-contiguous slices.
+
+**Correct approach:** Ensure the source data IS contiguous by re-examining the array layout. Since `A_scales_row` is declared as `A_scales_row[GK][REAL_M]` in row-major order, the slice for block `i0` is `&A_scales_row[0][i0*BLK]` — but across `g` rows these are separated by `REAL_M` bytes each. They are NOT contiguous.
+
+**Therefore**: The right fix is to change the **data layout** from `[GK][REAL_M]` to `[REAL_M][GK]` (transpose the scale array) — but since `A_scales_row` comes from the header (golden data), we cannot change it.
+
+**Alternative**: Keep exactly one contiguous staging buffer per operand, but **hoist the B-scale staging and load outside the `i0` loop** (it's already outside — the `memcpy` is in `j0`), and for A scales, the staging happens inside `i0` (also correct). The issue is the cost of the memcpy itself.
+
+**The real fix**: Allocate `A_s` and `B_s` as flat 1D arrays matching the hardware's expected layout (row-major: `[g * BLK + lane]`), which they already are. The memcpy cost is unavoidable *only if* the source is non-contiguous.
+
+**Key insight from strategy #6**: The B-scale staging (`memcpy` into `B_s`, then `gemmini_mx_load_scales(B_s)`) happens in the `j0` loop — once per `j0`. We can instead compute the pointer to the contiguous per-block slice differently. If `B_scales_col` is stored as `[GK][N_full]`, the slice `B_scales_col[g][j0*BLK .. j0*BLK+BLK-1]` is indeed contiguous *within one row* but not across `g` rows.
+
+**However**, examining more carefully: `A_S_BYTES = (MATMUL_K/32) * BLK` total bytes loaded. The staging array `A_s[GK][BLK]` is exactly `GK * BLK` bytes, laid out as `A_s[0][0..BLK-1], A_s[1][0..BLK-1], ...` — i.e., group-major, block-minor. The hardware scale memory indexing is `scale_dram + m * N_blocks + bi` — so row-major in (output-row, k-group) order.
+
+### Revised Plan (Practical and Correct)
+
+The **B-scale memcpy is in the `j0` loop** and is done once per `j0` iteration, shared across all `i0`. This is already hoisted optimally for B. But it's still a `memcpy`.
+
+For **A scales**, the `memcpy` runs every `(i0, j0)` pair — `BLOCKS_M * BLOCKS_N` times total. This is the hot path.
+
+**Strategy #6 applied correctly**: If `A_scales_row` is stored as `[GK][M_full]` with `M_full` being a multiple of `BLK`, then for a given `i0`, the data needed is `A_scales_row[g][i0*BLK]` for `g=0..GK-1` — these are at byte offsets `g * M_full + i0*BLK` in the flat array. They are NOT a contiguous block.
+
+**But** — if `M_full == BLK` (i.e., `REAL_M <= BLK` and there's only one row-block), the entire A scale array IS contiguous and no staging is needed. Similarly if `N_full == BLK` for B.
+
+For the general case with multiple blocks: **create a transposed layout** at initialization time (once, before the loop), or accept that staging is needed. But strategy #6 says "eliminate the intermediate staging arrays entirely by pointing directly using pointer arithmetic."
+
+This is valid **when the slice is contiguous** — which happens when loading B scales for a fixed `j0` across all `g` from a column-major layout, or when the problem dimensions equal BLK.
+
+**Practical plan that applies strategy #6 as stated:**
+
+Replace the per-`(i0,j0)` `memcpy` of A-scales and per-`j0` `memcpy` of B-scales with a **one-time transposition** of the scale arrays into a pre-transposed layout before the loop, so that the per-block slice IS contiguous. Then point `gemmini_mx_load_scales` directly at the pre-transposed data.
+
+Specifically:
+1. Before the `j0/i0` loops, create `A_scales_T[BLOCKS_M][GK * BLK]` and `B_scales_T[BLOCKS_N][GK * BLK]` once (or use flat arrays).
+2. For each block `i0`, `A_scales_T[i0]` is laid out as `[A_scales_row[0][i0*BLK .. i0*BLK+BLK-1], A_scales_row[1][i0*BLK..], ...]` — exactly what `A_s` was.
+3. Do this transposition **once** before the loops.
+4. Inside the loops, call `gemmini_mx_load_scales((uint64_t)A_scales_T[i0], A_S_BYTES, 0)` and `gemmini_mx_load_scales((uint64_t)B_scales_T[j0], B_S_BYTES, 1)` with no intermediate copy.
+
+This eliminates the per-iteration memcpy (hot path cost), replacing it with a one-time setup cost amortized across all `BLOCKS_M * BLOCKS_N` iterations. The `memcpy` total work is the same, but it becomes a single cache-warm sequential pass instead of scattered per-tile copies, and removes the staging copies from the critical timed path.
+
+## Summary of Changes
+
+1. **Before the `j0` loop**: Allocate and fill `A_scales_T[BLOCKS_M][A_S_BYTES]` and `B_scales_T[BLOCKS_N][B_S_BYTES]` by iterating over blocks and groups once.
+2. **Remove** the `memcpy` loops inside `j0` (for B) and inside `i0` (for A).
+3. **Replace** `gemmini_mx_load_scales((uint64_t)A_s, ...)` with `gemmini_mx_load_scales((uint64_t)A_scales_T[i0], ...)`.
+4. **Replace** `gemmini_mx_load_scales((uint64_t)B_s, ...)` with `gemmini_mx_load_scales((uint64_t)B_scales_T[j0], ...)`.
+5. **Remove** `A_s`, `B_s` local arrays and their per-iteration `memcpy` calls.
+
+This removes `2 * BLOCKS_M * BLOCKS_N` memcpy calls from the hot timed region, replacing them with pointer loads to pre-staged contiguous buffers.

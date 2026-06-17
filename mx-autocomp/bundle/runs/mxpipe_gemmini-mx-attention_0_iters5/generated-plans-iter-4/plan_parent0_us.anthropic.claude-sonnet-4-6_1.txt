@@ -1,0 +1,147 @@
+## Analysis
+
+Looking at the code, I need to identify the most impactful inefficiency.
+
+### Key Observation: `gemmini_flush(0)` and `gemmini_extended3_config_ex` are called twice
+
+The code calls `gemmini_flush(0)` and `gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0)` **identically** at the start of both matmul kernels (S1 = Q@K^T and O = P@V). The format fields are identical in both calls.
+
+### Key Observation: Strategy 4 — Eliminate Redundant Computation
+
+The second `gemmini_flush(0)` is expensive — it flushes the accelerator pipeline and resets state. The second `gemmini_extended3_config_ex` is identical to the first. However, `gemmini_flush` is needed to reset state between independent matmuls... but actually, looking more carefully:
+
+### Most Impactful: Strategy 5 — Rewrite algorithm to reduce total work
+
+The softmax computation uses `float row[ATT_S]` stack allocation with three separate passes over each row. **Strategy 12** addresses this directly.
+
+### Actually Most Impactful: Strategy 13 — Fix layout mismatch
+
+Looking at the B-matrix mvin for **both** kernels:
+
+**Kernel 1 (Q@K^T):** B is `KT_in` with stride `ATT_S * sizeof(elem_t)` and pointer `KT_in + (k*DIM)*ATT_S + j*DIM` — this looks like K^T is stored as (K, S) so tile (k,j) is at row `k*DIM`, col `j*DIM`. B tile layout uses `b_base + (k*tiles_J + j)*DIM` — **not** the standard `b_base + (j*tiles_K + k)*DIM`. This is a different ordering.
+
+**Kernel 2 (P@V):** Similarly uses `(k*tiles_J + j)*DIM` offset for B.
+
+This is inconsistent with the required `b_base + (j*tiles_K + k)*DIM` layout expected by `gemmini_loop_ws_spad`. This could be a correctness issue but the problem states the code is correct within tolerance.
+
+## Selected Strategy: **Strategy 4 — Eliminate Redundant Computation**
+
+The second `gemmini_flush(0)` is redundant and costly. Between the two matmul kernels, the only state that changes is scale factors and tile data. The `gemmini_flush` in kernel 2 unnecessarily stalls the pipeline. More importantly, the `gemmini_extended3_config_ex` call is **identical** in both kernels — same dataflow, same MX format fields, same strides — so the second call can be eliminated. The `gemmini_flush` between the two matmuls can also be removed since the fence at the end of kernel 1 already ensures completion, and no format state needs resetting.
+
+## Plan
+
+**Remove the second `gemmini_flush(0)` and the second `gemmini_extended3_config_ex` call** from kernel 3 (O = P@V), hoisting the configuration out of both kernels (strategy 6 is a special case of strategy 4 here). Since:
+
+1. Both kernels use identical `gemmini_extended3_config_ex` parameters (`WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0`)
+2. `gemmini_fence()` at the end of kernel 1 ensures the accelerator has completed all work
+3. CONFIG_EX fields persist until changed — no need to re-issue identical config
+4. `gemmini_flush` resets pipeline state unnecessarily when the format is unchanged
+
+**Concretely:**
+- Move `gemmini_flush(0)` and `gemmini_extended3_config_ex(...)` **before** both kernel blocks (issue once at the top of `solution()`)
+- Remove both per-kernel `gemmini_flush(0)` and `gemmini_extended3_config_ex(...)` calls
+- All other per-kernel operations (scale loads, mvin, mxquant_config_mvout, loop_ws_spad, read_smem, fence) remain in their correct per-kernel positions since scales and tile data differ between kernels
+
+This eliminates one `gemmini_flush` (pipeline stall + state reset) and one `gemmini_extended3_config_ex` (RoCC instruction overhead), reducing instruction count and pipeline disruption.
+
+```c
+void solution(void) {
+  // Hoist flush and config_ex outside both matmul kernels — format is identical for both.
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    // gemmini_flush and config_ex already issued above
+    gemmini_mx_load_scales((uint64_t)&Q_scales_row, sizeof(Q_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&KT_scales_col, sizeof(KT_scales_col), 1);
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int j = 0; j < tiles_J; j++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+    gemmini_fence();
+  }
+
+  // ---- 2) P = softmax(S1) rows on CPU; quantize to fp8 + per-32-group scales ----
+  for (int i = 0; i < ATT_S; i++) {
+    float row[ATT_S];
+
+    // Pass 1: Unpack BF16 -> float, find maxv
+    float maxv = -1e30f;
+    for (int j = 0; j < ATT_S; j++) {
+      uint16_t b = (uint16_t)((S1_hw[i][j / 4] >> ((j % 4) * 16)) & 0xFFFF);
+      row[j] = bf16_to_f(b);
+      if (row[j] > maxv) maxv = row[j];
+    }
+
+    // Pass 2: Compute exp(row[j] - maxv), accumulate sum
+    float sum = 0.0f;
+    for (int j = 0; j < ATT_S; j++) {
+      row[j] = exp_f(row[j] - maxv);
+      sum += row[j];
+    }
+
+    float inv_sum = 1.0f / sum;
+
+    // Pass 3 (fused): normalize + per-group max scan + per-group quantize
+    for (int g = 0; g < GROUPS_S; g++) {
+      // Fused normalize + group max
+      float gmax = 0.0f;
+      for (int j = g * 32; j < (g + 1) * 32; j++) {
+        row[j] *= inv_sum;
+        float a = f_abs(row[j]);
+        if (a > gmax) gmax = a;
+      }
+      // Compute e8m0 scale
+      int e = 0;
+      if (gmax > 0.0f) e = f_exp(gmax / 16.0f) + 1;
+      float inv_scale = pow2i(-e);
+      P_scales[g][i] = (uint8_t)(e + 127);
+      // Quantize group
+      for (int j = g * 32; j < (g + 1) * 32; j++)
+        P_q[i][j] = fp8_e4m3_rtz(row[j] * inv_scale);
+    }
+  }
+
+  // ---- 3) O = P @ V on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    // gemmini_flush and config_ex already issued at top — no need to re-issue
+    // (fence at end of kernel 1 ensures completion; format fields are identical)
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+    gemmini_mx_load_scales((uint64_t)&V_scales_col, sizeof(V_scales_col), 1);
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int j = 0; j < tiles_J; j++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+    gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+    gemmini_fence();
+  }
+}
+```

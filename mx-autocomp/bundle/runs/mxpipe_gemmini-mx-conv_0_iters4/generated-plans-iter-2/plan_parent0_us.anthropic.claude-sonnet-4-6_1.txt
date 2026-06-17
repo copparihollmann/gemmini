@@ -1,0 +1,89 @@
+## Analysis of the Current Code
+
+Looking at the baseline code, the im2col loop writes to `A_buf` (an intermediate buffer in DRAM), and then the mvin loop reads back from `A_buf` into the scratchpad. This creates an unnecessary DRAM write-then-read round-trip:
+
+1. CPU writes `X_in[c][pi*CONV_KSZ+dy][pj*CONV_KSZ+dx]` → `A_buf[...][...]`
+2. DMA reads `A_buf` → scratchpad
+
+Strategy **9** (fuse im2col directly into the mvin DMA by computing source pointer arithmetic per tile on-the-fly) addresses this directly.
+
+## Plan: Fuse Im2col into Mvin (Strategy 9)
+
+### Key Insight
+
+The mvin for A tile `(i, k)` loads `DIM=16` rows × `DIM=16` columns from `A_buf` starting at row `i*DIM`, column `k*DIM`. Each row `r` of `A_buf` corresponds to patch `(pi, pj)` where the flat patch index is `i*DIM + r`. Each column group of 16 starting at `k*DIM` corresponds to 16 consecutive entries of the im2col expansion `c*CONV_KSZ*CONV_KSZ + dy*CONV_KSZ + dx`.
+
+The mvin stride is set to `MATMUL_K` bytes (the full row width of `A_buf`), so successive DMA rows step by `MATMUL_K` bytes in DRAM. This means the DMA issues `DIM` transfers of `DIM` contiguous bytes each, with stride `MATMUL_K`.
+
+The im2col expansion maps column index `col` within `A_buf` to input coordinates:
+```
+c  = col / (CONV_KSZ * CONV_KSZ)
+dy = (col % (CONV_KSZ * CONV_KSZ)) / CONV_KSZ
+dx = col % CONV_KSZ
+```
+
+For a given tile `(i, k)`, the DMA reads 16 columns starting at `col = k*DIM`. If those 16 columns all fall within the same `(c, dy)` slice (i.e., `dx` varies from some start to start+15), and `X_in[c]` rows are contiguous in memory with stride `CONV_W` = `PATCHES_X * CONV_KSZ`, then the source pointer for row `r` of tile `(i, k)` is:
+
+```
+patch = i*DIM + r           // flat patch index
+pi = patch / PATCHES_X      // patch row
+pj = patch % PATCHES_X      // patch col
+col = k*DIM
+c  = col / (CONV_KSZ*CONV_KSZ)
+dy = (col % (CONV_KSZ*CONV_KSZ)) / CONV_KSZ
+dx = col % CONV_KSZ
+src = &X_in[c][pi*CONV_KSZ + dy][pj*CONV_KSZ + dx]
+```
+
+However, **direct fusion requires that the 16 columns of a tile are contiguous in `X_in`**, which holds only when the 16 columns don't cross a `(c, dy)` boundary. This is guaranteed when `CONV_KSZ * CONV_KSZ` is a multiple of 16 or when `DIM` divides into the inner dimension cleanly — but in the general case it may not hold.
+
+### When Fusion Is Exact
+
+For this problem: `CONV_C=2`, `k=CONV_KSZ=8`, so `CONV_KSZ*CONV_KSZ = 64` and `MATMUL_K = CONV_C * CONV_KSZ * CONV_KSZ = 128`. Since `DIM=16` and `64 = 4*16`, each tile column block of 16 lies entirely within one `(c, dy)` slice. So for tile column `k`, the 16 columns span `dx` values `[dx_start, dx_start+15]` within a fixed `(c, dy)`. Since `CONV_KSZ=8 < 16`, each tile of 16 columns *crosses exactly one* `dy` boundary within a `c` channel — but wait: `dx` only goes 0..7, so 16 columns span two `dy` values. This means the 16 columns are **not** contiguous in `X_in` in general.
+
+### Revised Approach: Use A_buf but Eliminate the Two-Phase Loop
+
+Rather than requiring contiguity, the correct fusion approach is: **compute the `A_buf` row pointer on-the-fly during the mvin loop**, issuing the mvin directly from `X_in`-derived pointers where the layout permits, or keeping `A_buf` only as a staging buffer but filling it lazily — one tile's worth at a time — immediately before each mvin, so the CPU never writes the full `A_buf` upfront and the hardware can pipeline.
+
+Actually, the most straightforward and correct application of strategy 9 here is: **replace the pre-built `A_buf` with on-the-fly pointer computation per mvin call**. Since `gemmini_config_ld` sets the DRAM stride and we issue `gemmini_extended_mvin(ptr, sp_addr, DIM, DIM)`, the DMA will fetch `DIM` rows each of `DIM` bytes starting at `ptr` with row stride = `MATMUL_K` bytes.
+
+The im2col source for row `row = i*DIM + r` of `A_buf`, column `col = k*DIM` is `X_in[c][pi*CONV_KSZ+dy][pj*CONV_KSZ+dx]` — and because the columns within a 16-wide tile may not be contiguous in `X_in`, **we must keep `A_buf` as the intermediate but fill it per-tile (one tile at a time) just before its mvin**, eliminating the full upfront pass and breaking the write-all-then-read-all pattern.
+
+### Concrete Change
+
+**Before:** The code does a complete nested im2col over all patches/channels/kernel positions writing all of `A_buf`, then separately loops over all tiles doing mvin from `A_buf`.
+
+**After:** Interleave: for each tile `(i, k)`, fill only the `DIM × DIM` sub-block of `A_buf` corresponding to that tile, then immediately issue the mvin for that tile. This means:
+- The CPU only writes `DIM*DIM = 256` bytes per tile before the mvin, not the full `A_buf`
+- The mvin DMA reads those 256 bytes before they are evicted from cache (hot L1/L2 data)
+- The full `A_buf` no longer needs to exist in DRAM as a complete structure before any DMA begins
+- Cache working set drops from `MATMUL_M * MATMUL_K` bytes to `DIM * DIM = 256` bytes per iteration
+
+The tile `(i, k)` of `A_buf` occupies rows `[i*DIM, i*DIM+DIM)` × columns `[k*DIM, k*DIM+DIM)`. The im2col fill for this tile is:
+
+```c
+for (int r = 0; r < DIM; r++) {
+    int patch = i * DIM + r;
+    int pi = patch / PATCHES_X;
+    int pj = patch % PATCHES_X;
+    for (int s = 0; s < DIM; s++) {
+        int col = k * DIM + s;
+        int c  = col / (CONV_KSZ * CONV_KSZ);
+        int dy = (col % (CONV_KSZ * CONV_KSZ)) / CONV_KSZ;
+        int dx = col % CONV_KSZ;
+        A_buf[i * DIM + r][k * DIM + s] =
+            X_in[c][pi * CONV_KSZ + dy][pj * CONV_KSZ + dx];
+    }
+}
+```
+
+Then immediately follow with the existing mvin for tile `(i, k)`. The B-side mvin loop is unchanged. The full im2col pre-pass is deleted.
+
+### Summary of Code Changes
+
+1. **Delete** the five-level nested im2col loop that fills all of `A_buf` upfront.
+2. **Inside** the `for (int i ...) for (int k ...)` mvin loop for A, **prepend** a `DIM×DIM` im2col fill for only the `(i,k)` tile of `A_buf`, using on-the-fly index arithmetic.
+3. Keep `gemmini_config_ld(MATMUL_K * sizeof(elem_t))` and the `gemmini_extended_mvin` call unchanged — the DMA source pointer `A_buf[i*DIM][k*DIM]` and stride `MATMUL_K` remain valid.
+4. All other steps (scale loading, B mvin, config_st, mxquant_config_mvout, loop_ws_spad, read_smem, fence) are unchanged.
+
+This eliminates the full upfront DRAM write of `A_buf` and the cold-cache DRAM read during the separate mvin loop, replacing both with a hot-cache write+read pattern at `256` bytes per tile.

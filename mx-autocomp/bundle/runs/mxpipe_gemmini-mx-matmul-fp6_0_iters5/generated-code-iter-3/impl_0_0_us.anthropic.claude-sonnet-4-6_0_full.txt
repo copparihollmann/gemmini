@@ -1,0 +1,87 @@
+Looking at the original code, I need to understand the issue and produce a correct, semantically equivalent implementation.
+
+The original code processes a quarter of the matrix (ti = MATMUL_M/DIM/2, tj = MATMUL_N/DIM/2). Let me analyze the scratchpad constraints and memory layout carefully, then write a correct version that follows all the rules.
+
+Key observations:
+- MATMUL_M, MATMUL_N use half tile counts (ti, tj)
+- The full matrix needs to be processed - the original only handles a quadrant, so we need to loop over quadrants
+- Actually, re-reading: the original uses ti×tj×tk tiles, reads MATMUL_M×MATMUL_N elements from smem - so it processes the full output but with half the tile counts, meaning MATMUL_M/2 × MATMUL_N/2 output
+- The `gemmini_mx_read_smem` reads `MATMUL_M * MATMUL_N` BF16 values - this is the full output
+- The original processes tiles_I=ti, tiles_J=tj covering MATMUL_M/2 rows × MATMUL_N/2 cols
+
+The code seems to compute a sub-block. I'll keep the same semantics but ensure correctness per all rules:
+
+```c
+void solution(void) {
+  {
+    int ti = MATMUL_M / DIM / 2;  // tiles in I dimension
+    int tj = MATMUL_N / DIM / 2;  // tiles in J dimension
+    int tk = MATMUL_K / DIM;       // tiles in K dimension
+
+    uint32_t ab = 0;
+    uint32_t bb = BANK_NUM * BANK_ROWS - tk * tj * DIM;
+    int SDST = 128;
+
+    // Step 1: Configure execution with fp6 e3m2 format, uselut=1
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+        1, 1, 0, 0, false, 1, 1, 3, 1);
+
+    // Step 2: Load scale factors (sel=0 for A, sel=1 for B)
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+    // Step 3: Load LUTs (sel=0 for B LUT, sel=1 for A LUT)
+    gemmini_mx_load_lut((uint64_t)B_lut_p, 1, 0);
+    gemmini_mx_load_lut((uint64_t)A_lut_p, 1, 1);
+
+    // Step 4a: MVIN A tiles into scratchpad (mvin port 0)
+    // A DRAM stride = MATMUL_K bytes (elem_t = 1 byte)
+    gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+
+    for (int i = 0; i < ti; i++) {
+      int k = 0;
+      while (k < tk) {
+        int blk = tk - k;
+        if (blk > MAX_BLOCK_LEN) blk = MAX_BLOCK_LEN;
+        uint32_t spad_addr = ab + (i * tk + k) * DIM;
+        elem_t *dram_ptr = ((elem_t*)A_in_hw) + i * DIM * MATMUL_K + k * DIM;
+        gemmini_extended_mvin((void*)dram_ptr, spad_addr, blk * DIM, DIM);
+        k += blk;
+      }
+    }
+
+    // Step 4b: MVIN B tiles into scratchpad (mvin2 port 1)
+    // FP6 packed: each element is 6 bits, but stored in 1-byte slots (elem_t=uint8_t)
+    // B DRAM stride = MATMUL_N/2 bytes (fp6 dual-packed, 2 elements per byte)
+    gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t) / 2, MVIN_SCALE_IDENTITY, false, 1);
+
+    for (int k = 0; k < tk; k++) {
+      int j = 0;
+      while (j < tj) {
+        int blk = tj - j;
+        if (blk > MAX_BLOCK_LEN) blk = MAX_BLOCK_LEN;
+        uint32_t spad_addr = bb + (k * tj + j) * DIM;
+        elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * (MATMUL_N / 2) + j * DIM;
+        gemmini_extended_mvin2((void*)dram_ptr, spad_addr, blk * DIM, DIM);
+        j += blk;
+      }
+    }
+
+    // Step 5: Configure requantized mvout
+    // i_bound, j_bound, k_bound must match ti, tj, tk used in loop_ws_spad
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+        ti, tj, tk, 0, 0, 9);
+
+    // Step 6: Compute fused tiled matmul (funct 24 marker is one-shot, issued by macro)
+    gemmini_loop_ws_spad(ti, tj, tk, 0, 0, 0,
+        ab, BANK_NUM * BANK_ROWS, 0, SDST,
+        false, false, false, false, false,
+        NO_ACTIVATION, 0, 0, false, 0x38);
+
+    // Step 7: Drain results from mx_smem to DRAM, then fence
+    gemmini_mx_read_smem(&C_hw[0][0], SDST * 16, MATMUL_M * MATMUL_N);
+    gemmini_fence();
+  }
+}
+```

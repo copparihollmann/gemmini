@@ -1,0 +1,46 @@
+## Analysis of the Original Code
+
+Looking at the original code, the outer loop iterates `i0` in the outer loop and `j0` in the inner loop:
+
+```c
+for (int i0 = 0; i0 < BLOCKS_M; i0++)
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    // loads A_s for (i0, all_k) -- changes with i0
+    // loads B_s for (all_k, j0) -- changes with j0
+    // mvins A tiles for i0-block -- changes with i0
+    // mvins B tiles for j0-block -- changes with j0
+    // compute + drain
+  }
+```
+
+**Key inefficiency**: For a fixed `i0`, the A tiles (rows `i0*BLK` to `i0*BLK+BLK-1`) are loaded from DRAM `BLOCKS_N` times — once for every `j0` iteration. Similarly, A scale factors `A_s` for a given `i0` are re-staged from `A_scales_row` on every `j0` pass. This is pure wasted work because the A data does not change across `j0`.
+
+## Selected Strategy
+
+**Strategy 13**: Reorder the outer loop nest to `i0` inside `j0` so that B tiles and B scale factors loaded for a given `j0` block are reused across all `i0` iterations without reloading.
+
+Wait — let me re-read. Strategy 13 says put `i0` *inside* `j0`, meaning `j0` is the outer loop. This means B tiles (which depend only on `j0`) are loaded once per `j0`, and then the inner `i0` loop reuses the same B data. Since `tiles_K * tiles_J * DIM` B rows are already in the scratchpad, and `BANK_NUM*BANK_ROWS - tiles_K*tiles_J*DIM` is the B base, B tiles stay valid across all `i0` iterations.
+
+## Plan
+
+**Change**: Swap the loop order so `j0` is the outer loop and `i0` is the inner loop.
+
+**What moves outside (done once per `j0`)**:
+1. The `memcpy` staging of `B_s[g][0]` from `B_scales_col` — only depends on `j0`
+2. `gemmini_mx_load_scales` for B — only depends on `j0` scale data
+3. The `gemmini_config_ld` + mvin loop for B tiles — B tiles `(k,j)` only depend on `j0`
+
+**What stays inside (done once per `(j0, i0)` pair)**:
+1. The `memcpy` staging of `A_s[g][0]` from `A_scales_row` — depends on `i0`
+2. `gemmini_mx_load_scales` for A — depends on `i0`
+3. The mvin loop for A tiles — depends on `i0`
+4. `gemmini_extended3_config_ex` + `gemmini_flush` — must precede scale loads each time (but since B scales are loaded before the i0 loop, we need to ensure A scales are loaded just before compute; the config_ex can also be moved outside if format doesn't change, but to maintain the required ordering sequence, we load A scales in the inner loop just before the loop_ws_spad)
+5. Compute + drain
+
+**Correctness check**:
+- Scratchpad constraint: B tiles occupy `tiles_K * tiles (BLK/DIM) * DIM` rows at the top. A tiles occupy `tiles_I_block * tiles_K * DIM` rows at the bottom. These are the same sizes as before — no layout change.
+- B tiles in scratchpad remain valid across all `i0` iterations since `a_base` grows upward and `b_base` is fixed at the top. With `tiles=BLK/DIM` and `tiles_K=MATMUL_K/DIM`, A uses `tiles * tiles_K * DIM` rows from `a_base=0`, and B uses `tiles * tiles_K * DIM` rows from `b_base`. Must verify no overlap: total = `2 * tiles * tiles_K * DIM ≤ 8192`.
+- The programming model sequence per inner iteration becomes: `config_ex → load_scales(A) → [B already loaded] → mvin A → config_st → mxquant_config → loop_ws_spad → read_smem → fence`. B scales must also be present; since they were loaded before the inner loop and the hardware scale memory persists, this is valid per rule 15 as long as B scale memory isn't overwritten inside the loop.
+- We re-issue `gemmini_flush` + `gemmini_extended3_config_ex` only in the outer `j0` loop. Then for each `i0`, we issue `gemmini_mx_load_scales` for A only (B is already loaded and unchanged). This satisfies the ordering: config_ex happened before all scale loads, A scales are loaded before compute, B scales were loaded before entering the `i0` loop and are still valid.
+
+**Result**: B tile DRAM loads reduced from `BLOCKS_M * BLOCKS_N` to `BLOCKS_N`. A scale memcpy overhead is similarly halved in amortization terms. For `BLOCKS_M` iterations of `i0`, B tiles are loaded only once, saving `(BLOCKS_M - 1) * BLOCKS_N` sets of B mvin operations and B scale loads.

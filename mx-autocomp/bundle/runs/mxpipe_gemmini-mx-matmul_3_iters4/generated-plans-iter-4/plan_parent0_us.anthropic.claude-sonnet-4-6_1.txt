@@ -1,0 +1,77 @@
+## Analysis
+
+Looking at the original code, the mvin loops issue one `gemmini_extended_mvin` / `gemmini_extended_mvin2` call per tile. For the given matrix dimensions:
+
+- `tiles_I = MATMUL_M / DIM`
+- `tiles_J = MATMUL_N / DIM`  
+- `tiles_K = MATMUL_K / DIM`
+
+Each A tile and B tile gets its own mvin instruction. The hardware supports batching up to `MAX_BLOCK_LEN=4` consecutive DIM-row tiles into a single `gemmini_block_mvin` call, which directly reduces the number of instructions dispatched.
+
+## Selected Strategy: #9 — Batch consecutive A-tile rows into a single `gemmini_block_mvin` call
+
+## Plan
+
+**Observation:** The inner loop over `i` (for A tiles) and `j` (for B tiles) for a fixed `k` issues one mvin per tile. For A, tiles at `a_base + (i*tiles_K + k)*DIM` for consecutive `i` values are **not** necessarily contiguous in scratchpad (they are spaced `tiles_K*DIM` apart), so A tiles cannot be batched across `i`.
+
+However, examining the B mvin loop more carefully: for a fixed `k`, consecutive `j` tiles go to `b_base + (j*tiles_K + k)*DIM`. These are **not** contiguous in scratchpad either (spaced `tiles_K*DIM` apart).
+
+Re-examining: `gemmini_block_mvin` batches `len` tiles into **contiguous scratchpad rows** starting at `spad_addr`, loading `len*DIM` columns from a contiguous DRAM region. This works when DRAM source rows are contiguous AND scratchpad destination rows are contiguous.
+
+For A tiles with fixed `k`, iterating over `i`: DRAM pointer = `A_in + i*DIM*MATMUL_K + k*DIM`. Consecutive `i` differ by `DIM*MATMUL_K` bytes in DRAM — **not** contiguous. So block_mvin doesn't apply across `i`.
+
+For the **k-loop inner tiles** at fixed `i`, consecutive `k` tiles: DRAM = `A_in + i*DIM*MATMUL_K + k*DIM` — consecutive `k` differ by `DIM` bytes in DRAM and by `DIM` rows in scratchpad (contiguous!). So batching across `k` (up to 4 at a time) **is** valid.
+
+**The plan:** Restructure the mvin loops to iterate over `i` (and `j`) in the outer loop and `k` in the inner loop, then batch consecutive `k` tiles (up to `MAX_BLOCK_LEN=4`) using `gemmini_block_mvin`. For A at fixed `i`, the DRAM source for `k=0..tiles_K-1` is `A_in + i*DIM*MATMUL_K + k*DIM` — consecutive `k` are `DIM` bytes apart (contiguous in the packed row), and the scratchpad destination `a_base + (i*tiles_K + k)*DIM` is also contiguous across `k`. So `gemmini_block_mvin` with `len=min(4, tiles_K-k)` is correct.
+
+Similarly for B at fixed `j`: DRAM = `B_in + j*DIM*MATMUL_K + k*DIM`, scratchpad = `b_base + (j*tiles_K + k)*DIM` — also contiguous across `k`. Batch B tiles the same way.
+
+The stride config `MATMUL_K * sizeof(elem_t)` remains correct (it's the DRAM row stride for `gemmini_config_ld`). The `block_mvin_stride` in `gemmini_extended4_config_ld` would be set to `DIM` (the inter-tile stride within a batch), but `gemmini_block_mvin` uses the already-configured `gemmini_config_ld` stride, which handles one DIM-row at a time. Actually `gemmini_block_mvin(dram_addr, spad_addr, len)` = `gemmini_extended_mvin(dram_addr, spad_addr, len*DIM, DIM)` — it loads `len*DIM` columns × `DIM` rows as one chunk. This requires the DRAM source to have `len*DIM` contiguous columns, which is satisfied when consecutive k-tiles are adjacent in the row (`k*DIM` to `(k+len)*DIM-1`).
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Configure ld port 0 for A (stride = full packed row width)
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), SCALE_IDENTITY, false, 0);
+  // Configure ld port 1 for B (stride = full packed row width)
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), SCALE_IDENTITY, false, 1);
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // MVIN A: outer loop over i, inner loop over k batched by up to MAX_BLOCK_LEN=4
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+      int batch = tiles_K - k;
+      if (batch > MAX_BLOCK_LEN) batch = MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_block_mvin((void*)dram_ptr, sp_addr, batch);
+    }
+  }
+
+  // MVIN B: outer loop over j, inner loop over k batched by up to MAX_BLOCK_LEN=4
+  for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+      int batch = tiles_K - k;
+      if (batch > MAX_BLOCK_LEN) batch = MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = b_base + (j * tiles_K + k) * DIM;
+      gemmini_block_mvin2((void*)dram_ptr, sp_addr, batch);
+    }
+  }
+
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+**Key changes:**
+1. A mvin loop restructured: outer `i`, inner `k` stepped by `MAX_BLOCK_LEN`; `gemmini_block_mvin` batches up to 4 consecutive k-tiles in one instruction. This reduces A mvin instructions from `tiles_I*tiles_K` to `tiles_I * ceil(tiles_K/4)`.
+2. B mvin loop restructured: outer `j`, inner `k` stepped by `MAX_BLOCK_LEN`; `gemmini_block_mvin2` does the same for B. Reduces from `tiles_J*tiles_K` to `tiles_J * ceil(tiles_K/4)`.
+3. All other steps (config, scale load, compute, read) are unchanged and in the correct order.

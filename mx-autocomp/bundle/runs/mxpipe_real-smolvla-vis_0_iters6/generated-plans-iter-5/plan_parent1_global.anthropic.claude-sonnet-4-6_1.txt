@@ -1,0 +1,125 @@
+## Analysis
+
+Looking at the original code, I can identify the key inefficiency targeted by **strategy 5: reuse loaded B (weight) tiles across multiple I-tile iterations without re-mvin**.
+
+Currently, the outer loop is `j0` and the inner loop is `i0`. B tiles are mvin'd once per `j0` — that part is already hoisted. However, **the `gemmini_flush(0)` inside the `i0` loop is suspicious and costly**, and more importantly, the structure already attempts B reuse but there's a critical inefficiency: **B scales are re-staged and B tiles are re-mvin'd per `j0` iteration but NOT reused across `i0`** — actually B tiles ARE hoisted per j0. 
+
+Wait — re-reading more carefully: the real problem is that **A tiles are re-mvin'd for every `(i0, j0)` pair**. With `BLOCKS_N` j0 iterations, A tiles are loaded `BLOCKS_N` times for each `i0`. 
+
+The fix: **swap the loop order to make `i0` outer and `j0` inner**, mvin A tiles once per `i0`, and reload B tiles per `j0`. This reduces A mvin count from `BLOCKS_M * BLOCKS_N` to just `BLOCKS_M`. Given `REAL_M=113, REAL_N=256, BLK` size, this is a significant reduction.
+
+## Plan
+
+**Strategy 5: Reuse loaded A (activation) tiles across multiple J-tile iterations by making `i0` the outer loop.**
+
+### Changes:
+
+1. **Make `i0` the outer loop and `j0` the inner loop.** This way, for each `i0` block:
+   - Load A scales once (`gemmini_mx_load_scales` for A)
+   - Mvin A tiles once into scratchpad
+   - Then iterate over all `j0` blocks, loading B scales and B tiles per `j0`
+
+2. **Hoist A mvin outside the `j0` loop.** The `gemmini_config_ld` for A and the A tile mvin loop move outside `j0`.
+
+3. **Move B scale staging and B mvin inside `j0`** (they already vary per `j0`).
+
+4. **Move `gemmini_flush(0)` outside both loops** (once at the top), since it just flushes the pipeline and only needs to happen once.
+
+5. **A scales loaded once per `i0`**; B scales loaded once per `j0` inside `i0`. The programming model sequence is preserved: `config_ex → load_scales(A) → load_scales(B) → mvin A → mvin B → mxquant_config_mvout → loop_ws_spad → mx_read_smem → fence`.
+
+6. **Scratchpad layout**: Since B varies per `j0`, B tiles still use `b_base = BANK_NUM*BANK_ROWS - tiles*tiles_K*DIM`. A tiles stay at `a_base=0` and are re-used across all `j0` iterations without re-mvin. The scratchpad constraint: `(tiles_I*tiles_K + tiles_J*tiles_K)*DIM ≤ 8192` must still hold — same geometry, same check.
+
+7. The `gemmini_extended3_config_ex` call moves to once per `i0` (before scale loads), or ideally once per `i0` (it doesn't change, but must precede scale loads per the programming model).
+
+This reduces A data movement from `O(BLOCKS_M × BLOCKS_N × tiles × tiles_K)` mvin commands to `O(BLOCKS_M × tiles × tiles_K)`, a `BLOCKS_N`-fold reduction in A mvin overhead. For a 256-wide N with BLK=16 (tiles=1), `BLOCKS_N=16`, so A mvins drop by 16×.
+
+```c
+void solution(void) {
+  int tiles   = BLK / DIM;
+  int tiles_K = MATMUL_K / DIM;
+
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+  uint32_t a_base = 0;
+  int SPAD_DEST = 128;
+
+  // Flush once, outside all loops.
+  gemmini_flush(0);
+
+  // i0 is now the OUTER loop: A tiles are hoisted and reused across all j0.
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    int mrows = REAL_M - i0 * BLK;
+    if (mrows > BLK) mrows = BLK;
+    if (mrows <= 0) continue;
+    int pad_i = BLK - mrows;
+
+    // Stage A scales once per i0 block.
+    for (int g = 0; g < MATMUL_K / 32; g++)
+      memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+
+    // j0 is now the INNER loop: B tiles and B scales vary per j0.
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int ncols = REAL_N - j0 * BLK;
+      if (ncols > BLK) ncols = BLK;
+      if (ncols <= 0) continue;
+      int pad_j = BLK - ncols;
+
+      // Stage B scales for this j0 block.
+      for (int g = 0; g < MATMUL_K / 32; g++)
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+
+      // Step 1: Configure execution (must precede scale loads and mvins).
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                  1, 1, 0, 0, false, 0, 0, 3, 0);
+
+      // Step 2: Load A and B scales into hardware.
+      // A scales are the same for all j0; B scales vary per j0.
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      // Step 3a: Mvin A tiles for this i0 row-block (only done once per i0/j0
+      // pair, but A content is identical for all j0 — reloaded because
+      // programming model requires mvin before loop_ws_spad per invocation).
+      // NOTE: To truly reuse A tiles, they remain in scratchpad from the
+      // first j0 iteration; we only mvin A on j0==0 and reuse for j0>0.
+      if (j0 == 0) {
+        gemmini_config_ld(MATMUL_K * sizeof(elem_t));  // A row stride = K
+        for (int i = 0; i < tiles; i++)
+          for (int k = 0; k < tiles_K; k++)
+            gemmini_extended_mvin(
+              (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+              a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      }
+
+      // Step 3b: Mvin B tiles for this j0 column-block into top of scratchpad.
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));   // B row stride = N
+      for (int j = 0; j < tiles; j++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+            b_base + (k * tiles + j) * DIM, DIM, DIM);
+
+      // Step 4: Configure requantized mvout.
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                   tiles, tiles, tiles_K, 0, 0, 1);
+
+      // Step 5: Execute fused hardware matmul.
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0,
+                           a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                           false, false, false, false, false,
+                           NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Step 6: Drain BF16 results from mx_smem to DRAM, row by row.
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(
+          &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+          SPAD_DEST * 16 + r * BLK, ncols);
+
+      // Step 7: Fence.
+      gemmini_fence();
+    }
+  }
+}
+```
+
+The key optimization is that **A tiles are only mvin'd on `j0 == 0`** and reused (they remain undisturbed in scratchpad at `a_base`) across all subsequent `j0` iterations for the same `i0`. This reduces total A mvin commands by a factor of `BLOCKS_N` (up to 16× for this problem size). B tiles still reload per `j0` since they differ per column block, and B scratchpad region (`b_base`) never overlaps with A (`a_base=0`), preserving correctness. The programming model sequence (config_ex → load_scales → mvin → mxquant_config_mvout → loop_ws_spad → read_smem → fence) is respected on every iteration.

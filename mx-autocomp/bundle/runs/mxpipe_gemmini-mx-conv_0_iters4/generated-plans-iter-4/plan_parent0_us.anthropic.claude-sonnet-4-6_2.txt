@@ -1,0 +1,140 @@
+## Analysis of Current Code
+
+Looking at the hot path, the most expensive CPU-side work is the im2col loop:
+
+```c
+for (int i = 0; i < tiles_I; i++) {
+    for (int li = 0; li < DIM; li++) {
+        int patch_idx = i * DIM + li;
+        int pi = patch_idx / PATCHES_X;   // ← expensive integer divide
+        int pj = patch_idx % PATCHES_X;   // ← expensive integer modulo
+        int y_base = pi * CONV_KSZ;
+        int x_base = pj * CONV_KSZ;
+        elem_t *a_row = A_buf[patch_idx];
+        for (int c = 0; c < CONV_C; c++) {
+            int c_off = c * CONV_KSZ * CONV_KSZ;
+            for (int dy = 0; dy < CONV_KSZ; dy++) {
+                int dy_off = c_off + dy * CONV_KSZ;
+                const elem_t *x_row = &X_in[c][y_base + dy][x_base];
+                for (int dx = 0; dx < CONV_KSZ; dx++)
+                    a_row[dy_off + dx] = x_row[dx];
+            }
+        }
+    }
+    // mvin for this i-row
+}
+```
+
+**Strategy 7** directly targets this: precompute a lookup table of `x_row` base addresses (indexed by `patch_idx` and `(c, dy)`) before the mvin loop, eliminating the repeated integer divide/modulo and multiply chains from the hot path.
+
+## Plan
+
+### Strategy: Precompute im2col source pointer table (Strategy 7)
+
+**What to precompute:** Before the `tiles_I` loop, compute and store all `x_row` pointers into a 2D table `x_row_lut[MATMUL_M][CONV_C * CONV_KSZ]`. This collapses the expensive per-patch `patch_idx / PATCHES_X`, `patch_idx % PATCHES_X`, and the per-`(c, dy)` multiply chains into a single precomputation pass, leaving the inner loop as a pure array-indexed pointer dereference plus `memcpy`-like copy.
+
+**Additional improvement:** While building the LUT, also precompute `y_base` and `x_base` via increment (counting patch coordinates with `pj++`/carry into `pi++`) instead of divide/modulo, removing all integer divides from the entire im2col.
+
+**How it improves performance:**
+- The `patch_idx / PATCHES_X` and `patch_idx % PATCHES_X` are executed `tiles_I * DIM = MATMUL_M` times; integer divide on RISC-V is ~20–40 cycles each.
+- The multiply chain `c * CONV_KSZ * CONV_KSZ + dy * CONV_KSZ` is recomputed for every `(patch, c, dy)` triple — `MATMUL_M * CONV_C * CONV_KSZ` times total.
+- Replacing all of this with a one-time LUT build + O(1) pointer lookup in the hot copy loop dramatically reduces the CPU cycle count between mvin submissions, keeping the DMA pipeline fed more continuously.
+
+## Rewritten Code
+
+```c
+void solution(void) {
+  // Tile counts
+  const int tiles_I = MATMUL_M / DIM;
+  const int tiles_J = MATMUL_N / DIM;
+  const int tiles_K = MATMUL_K / DIM;
+
+  // Scratchpad base addresses
+  const int a_base = 0;
+  const int b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+  const int SPAD_DEST = 0;
+
+  // Step 0: Precompute im2col source pointer LUT.
+  // x_row_lut[patch_idx][c * CONV_KSZ + dy] = pointer to X_in[c][y_base+dy][x_base]
+  // This eliminates repeated integer divide/modulo and multiply from the hot path.
+  // Total entries: MATMUL_M * CONV_C * CONV_KSZ pointers.
+  static const elem_t *x_row_lut[MATMUL_M][CONV_C * CONV_KSZ];
+
+  {
+    int pi = 0, pj = 0;
+    for (int patch_idx = 0; patch_idx < MATMUL_M; patch_idx++) {
+      int y_base = pi * CONV_KSZ;
+      int x_base = pj * CONV_KSZ;
+      for (int c = 0; c < CONV_C; c++) {
+        int c_off = c * CONV_KSZ;
+        for (int dy = 0; dy < CONV_KSZ; dy++) {
+          x_row_lut[patch_idx][c_off + dy] = &X_in[c][y_base + dy][x_base];
+        }
+      }
+      // Advance patch coordinates without divide/modulo
+      pj++;
+      if (pj >= PATCHES_X) {
+        pj = 0;
+        pi++;
+      }
+    }
+  }
+
+  // Step 1: Configure execution (MX FP8 -> BF16, weight-stationary)
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // Step 2: Load scale factors (A=sel 0, B=sel 1)
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Step 3: Load B tiles using mvin2 (port 1) — done once, amortized over all I tiles
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+  for (int j = 0; j < tiles_J; j++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin2(
+          (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+          b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+
+  // Step 4: Configure mvin port 0 for A tiles
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+
+  // Step 5: im2col using precomputed LUT + mvin, one i-row at a time.
+  for (int i = 0; i < tiles_I; i++) {
+    // im2col: produce DIM rows of A_buf for this i-tile using precomputed LUT
+    for (int li = 0; li < DIM; li++) {
+      int patch_idx = i * DIM + li;
+      elem_t *a_row = A_buf[patch_idx];
+      // Inner loop: use LUT pointer — no divide, modulo, or multiply
+      for (int c = 0; c < CONV_C; c++) {
+        int c_off = c * CONV_KSZ;
+        for (int dy = 0; dy < CONV_KSZ; dy++) {
+          const elem_t *x_row = x_row_lut[patch_idx][c_off + dy];
+          for (int dx = 0; dx < CONV_KSZ; dx++)
+            a_row[c_off * CONV_KSZ + dy * CONV_KSZ + dx] = x_row[dx];
+        }
+      }
+    }
+
+    // Immediately mvin this i-row's tiles (port 0, non-blocking).
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin(
+          (void*)(((elem_t*)A_buf) + i * DIM * MATMUL_K + k * DIM),
+          a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+  }
+
+  // Step 6: Configure output stride and requantizer.
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+      tiles_I, tiles_J, tiles_K, 0, 0, tiles_K);
+
+  // Step 7: Execute fused tiled weight-stationary matmul over scratchpad.
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+      a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+      false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // Step 8: Drain BF16 results from mx_smem to DRAM, then fence.
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```

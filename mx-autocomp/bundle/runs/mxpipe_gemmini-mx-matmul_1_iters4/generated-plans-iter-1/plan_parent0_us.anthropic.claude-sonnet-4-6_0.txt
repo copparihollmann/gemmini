@@ -1,0 +1,53 @@
+## Analysis of the Original Code
+
+The original code for a 32×32×32 FP8 matmul (tiles_I=2, tiles_J=2, tiles_K=2) has:
+
+```c
+gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+// All A tiles loaded via mvin (port 0)
+for (int i = 0; i < tiles_I; i++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(...);  // A tiles on port 0
+
+// All B tiles ALSO loaded via mvin (port 0)
+for (int j = 0; j < tiles_J; j++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(...);  // B tiles on port 0 — serialized!
+```
+
+**Key inefficiency:** Both A and B tiles are loaded through the same `mvin` port (port 0 / `k_MVIN`). This serializes all DMA transfers. The hardware provides a dedicated `mvin2` port (`k_MVIN2`) for B tiles that can operate concurrently with `mvin` (port 0) for A tiles.
+
+## Selected Strategy
+
+**Strategy 12:** Replace `gemmini_extended_mvin` with `gemmini_extended_mvin2` for B-tile loads to use the dedicated mvin2 port and allow hardware to overlap A and B DMA transfers concurrently.
+
+## Plan
+
+1. **Keep the A-tile loop unchanged**, using `gemmini_extended_mvin` (port 0 / `k_MVIN`) with `gemmini_config_ld` stride set to `MATMUL_K * sizeof(elem_t)`.
+
+2. **Issue a separate `gemmini_config_ld` with `id=1`** (via `gemmini_extended3_config_ld` with `id=1`) to configure the stride for port 1 (mvin2). The B matrix has a different layout from A: B is stored as `B_in[k][j]` with row stride `MATMUL_N/2` bytes (since B is column-major packed with `VALUES_PER_BYTE=2`… but wait — in this fp8 baseline `VALUES_PER_BYTE` is not used; checking the code: B stride is `MATMUL_K * sizeof(elem_t)` matching the same config as A, since `B_in` is indexed as `B_in + j * DIM * MATMUL_K + k * DIM`). The stride for both A and B is `MATMUL_K * sizeof(elem_t)`, so the same config_ld value applies to port 1.
+
+3. **Replace `gemmini_extended_mvin` with `gemmini_extended_mvin2`** in the B-tile loop, so B tiles DMA through port 1. This allows the hardware to issue B-tile DMA requests concurrently with (or immediately after) the A-tile DMA requests on port 0, overlapping the memory transfers.
+
+4. **Interleave A and B mvin calls** in a single loop over `(i, j, k)` where possible, so both ports are active simultaneously — issuing an `mvin` for an A tile immediately followed by an `mvin2` for a B tile in the same loop iteration.
+
+5. **No fence is needed between the A mvin and B mvin2 loops** (the hardware sequencer handles ordering before `gemmini_loop_ws_spad`), so no additional synchronization is introduced.
+
+The rewritten mvin section becomes:
+
+```c
+// Configure port 0 (mvin) for A tiles
+gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+// Configure port 1 (mvin2) for B tiles — same stride
+gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+// Interleave A (mvin) and B (mvin2) loads so both ports are active
+for (int k = 0; k < tiles_K; k++) {
+  for (int i = 0; i < tiles_I; i++)
+    gemmini_extended_mvin(A_ptr(i,k), a_base + (i*tiles_K+k)*DIM, DIM, DIM);
+  for (int j = 0; j < tiles_J; j++)
+    gemmini_extended_mvin2(B_ptr(j,k), b_base + (j*tiles_K+k)*DIM, DIM, DIM);
+}
+```
+
+This change is localized to the mvin section, requires no change to the scale loading, config_ex, mxquant_config_mvout, loop_ws_spad, or read_smem steps, and is semantically equivalent since all tiles are still loaded to the same scratchpad addresses before `gemmini_loop_ws_spad` executes.

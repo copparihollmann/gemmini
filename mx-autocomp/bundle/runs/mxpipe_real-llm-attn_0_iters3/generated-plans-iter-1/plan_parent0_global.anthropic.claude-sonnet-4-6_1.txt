@@ -1,0 +1,39 @@
+## Analysis
+
+Looking at the original code, I need to identify the key inefficiency to target.
+
+**Current structure:**
+- Outer loops over `i0` (BLOCKS_M) and `j0` (BLOCKS_N) — block-level tiling
+- Inside each (i0, j0) block: `gemmini_flush`, full config, load scales, mvin A, mvin B, compute, readout
+- `REAL_M = 8`, `BLK` = some block size, `DIM = 16`
+
+**Key observation for Strategy 3:**
+
+Since `REAL_M = 8`, which is less than `DIM = 16`, we have `tiles_I = BLK/DIM` — but wait, `BLK` is the block size. More importantly, `REAL_M = 8` means there's only **one row of tiles** in the M dimension (since 8 < 16 = DIM, so `REAL_M / DIM = 0` tiles normally, but the code pads to BLK which must be ≥ DIM).
+
+Actually: `REAL_M = 8`, so there's at most 1 tile in M (pad_i = BLK - 8). The outer `i0` loop runs only once (`BLOCKS_M = ceil(8/BLK) = 1`). Similarly, K is fixed at `MATMUL_K`, and N is `REAL_N`.
+
+The critical insight is: **with REAL_M=8 (a single DIM tile in M), the entire computation is a single `gemmini_loop_ws_spad` call**. The outer i0/j0 block loops are unnecessary overhead. We can call `gemmini_loop_ws_spad` once with `tiles_I = 1` (since M=8 padded to 16 = 1 DIM tile), `tiles_J = REAL_N/DIM`, `tiles_K = MATMUL_K/DIM`, eliminating all loop overhead, repeated flushes, repeated config calls, and repeated scale loads.
+
+## Plan: Apply Strategy 3
+
+**Step 1: Recognize the dimensions.** `REAL_M = 8 ≤ DIM = 16`, so the entire M dimension fits in exactly one tile (`tiles_I = 1`). The i0 loop runs exactly once. Similarly, if `REAL_N` is a multiple of DIM, the j0 loop can be collapsed into `tiles_J = REAL_N/DIM`.
+
+**Step 2: Eliminate the outer i0/j0 loops entirely.** Instead of iterating over blocks and invoking the accelerator once per block, issue a single accelerator invocation covering the full matrix:
+- `tiles_I = 1` (M=8 padded to 16)
+- `tiles_J = REAL_N / DIM`
+- `tiles_K = MATMUL_K / DIM`
+- `pad_i = DIM - REAL_M = 8`, `pad_j = 0`
+
+**Step 3: Load scales once for the full matrix.** Call `gemmini_mx_load_scales` a single time with the full `A_scales_row` and `B_scales_col` arrays (all groups along K, all columns of N), instead of per-block memcpy + load. This eliminates the 2 `memcpy` calls and reduces scale load overhead to one pair of `gemmini_mx_load_scales` calls.
+
+**Step 4: MVIN A and B directly from DRAM with correct full strides.** 
+- A: stride = `MATMUL_K * sizeof(elem_t)`, one tile row (i=0), K tiles along K → `tiles_K` mvin calls
+- B: stride = `MATMUL_N * sizeof(elem_t)`, all `tiles_J * tiles_K` tiles
+- `b_base = BANK_NUM*BANK_ROWS - tiles_K*tiles_J*DIM`
+
+**Step 5: Single `gemmini_loop_ws_spad` call** with `tiles_I=1, tiles_J=REAL_N/DIM, tiles_K=MATMUL_K/DIM`.
+
+**Step 6: Single readout loop** over `mrows=REAL_M` rows and all N columns, then one `gemmini_fence()`.
+
+This collapses all the repeated `gemmini_flush` + config + scale-load + mvin + compute + readout iterations into one flat sequence, removing the dominant loop-overhead cost and the memcpy staging entirely.

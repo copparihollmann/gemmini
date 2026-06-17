@@ -1,0 +1,69 @@
+An analysis of the original code reveals two major opportunities to significantly reduce execution latency on the MX-Gemmini coprocessor:
+
+1. **LUT Update Granularity Optimization (Strategy 9)**: 
+   In the original code, `lut_update_granularity` was set to `9` in `gemmini_mxquant_config_mvout`. Since the FP6 E3M2 weight and activation LUTs are invariant across the entire reduction dimension ($K$), updating the requantizer LUT more frequently than once per complete tile reduction is highly inefficient. By matching the granularity exactly to `tk` (16), the hardware refreshes the requantizer LUT exactly once per outer tile compute loop instead of multiple times. This eliminates redundant hardware stalls and unnecessary memory overhead.
+
+2. **Parallel Port-Splitting for MVINs**:
+   The baseline code utilized the default `gemmini_extended_mvin` instruction (associated with port 0) to load both A and B matrices, causing serialization of all memory transfers. By configuring `id=0` for A loads and `id=1` for B loads using `gemmini_extended3_config_ld`, and dispatching B loads via `gemmini_extended_mvin2`, we split memory transactions into separate, dedicated DMA channels. This allows Gemmini's independent DMA engines to overlap the latency of A and B reads simultaneously.
+
+Here is the fully optimized, semantically equivalent code incorporating these strategies:
+
+```c
+// Optimized MX matmul kernel (128x128x256, fp6:e3m2) using optimized LUT granularity and parallel MVIN pipelines.
+void solution(void) {
+  {
+    int ti = MATMUL_M / DIM / 2, tj = MATMUL_N / DIM / 2, tk = MATMUL_K / DIM;
+    uint32_t ab = 0;
+    uint32_t bb = BANK_NUM * BANK_ROWS - tk * tj * DIM;
+    int SDST = 128;
+    
+    // 1. Configure execution
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 1, 1, 3, 1);
+    
+    // 2. Load scale factors
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+    
+    // 3. Load quant LUTs
+    gemmini_mx_load_lut((uint64_t)B_lut_p, 1, 0);
+    gemmini_mx_load_lut((uint64_t)A_lut_p, 1, 1);
+    
+    // 4. Configure independent load strides (id=0 for A, id=1 for B)
+    gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), 1.0f, false, 0);
+    gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t) / 2, 1.0f, false, 1);
+    
+    // MVIN A using Port 0 (mvin)
+    for (int i = 0; i < ti; i++) {
+      for (int k = 0; k < tk; k += 2) {
+        gemmini_extended_mvin((void*)(((elem_t*)A_in_hw) + i * DIM * MATMUL_K + k * DIM), 
+                              ab + (i * tk + k) * DIM, 
+                              2 * DIM, 
+                              DIM);
+      }
+    }
+    
+    // MVIN B using Port 1 (mvin2)
+    for (int k = 0; k < tk; k++) {
+      for (int j = 0; j < tj; j += 2) {
+        gemmini_extended_mvin2((void*)(((elem_t*)B_in) + k * DIM * (MATMUL_N / 2) + j * DIM), 
+                               bb + (k * tj + j) * DIM, 
+                               2 * DIM, 
+                               DIM);
+      }
+    }
+    
+    // 5. Configure output and program requantizer (granularity optimized to tk)
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti, tj, tk, 0, 0, tk);
+    
+    // 6. Compute weight-stationary tiled matmul over scratchpad
+    gemmini_loop_ws_spad(ti, tj, tk, 0, 0, 0, ab, BANK_NUM * BANK_ROWS, 0, SDST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    
+    // 7. Drain BF16-packed results from shared memory
+    gemmini_mx_read_smem(&C_hw[0][0], SDST * 16, MATMUL_M * MATMUL_N);
+    
+    // 8. Memory barrier before CPU access
+    gemmini_fence();
+  }
+}
+```

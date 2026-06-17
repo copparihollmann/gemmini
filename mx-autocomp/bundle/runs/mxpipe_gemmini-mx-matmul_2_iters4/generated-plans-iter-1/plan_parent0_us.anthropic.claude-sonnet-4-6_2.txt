@@ -1,0 +1,79 @@
+# Optimization Plan: Eliminate Redundant Fence Calls Between Mvin Operations (Strategy 10)
+
+## Analysis of the Current Code
+
+The baseline code issues `gemmini_extended_mvin` for all A tiles and all B tiles sequentially. Looking at the reference pattern in `matmul_ws_mx_generic.c`, there is a `gemmini_fence()` call after **every single tile mvin**:
+
+```c
+for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+        gemmini_extended_mvin(...);
+        gemmini_fence();   // ← serializes every tile load
+    }
+}
+```
+
+However, the baseline code (the one we're optimizing) does **not** have per-tile fences, but the mvin loops are still structured as two separate sequential loops — one for A, one for B — with an implicit serialization between them. The key inefficiency is that issuing all A mvins in one pass, then a full pass of B mvins, keeps the DMA pipeline artificially separated. We can instead **batch all A-tile mvins immediately followed by all B-tile mvins without any intervening fence**, letting the hardware scoreboard manage ordering, and then issue a single `gemmini_fence()` only before the compute step.
+
+## What Strategy 10 Does
+
+Strategy 10 states: *"Issue all A-tile mvins first then immediately issue all B-tile mvins back-to-back without intervening fence, relying on hardware scoreboarding to overlap DMA with earlier-queued DMA rather than serializing with explicit synchronization points."*
+
+For the current 64×128×128 problem:
+- `tiles_I = 64/16 = 4`
+- `tiles_J = 128/16 = 8`
+- `tiles_K = 128/16 = 8`
+- A tiles: 4 × 8 = 32 tiles
+- B tiles: 8 × 8 = 64 tiles
+
+The current code issues 32 A-tile mvins then 64 B-tile mvins. The structural fix is to ensure there is **no fence between the last A mvin and the first B mvin**, and **no fence within either loop**. The hardware's RoCC command queue and DMA scoreboard are designed to accept back-to-back mvin commands and execute them in parallel where address dependencies allow. Inserting a fence forces the CPU to stall until all previously issued DMA commands complete before enqueuing the next wave — defeating the hardware's ability to overlap A-tile loads with B-tile loads.
+
+Additionally, we should add a single `gemmini_fence()` **after all mvins are issued** and **before** `gemmini_mxquant_config_mvout` + `gemmini_loop_ws_spad`, ensuring all tile data is resident in the scratchpad before compute begins.
+
+## Specific Changes
+
+1. **Remove any implicit serialization between A-loop and B-loop** — keep them as two clean back-to-back loops.
+2. **Add a single `gemmini_fence()` after all mvin commands** (both A and B) are issued and before the `gemmini_mxquant_config_mvout` + compute step.
+3. The `gemmini_config_ld` for B uses a different stride than A, so a reconfiguration is still needed between the A-loop and B-loop — but this is a single lightweight instruction, not a fence.
+
+## Resulting Code
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Issue all A-tile mvins (no fence between tiles)
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+  // Immediately issue all B-tile mvins back-to-back — no fence between A and B loops.
+  // Hardware scoreboarding overlaps A-tile DMA completion with B-tile DMA initiation.
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int j = 0; j < tiles_J; j++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin2((void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+                             b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+
+  // Single fence: wait for ALL mvin commands (A and B) to complete before compute.
+  gemmini_fence();
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+## Why This Improves Performance
+
+- **Before**: The two mvin loops are separated only by a `gemmini_config_ld` reconfiguration, which is itself a synchronizing instruction in many implementations. No explicit parallelism between A-DMA and B-DMA is exploited.
+- **After**: By using `gemmini_extended_mvin2` for B tiles (the second DMA port), both DMA channels can be active simultaneously. The hardware command queue accepts all 96 mvin commands (32 A + 64 B) without stalling, allowing the DMA engine to issue B-tile transfers as soon as A-tile slots free up in the command queue. The single fence at the end amortizes the synchronization cost across all 96 tiles rather than serializing in two waves.
+- **Expected gain**: With 96 total tile transfers and the hardware able to pipeline them, the DMA phase should approach the bandwidth-limited lower bound rather than the sum of two sequential DMA phases.

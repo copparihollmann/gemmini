@@ -1,0 +1,58 @@
+## Performance Analysis
+
+Looking at the original code, the inner mvin loops issue individual `gemmini_extended_mvin` calls with `cols=DIM=16` per call:
+
+```c
+for (int i = 0; i < tiles; i++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(..., a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+```
+
+For a 256×256×512 matmul with `BLK=256`, `DIM=16`: `tiles = 16`, `tiles_K = 32`, so **512 individual mvin commands for A** and **512 for B** per outer block — 1024 total mvin instructions per `(i0, j0)` iteration. Each command has instruction-issue overhead and causes the DMA queue to fragment with 16-column (16-byte) requests.
+
+## Selected Strategy: Batch the mvin (Strategy 2)
+
+**Batch size = 2 (cols = 32)** is the validated sweet spot per the strategy description.
+
+## Plan
+
+### For A tiles:
+The A layout is `a_base + (i * tiles_K + k) * DIM`. For a fixed `i`, successive `k` values produce **contiguous scratchpad addresses** (`...*DIM, ...*DIM+16, ...*DIM+32, ...`). We can batch pairs of consecutive `k` values:
+
+```c
+for (int i = 0; i < tiles; i++)
+  for (int k = 0; k < tiles_K; k += 2)
+    gemmini_extended_mvin(
+      (void*)(((elem_t*)A_in) + (i0*BLK + i*DIM)*MATMUL_K + k*DIM),
+      a_base + (i * tiles_K + k) * DIM,
+      2 * DIM,   // cols = 32
+      DIM);
+```
+
+The DRAM pointer advances by `k*DIM` along a row of length `MATMUL_K`, so two adjacent `k` tiles are indeed contiguous in DRAM (stride is already `MATMUL_K` bytes per row). The scratchpad address `a_base + (i*tiles_K + k)*DIM` is the start of two consecutive DIM-row slots. `cols=32 ≤ 48`, satisfying the safety constraint.
+
+Since `tiles_K = 32` is divisible by 2, no remainder handling is needed.
+
+### For B tiles:
+The B layout is `b_base + (k * tiles + j) * DIM`. For a fixed `j`, varying `k` gives non-contiguous scratchpad slots (stride = `tiles*DIM`). However, for a fixed `k`, varying `j` gives contiguous slots. We should restructure the B loop to iterate `k` in the outer loop and `j` in the inner loop, then batch on `j`:
+
+```c
+for (int k = 0; k < tiles_K; k++)
+  for (int j = 0; j < tiles; j += 2)
+    gemmini_extended_mvin(
+      (void*)(((elem_t*)B_in) + k*DIM*MATMUL_N + (j0*BLK + j*DIM)),
+      b_base + (k * tiles + j) * DIM,
+      2 * DIM,   // cols = 32
+      DIM);
+```
+
+For fixed `k`, adjacent `j` values: DRAM address `B_in + k*DIM*MATMUL_N + j0*BLK + j*DIM` — increasing `j` by 1 advances by `DIM` bytes, so two consecutive `j` tiles are contiguous in DRAM. Scratchpad address `b_base + (k*tiles + j)*DIM` — increasing `j` by 1 advances by `DIM`, so two consecutive `j` slots are also contiguous. `cols=32 ≤ 48`, safe.
+
+Since `tiles = BLK/DIM = 16` is divisible by 2, no remainder is needed.
+
+### Net effect:
+- A mvins reduced from 512 → **256** commands
+- B mvins reduced from 512 → **256** commands  
+- Total mvin instructions per outer block: 1024 → **512** (50% reduction)
+- Each command transfers 32 bytes instead of 16, improving DMA burst efficiency
+- No change to scratchpad layout, tile indexing, scale loading, compute, or readout — all other code remains identical

@@ -1,0 +1,86 @@
+Looking at the original code and the error, I need to analyze what's happening:
+
+The original code has:
+- `ti = MATMUL_M / DIM / 2` and `tj = MATMUL_N / DIM / 2` — splitting into halves
+- `SDST = 128` — destination in shared memory
+- Full A matrix (128×256) and half B matrix (256×64) loaded into scratchpad
+
+For 128×128×256 with DIM=16:
+- `tiles_I = 128/16 = 8`, `tiles_J = 128/16 = 8`, `tiles_K = 256/16 = 16`
+- But `ti = 8/2 = 4`, `tj = 8/2 = 4` — the original only computes half the output
+
+The original loops only cover half the I and J dimensions. This appears to be computing one quadrant. But the `gemmini_mx_read_smem` reads `MATMUL_M * MATMUL_N` elements — this suggests the loop should cover the full output. I need to make the code semantically equivalent while ensuring correctness.
+
+The fix: use full `tiles_I = MATMUL_M/DIM` and `tiles_J = MATMUL_N/DIM` with proper scratchpad layout, ensuring all tiles fit and bounds match.
+
+Scratchpad check: `tiles_I=8, tiles_J=8, tiles_K=16`
+- A tiles: `8*16*16 = 2048` rows
+- B tiles: `8*16*16 = 2048` rows  
+- Total: 4096 rows ≤ 8192 ✓
+
+```c
+void solution(void) {
+  {
+    int ti = MATMUL_M / DIM;
+    int tj = MATMUL_N / DIM;
+    int tk = MATMUL_K / DIM;
+    uint32_t ab = 0;
+    uint32_t bb = BANK_NUM * BANK_ROWS - tk * tj * DIM;
+    int SDST = 0;
+
+    // Step 1: Configure execution with fp6 e3m2 format, uselut=1
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+        1, 1, 0, 0, false,
+        /*act_mx_fmt*/1, /*wgt_mx_fmt*/1, /*out_mx_fmt*/3, /*uselut*/1);
+
+    // Step 2: Load scale factors (sel=0 for A, sel=1 for B)
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+    // Step 3: Load LUTs (sel=1 for A LUT, sel=0 for B LUT)
+    gemmini_mx_load_lut((uint64_t)B_lut_p, 1, 0);
+    gemmini_mx_load_lut((uint64_t)A_lut_p, 1, 1);
+
+    // Step 4: MVIN tiles of A into scratchpad
+    // A is MATMUL_M rows x MATMUL_K cols, stride = MATMUL_K * sizeof(elem_t)
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i = 0; i < ti; i++) {
+      for (int k = 0; k < tk; k++) {
+        gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in_hw) + i * DIM * MATMUL_K + k * DIM),
+            ab + (i * tk + k) * DIM,
+            DIM, DIM);
+      }
+    }
+
+    // MVIN tiles of B into scratchpad
+    // B is stored as MATMUL_K rows x (MATMUL_N/2) cols (fp6 packed)
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2);
+    for (int k = 0; k < tk; k++) {
+      for (int j = 0; j < tj; j++) {
+        gemmini_extended_mvin2(
+            (void*)(((elem_t*)B_in) + k * DIM * (MATMUL_N / 2) + j * DIM),
+            bb + (k * tj + j) * DIM,
+            DIM, DIM);
+      }
+    }
+
+    // Step 5: Configure requantized mvout with correct tile bounds
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+        /*i_bound*/ti, /*j_bound*/tj, /*k_bound*/tk,
+        /*scale_act_sel*/0, /*scale_w_sel*/0,
+        /*lut_update_granularity*/9);
+
+    // Step 6: Compute weight-stationary tiled matmul
+    gemmini_loop_ws_spad(ti, tj, tk, 0, 0, 0,
+        ab, BANK_NUM * BANK_ROWS, 0, SDST,
+        false, false, false, false, false,
+        NO_ACTIVATION, 0, 0, false, 0x38);
+
+    // Step 7: Read results from shared memory to DRAM
+    gemmini_mx_read_smem(&C_hw[0][0], SDST * 16, MATMUL_M * MATMUL_N);
+    gemmini_fence();
+  }
+}
+```

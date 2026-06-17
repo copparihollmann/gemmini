@@ -1,0 +1,98 @@
+Looking at the failing code, I need to identify the bugs:
+
+1. **Scale loading is wrong**: `gemmini_mx_load_scales` sel=0 is for A scales and sel=1 is for B scales - but the documentation says sel=0 is A (activation) and sel=1 is B (weight). The code has this correct, but let me check the scale loading logic more carefully.
+
+2. **Scale loading format**: The scales need to be loaded as a flat block. The current code loads `BLK` bytes per group per outer tile, but the scale memory layout needs to match `scale_dram + m*N_blocks + bi` indexing. The `gemmini_mx_load_scales` loads `len` bytes sequentially into the scale buffer - so we need to load all scales for the tile contiguously.
+
+3. **B matrix mvin**: Using `mvin` (port 0) for both A and B. B should use `mvin2` (port 1) for correct behavior and to match the architecture description.
+
+4. **B tile layout**: The B tile index calculation `b_base + (k * tiles + j) * DIM` should be `b_base + (j * tiles_K + k) * DIM` to match the documented layout.
+
+5. **mvin B config_ld stride**: B has stride `MATMUL_N * sizeof(elem_t)` which is correct for row-major B.
+
+6. **Scale loading**: Each `gemmini_mx_load_scales` call should load the complete scale data for the tile block. The scales should be loaded as `tiles` values (number of rows/cols in the block).
+
+Let me fix these issues:
+
+```c
+void solution(void) {
+  const int GK = MATMUL_K / 32;
+  const int tiles   = BLK / DIM;
+  const int tiles_K = MATMUL_K / DIM;
+
+  /* B sits at the top of scratchpad, growing downward */
+  const uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+  const uint32_t a_base = 0;
+  const int SPAD_DEST = 128;
+
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    int mrows = REAL_M - i0 * BLK;
+    if (mrows > BLK) mrows = BLK;
+    if (mrows <= 0) continue;
+    int pad_i = BLK - mrows;
+
+    /* Load A scales for this row-block: one e8m0 per MX block of 32 elements.
+       For each K-group g, load tiles_M = tiles row-scales starting at row i0*tiles */
+    for (int g = 0; g < GK; g++)
+      gemmini_mx_load_scales(
+          (uint64_t)(&A_scales_row[g][i0 * tiles]),
+          tiles * sizeof(uint8_t), 0);
+
+    /* MVIN A tiles: stride = MATMUL_K bytes (one row of A in elem_t units) */
+    gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+    for (int i = 0; i < tiles; i++) {
+      for (int k = 0; k < tiles_K; k++) {
+        gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM,
+            DIM, DIM);
+      }
+    }
+
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int ncols = REAL_N - j0 * BLK;
+      if (ncols > BLK) ncols = BLK;
+      if (ncols <= 0) continue;
+      int pad_j = BLK - ncols;
+
+      /* Load B scales for this col-block */
+      for (int g = 0; g < GK; g++)
+        gemmini_mx_load_scales(
+            (uint64_t)(&B_scales_col[g][j0 * tiles]),
+            tiles * sizeof(uint8_t), 1);
+
+      /* MVIN B tiles via mvin2: stride = MATMUL_N bytes */
+      gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+      for (int j = 0; j < tiles; j++) {
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin2(
+              (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+              b_base + (j * tiles_K + k) * DIM,
+              DIM, DIM);
+        }
+      }
+
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+          tiles, tiles, tiles_K, 0, 0, 1);
+
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K,
+          pad_i, pad_j, 0,
+          a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+          false, false, false, false, false,
+          NO_ACTIVATION, 0, 0, false, 0x38);
+
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(
+            &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+            SPAD_DEST * 16 + r * BLK,
+            ncols);
+      gemmini_fence();
+    }
+  }
+}
+```

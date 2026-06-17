@@ -1,0 +1,60 @@
+## Analysis of the Original Code
+
+The original code has this structure:
+1. Load all A tiles (via `gemmini_extended_mvin`, port 1 only)
+2. Load all B tiles (via `gemmini_extended_mvin`, port 1 only, sequentially after A)
+3. Configure output and compute
+
+The key inefficiency targeted by **strategy 11**: all A tiles are loaded to completion before any B tile loading begins. Both A and B use the same mvin port (`gemmini_extended_mvin`). By interleaving A loads (`gemmini_extended_mvin`) and B loads (`gemmini_extended_mvin2`) in a single loop, both DMA channels can be active simultaneously, overlapping the two sets of transfers and hiding latency.
+
+## Plan: Apply Strategy 11 — Interleave A and B Tile Loads Using mvin and mvin2
+
+### What to change
+
+**Replace the two separate nested loops** (one for A, one for B) **with a single interleaved loop** that issues one A-tile mvin (port 1) and one B-tile mvin2 (port 2) per iteration, alternating between them so both DMA channels are utilized in parallel.
+
+### Specific steps
+
+1. **Keep all setup unchanged**: `gemmini_extended3_config_ex`, `gemmini_mx_load_scales`, scratchpad layout (`a_base`, `b_base`), tile counts — all remain identical.
+
+2. **Issue a single `gemmini_config_ld` for both ports**: The stride for both A and B is `MATMUL_K * sizeof(elem_t)` bytes (same row stride for both matrices in this problem). Since both matrices have stride `MATMUL_K * 1 = 128` bytes, one `gemmini_config_ld(MATMUL_K * sizeof(elem_t))` covers both.
+
+   - If the strides differ, issue `gemmini_extended3_config_ld(..., id=0)` for port 1 (A) and `gemmini_extended3_config_ld(..., id=1)` for port 2 (B). In this kernel both strides are `MATMUL_K * sizeof(elem_t) = 128`, so one call suffices.
+
+3. **Interleave the mvin commands**: Instead of:
+   ```c
+   // All A tiles first
+   for (int i = 0; i < tiles_I; i++)
+     for (int k = 0; k < tiles_K; k++)
+       gemmini_extended_mvin(A_ptr, a_spad, DIM, DIM);
+   // Then all B tiles
+   for (int j = 0; j < tiles_J; j++)
+     for (int k = 0; k < tiles_K; k++)
+       gemmini_extended_mvin(B_ptr, b_spad, DIM, DIM);
+   ```
+   Use a single loop over the larger of `tiles_I*tiles_K` and `tiles_J*tiles_K` iterations, issuing both an A-tile (`gemmini_extended_mvin`) and a B-tile (`gemmini_extended_mvin2`) per step:
+   ```c
+   int total_A = tiles_I * tiles_K;  // 4*8 = 32
+   int total_B = tiles_J * tiles_K;  // 8*8 = 64
+   int total = (total_A > total_B) ? total_A : total_B;
+   for (int t = 0; t < total; t++) {
+     if (t < total_A) {
+       int i = t / tiles_K, k = t % tiles_K;
+       gemmini_extended_mvin(A_ptr(i,k), a_base + (i*tiles_K+k)*DIM, DIM, DIM);
+     }
+     if (t < total_B) {
+       int j = t / tiles_K, k = t % tiles_K;
+       gemmini_extended_mvin2(B_ptr(j,k), b_base + (j*tiles_K+k)*DIM, DIM, DIM);
+     }
+   }
+   ```
+   This ensures that for every A-tile command issued on port 1, a B-tile command is issued on port 2 in the same iteration, maximizing DMA channel overlap.
+
+4. **Leave everything after the mvin loops unchanged**: `gemmini_config_st`, `gemmini_mxquant_config_mvout`, `gemmini_loop_ws_spad`, `gemmini_mx_read_smem`, and `gemmini_fence()` are unmodified.
+
+### Why this works
+
+- `gemmini_extended_mvin` and `gemmini_extended_mvin2` are independent DMA ports. Issuing them in alternating pairs allows the hardware to pipeline the two streams concurrently rather than serializing them.
+- For this problem: `tiles_I=4, tiles_J=8, tiles_K=8` → 32 A-tile commands and 64 B-tile commands. The interleaved loop runs 64 iterations: first 32 issue both A and B commands, last 32 issue only B commands. This overlaps all 32 A loads with the first 32 of 64 B loads.
+- The scratchpad layout is unchanged (A at `a_base`, B at `b_base = BANK_NUM*BANK_ROWS - tiles_K*tiles_J*DIM`), so correctness is preserved.
+- No semantic change to the computation: all tiles are in scratchpad before `gemmini_loop_ws_spad` executes.

@@ -1,0 +1,493 @@
+{'correct': False, 'test_results': {0: False}, 'compiled': True, 'stdout': 'Kernel produced an INCORRECT/illegal result on spike. Diagnostic (fix this before optimizing):
+GEMMINI MVIN ILLEGAL: cols=64 overflows the 6-bit hardware num_cols field (rs2[37:32]) -> truncated to 0. Reduce block batch so cols=batch*DIM <= 63 (max block batch 3). -- RTL LoadController.sv cols field
+Gemmini extension configured with:
+dim = 16'}
+Prev latency: 1596
+New latency: N/A
+Plan: An elegant and highly effective optimization plan to address the inefficiencies of the baseline kernel.
+
+### Optimization Plan: Pipelined Output Transfers via Double-Buffered Accumulator and Scratchpad (Strategy 3)
+
+We will implement **Strategy 3: pipeline `gemmini_mx_read_smem` reads with next-tile mvin to overlap output transfer and input loading**. This approach significantly reduces execution time by keeping the Gemmini systolic array fed with compute instructions while output transfers run asynchronously in the background.
+
+#### 1. Inefficiencies in the Baseline Code:
+- **Sequential Execution**: Compute and data transfer are entirely serialized. The CPU waits for the whole matmul to finish, then blocks during `gemmini_mx_read_smem` and the final fence.
+- **High Instruction Overhead**: B-tiles are loaded individually, resulting in $16 \times 16 = 256$ independent `gemmini_extended_mvin` instructions. Since `MAX_BLOCK_LEN = 4`, we can load up to 4 contiguous tiles of size `DIM` at once.
+- **Zero Scratchpad/Accumulator Overlap**: The hardware resources are single-buffered, meaning new data cannot be loaded until the current computation and transfer are completely done.
+
+#### 2. Key Optimization Strategies:
+- **Tiling along $J$**: We will divide `tiles_J` (16) into blocks of size `J_TILE = 4`. This splits the computation into 4 blocks of $32 \times 64 \times 256$.
+- **Contiguous Block MVIN**: For each block of $J$, we will load the weights $B$ using block-based `mvin` with columns of width `4 * DIM = 64`. This reduces the number of load instructions for $B$ from 256 to 64. Similarly, we will load $A$ using 4-tile wide blocks.
+- **Double-Buffered Scratchpad**: We will split the upper scratchpad region into two buffers for $B$ (`b_bases[2] = {7168, 6144}`).
+- **Double-Buffered Accumulator/SMEM**: Since each block needs only $32 \times 64$ output elements, it occupies exactly 128 rows of the accumulator. We can perfectly double-buffer `SPAD_DEST` (`spad_dests[2] = {0, 128}`) to completely eliminate write-after-read hazards.
+- **Three-Stage Software Pipeline**: We will construct a loop with stage indicators:
+  - **Stage 1 (Load)**: Load $B$ for block `b` into scratchpad buffer `b % 2`.
+  - **Stage 2 (Compute)**: Execute the weight-stationary gemmini loop for block `b-1` writing to `spad_dests[(b-1) % 2]`.
+  - **Stage 3 (Store)**: Asynchronously stream results of block `b-2` from `spad_dests[(b-2) % 2]` in SMEM to DRAM.
+- **CPU Reconstruction**: Because the slices are non-contiguous in the final row-major DRAM buffers, each block of `gemmini_mx_read_smem` and scale-factor writes will output to contiguous temporary DRAM buffers (`C_temp` and `scale_factors_temp`). At the end of the kernel (after the `gemmini_fence()`), the CPU will assemble the final non-contiguous outputs, adding negligible overhead.
+
+---
+
+### Optimized Code Implementation
+
+```c
+// Optimized MX matmul kernel with double-buffered pipelined transfers (32x256x256, fp8:e4m3).
+void solution(void) {
+  const int J_TILE = 4;
+  int num_blocks = tiles_J / J_TILE;
+
+  // Allocate safe temporary DRAM buffers for pipelined contiguous writes
+  static uint64_t C_temp[16][MATMUL_M * 16]; 
+  static uint8_t scale_factors_temp[16][MATMUL_M * 4];
+
+  // Scratchpad partition bases
+  const int a_base = 0;
+  
+  // Double-buffered scratchpad regions for B (top of scratchpad, growing downwards)
+  const int b_size = J_TILE * tiles_K * DIM; // 4 * 16 * 16 = 1024 rows
+  const int b_bases[2] = {
+    BANK_NUM * BANK_ROWS - b_size,       // 7168
+    BANK_NUM * BANK_ROWS - 2 * b_size    // 6144
+  };
+
+  // Double-buffered accumulator destinations
+  const int spad_dests[2] = {0, 128};
+
+  // 1. Configure execution and load scale factors
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // 2. Load A tiles once using contiguous 4-tile wide blocks
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k += 4) {
+      gemmini_extended_mvin((void *)(((elem_t *)A_in) + i * DIM * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, 4 * DIM, DIM);
+    }
+  }
+
+  // 3. Pipelined Load, Compute, and Store Loop
+  for (int b = 0; b < num_blocks + 2; b++) {
+    int b_load  = b;
+    int b_comp  = b - 1;
+    int b_store = b - 2;
+
+    // --- STAGE 3: Asynchronous SMEM -> DRAM copy ---
+    if (b_store >= 0 && b_store < num_blocks) {
+      gemmini_mx_read_smem(C_temp[b_store], spad_dests[b_store % 2] * 16, MATMUL_M * J_TILE * DIM);
+    }
+
+    // --- STAGE 1: Load B tiles for next block ---
+    if (b_load >= 0 && b_load < num_blocks) {
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int k = 0; k < tiles_K; k++) {
+        elem_t *dram_ptr = ((elem_t *)B_in) + k * DIM * MATMUL_N + (b_load * J_TILE) * DIM;
+        uint32_t sp_addr = b_bases[b_load % 2] + k * J_TILE * DIM;
+        gemmini_extended_mvin(dram_ptr, sp_addr, J_TILE * DIM, DIM);
+      }
+    }
+
+    // --- STAGE 2: Compute ---
+    if (b_comp >= 0 && b_comp < num_blocks) {
+      gemmini_config_st(J_TILE * DIM / 4 * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors_temp[b_comp], tiles_I, J_TILE, tiles_K, 0, 0, 1);
+      
+      gemmini_loop_ws_spad(tiles_I, J_TILE, tiles_K, PAD_I, PAD_J, PAD_K,
+                           a_base, b_bases[b_comp % 2] + b_size, 0, spad_dests[b_comp % 2],
+                           false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    }
+  }
+
+  // 4. Synchronization barrier
+  gemmini_fence();
+
+  // 5. CPU reconstruction of output buffers from contiguous temporary copies
+  for (int b = 0; b < num_blocks; b++) {
+    for (int i = 0; i < MATMUL_M; i++) {
+      // Re-assemble C_hw
+      for (int col = 0; col < J_TILE * 4; col++) {
+        C_hw[i][b * (J_TILE * 4) + col] = C_temp[b][i * (J_TILE * 4) + col];
+      }
+      // Re-assemble scale factors
+      for (int col = 0; col < J_TILE; col++) {
+        ((uint8_t *)scale_factors)[i * tiles_J + b * J_TILE + col] = scale_factors_temp[b][i * J_TILE + col];
+      }
+    }
+  }
+}
+```
+
+CodeCandidate(parent=CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED baseline MX matmul kernel (32x256x256, fp8:e4m3).
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // mvin FULL padded tiles (block-aligned DIMxDIM -> 1 cheap DMA/tile; sub-DIM mvin is modeled
+  // as a slow/unaligned path on spike). The header holds padded data; loop_ws pad_I/pad_J/pad_K
+  // then skip the padded rows/cols in COMPUTE, so the real M*N*K result is unaffected.
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K
+  for (int i = 0; i < tiles_I; i++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+  // B tile (k,j) = B_in[k][j] (stride N) into scratchpad slot (k*tiles_J + j) —
+  // the layout gemmini\'s MX loop reads (B_t = B_sp + (k*TJ + j)*DIM). The old
+  // (j*tiles_K + k) slot was a transpose: correct only when N==K, garbage otherwise.
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+  for (int j = 0; j < tiles_J; j++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + j * DIM),
+                            b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, PAD_I, PAD_J, PAD_K, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  // read only the REAL rows (smem row stride is the padded MATMUL_N); padded rows stay 0 (memset).
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, REAL_M * MATMUL_N);
+  gemmini_fence();
+}
+''',
+score=1596,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'Accelerator-bound: compute and data-movement look balanced; tune tiling / scratchpad occupancy for more overlap.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''An elegant and effective plan is to apply **Strategy 2: Assign B tiles to a fixed high-address scratchpad region to enable weight-stationary reuse across I tiles**.
+
+### Analysis of Inefficiencies
+In the baseline code, the scratchpad utilization is reported as 0KB because `a_base` and `b_base` are not properly defined and allocated in the scratchpad. Without explicit partitioning, the hardware cannot safely manage spatial reuse, leading to redundant memory accesses and lower systolic array utilization. 
+
+With $M=32$, $N=256$, and $K=256$, the tile dimensions are:
+- $\text{tiles}_I = 32 / 16 = 2$
+- $\text{tiles}_J = 256 / 16 = 16$
+- $\text{tiles}_K = 256 / 16 = 16$
+
+The total scratchpad capacity is 8192 rows ($\text{BANK\_NUM} \times \text{BANK\_ROWS} = 4 \times 2048$). 
+- A tiles require $\text{tiles}_I \times \text{tiles}_K \times \text{DIM} = 2 \times 16 \times 16 = 512$ rows.
+- B tiles require $\text{tiles}_J \times \text{tiles}_K \times \text{DIM} = 16 \times 16 \times 16 = 4096$ rows.
+- Combined requirement is $512 + 4096 = 4608$ rows, which fits comfortably within the 8192-row scratchpad limit.
+
+By explicitly partitioning the scratchpad, we can store all B tiles at the high-address end of the scratchpad, allowing them to remain resident and be reused across different I-tiles during weight-stationary execution.
+
+---
+
+### Step-by-Step Optimization Plan
+
+1. **Calculate and Define Scratchpad Bases:**
+   * Define `a_base` as `0` at the start of `solution()`.
+   * Define `b_base` as `BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM` to place B tiles at the very top of the scratchpad, growing downward. This prevents any overlap with A tiles.
+
+2. **Load A Tiles into Scratchpad:**
+   * Iterate over `tiles_I` and `tiles_K`.
+   * Stream A tiles from DRAM into the scratchpad at the address `a_base + (i * tiles_K + k) * DIM`.
+
+3. **Load B Tiles into High Scratchpad Region:**
+   * Iterate over `tiles_J` and `tiles_K`.
+   * Stream B tiles from DRAM into the scratchpad at `b_base + (j * tiles_K + k) * DIM`. This matches Rule 12\'s layout requirement to ensure correct indexing in hardware during compute.
+
+4. **Invoke Compute with Partitioned Scratchpad:**
+   * Call `gemmini_loop_ws_spad` using `a_base` as the A base address, and the top boundary sentinel `BANK_NUM * BANK_ROWS` (which is 8192) as the B limit.
+   * This partition enables the hardware fused loop to automatically reuse loaded weights and minimize DRAM traffic.''',
+code='''// AUTO-GENERATED baseline MX matmul kernel (32x256x256, fp8:e4m3).
+void solution(void) {
+  // Calculate scratchpad partition bases
+  const int a_base = 0;
+  const int b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+
+  // Ensure no overlap between A and B regions
+  if (a_base + tiles_I * tiles_K * DIM > b_base) {
+    // Handle error or adjust tiling strategy
+    return;
+  }
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Load A tiles
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin((void *)(((elem_t *)A_in) + i * DIM * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    }
+  }
+
+  // Load B tiles into high scratchpad region for reuse
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin((void *)(((elem_t *)B_in) + k * DIM * MATMUL_N + j * DIM),
+                            b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+    }
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  
+  // Use partitioned scratchpad for compute
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, PAD_I, PAD_J, PAD_K,
+                       a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                       false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+                       
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, REAL_M * MATMUL_N);
+  gemmini_fence();
+}
+''',
+score=1596,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'Accelerator-bound: compute and data-movement look balanced; tune tiling / scratchpad occupancy for more overlap.'],
+plan_gen_model='gemini-3.5-flash',
+code_gen_model='qwen.qwen3-coder-480b-a35b-v1:0',
+stdout=None,
+stderr=None),
+plan='''An elegant and highly effective optimization plan to address the inefficiencies of the baseline kernel.
+
+### Optimization Plan: Pipelined Output Transfers via Double-Buffered Accumulator and Scratchpad (Strategy 3)
+
+We will implement **Strategy 3: pipeline `gemmini_mx_read_smem` reads with next-tile mvin to overlap output transfer and input loading**. This approach significantly reduces execution time by keeping the Gemmini systolic array fed with compute instructions while output transfers run asynchronously in the background.
+
+#### 1. Inefficiencies in the Baseline Code:
+- **Sequential Execution**: Compute and data transfer are entirely serialized. The CPU waits for the whole matmul to finish, then blocks during `gemmini_mx_read_smem` and the final fence.
+- **High Instruction Overhead**: B-tiles are loaded individually, resulting in $16 \times 16 = 256$ independent `gemmini_extended_mvin` instructions. Since `MAX_BLOCK_LEN = 4`, we can load up to 4 contiguous tiles of size `DIM` at once.
+- **Zero Scratchpad/Accumulator Overlap**: The hardware resources are single-buffered, meaning new data cannot be loaded until the current computation and transfer are completely done.
+
+#### 2. Key Optimization Strategies:
+- **Tiling along $J$**: We will divide `tiles_J` (16) into blocks of size `J_TILE = 4`. This splits the computation into 4 blocks of $32 \times 64 \times 256$.
+- **Contiguous Block MVIN**: For each block of $J$, we will load the weights $B$ using block-based `mvin` with columns of width `4 * DIM = 64`. This reduces the number of load instructions for $B$ from 256 to 64. Similarly, we will load $A$ using 4-tile wide blocks.
+- **Double-Buffered Scratchpad**: We will split the upper scratchpad region into two buffers for $B$ (`b_bases[2] = {7168, 6144}`).
+- **Double-Buffered Accumulator/SMEM**: Since each block needs only $32 \times 64$ output elements, it occupies exactly 128 rows of the accumulator. We can perfectly double-buffer `SPAD_DEST` (`spad_dests[2] = {0, 128}`) to completely eliminate write-after-read hazards.
+- **Three-Stage Software Pipeline**: We will construct a loop with stage indicators:
+  - **Stage 1 (Load)**: Load $B$ for block `b` into scratchpad buffer `b % 2`.
+  - **Stage 2 (Compute)**: Execute the weight-stationary gemmini loop for block `b-1` writing to `spad_dests[(b-1) % 2]`.
+  - **Stage 3 (Store)**: Asynchronously stream results of block `b-2` from `spad_dests[(b-2) % 2]` in SMEM to DRAM.
+- **CPU Reconstruction**: Because the slices are non-contiguous in the final row-major DRAM buffers, each block of `gemmini_mx_read_smem` and scale-factor writes will output to contiguous temporary DRAM buffers (`C_temp` and `scale_factors_temp`). At the end of the kernel (after the `gemmini_fence()`), the CPU will assemble the final non-contiguous outputs, adding negligible overhead.
+
+---
+
+### Optimized Code Implementation
+
+```c
+// Optimized MX matmul kernel with double-buffered pipelined transfers (32x256x256, fp8:e4m3).
+void solution(void) {
+  const int J_TILE = 4;
+  int num_blocks = tiles_J / J_TILE;
+
+  // Allocate safe temporary DRAM buffers for pipelined contiguous writes
+  static uint64_t C_temp[16][MATMUL_M * 16]; 
+  static uint8_t scale_factors_temp[16][MATMUL_M * 4];
+
+  // Scratchpad partition bases
+  const int a_base = 0;
+  
+  // Double-buffered scratchpad regions for B (top of scratchpad, growing downwards)
+  const int b_size = J_TILE * tiles_K * DIM; // 4 * 16 * 16 = 1024 rows
+  const int b_bases[2] = {
+    BANK_NUM * BANK_ROWS - b_size,       // 7168
+    BANK_NUM * BANK_ROWS - 2 * b_size    // 6144
+  };
+
+  // Double-buffered accumulator destinations
+  const int spad_dests[2] = {0, 128};
+
+  // 1. Configure execution and load scale factors
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // 2. Load A tiles once using contiguous 4-tile wide blocks
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k += 4) {
+      gemmini_extended_mvin((void *)(((elem_t *)A_in) + i * DIM * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, 4 * DIM, DIM);
+    }
+  }
+
+  // 3. Pipelined Load, Compute, and Store Loop
+  for (int b = 0; b < num_blocks + 2; b++) {
+    int b_load  = b;
+    int b_comp  = b - 1;
+    int b_store = b - 2;
+
+    // --- STAGE 3: Asynchronous SMEM -> DRAM copy ---
+    if (b_store >= 0 && b_store < num_blocks) {
+      gemmini_mx_read_smem(C_temp[b_store], spad_dests[b_store % 2] * 16, MATMUL_M * J_TILE * DIM);
+    }
+
+    // --- STAGE 1: Load B tiles for next block ---
+    if (b_load >= 0 && b_load < num_blocks) {
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int k = 0; k < tiles_K; k++) {
+        elem_t *dram_ptr = ((elem_t *)B_in) + k * DIM * MATMUL_N + (b_load * J_TILE) * DIM;
+        uint32_t sp_addr = b_bases[b_load % 2] + k * J_TILE * DIM;
+        gemmini_extended_mvin(dram_ptr, sp_addr, J_TILE * DIM, DIM);
+      }
+    }
+
+    // --- STAGE 2: Compute ---
+    if (b_comp >= 0 && b_comp < num_blocks) {
+      gemmini_config_st(J_TILE * DIM / 4 * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors_temp[b_comp], tiles_I, J_TILE, tiles_K, 0, 0, 1);
+      
+      gemmini_loop_ws_spad(tiles_I, J_TILE, tiles_K, PAD_I, PAD_J, PAD_K,
+                           a_base, b_bases[b_comp % 2] + b_size, 0, spad_dests[b_comp % 2],
+                           false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    }
+  }
+
+  // 4. Synchronization barrier
+  gemmini_fence();
+
+  // 5. CPU reconstruction of output buffers from contiguous temporary copies
+  for (int b = 0; b < num_blocks; b++) {
+    for (int i = 0; i < MATMUL_M; i++) {
+      // Re-assemble C_hw
+      for (int col = 0; col < J_TILE * 4; col++) {
+        C_hw[i][b * (J_TILE * 4) + col] = C_temp[b][i * (J_TILE * 4) + col];
+      }
+      // Re-assemble scale factors
+      for (int col = 0; col < J_TILE; col++) {
+        ((uint8_t *)scale_factors)[i * tiles_J + b * J_TILE + col] = scale_factors_temp[b][i * J_TILE + col];
+      }
+    }
+  }
+}
+```''',
+code='''// Optimized MX matmul kernel with double-buffered pipelined transfers (32x256x256, fp8:e4m3).
+void solution(void) {
+  const int J_TILE = 4; // Process 4 N-tiles (64 columns) at a time
+  const int num_blocks = tiles_J / J_TILE; // 16 / 4 = 4 blocks
+
+  // Temporary DRAM buffers for pipelined, contiguous outputs
+  static uint64_t C_temp[16][MATMUL_M * 16]; // Max 4 blocks * 64 columns = 256 cols
+  static uint8_t scale_factors_temp[16][MATMUL_M * 4]; // 4 scale groups per block
+
+  // Scratchpad layout
+  const int a_base = 0;
+  const int b_tile_size = J_TILE * tiles_K * DIM; // 4 * 16 * 16 = 1024 rows per buffer
+  const int b_bases[2] = {
+    BANK_NUM * BANK_ROWS - b_tile_size,       // Buffer 0: 8192 - 1024 = 7168
+    BANK_NUM * BANK_ROWS - 2 * b_tile_size    // Buffer 1: 8192 - 2048 = 6144
+  };
+  // Ensure no overlap between A and B regions
+  if (a_base + tiles_I * tiles_K * DIM > b_bases[1]) {
+    return; // Handle error or adjust tiling
+  }
+
+  // Accumulator/SMEM double-buffering
+  const int spad_dests[2] = {0, 128}; // Each block uses 32*64/16 = 128 acc rows
+
+  // --- PHASE 1: One-time Configuration and A Loading ---
+
+  // Configure execution for FP8->BF16, weight-stationary
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                              /*C_stride*/1, /*A_stride*/1,
+                              /*A_transpose*/0, /*B_transpose*/0,
+                              /*set_only_strides*/false,
+                              /*act_mx_fmt*/0, /*wgt_mx_fmt*/0, /*out_mx_fmt*/3, /*uselut*/0);
+
+  // Load global scale factors (done once)
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), /*sel*/0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), /*sel*/1);
+
+  // Load A tiles into scratchpad (fully reuse A)
+  // Use MAX_BLOCK_LEN=4 to reduce mvin calls: load 4 K-tiles at once
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) { // MAX_BLOCK_LEN = 4
+      int block_len = (k + MAX_BLOCK_LEN > tiles_K) ? (tiles_K - k) : MAX_BLOCK_LEN;
+      gemmini_extended_mvin((void *)(((elem_t *)A_in) + i * DIM * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM,
+                            block_len * DIM, DIM);
+    }
+  }
+
+  // --- PHASE 2: Pipelined Load, Compute, Store Loop ---
+
+  // We pipeline 3 stages: Load(B), Compute, Store(C)
+  // We iterate `num_blocks + 2` times to drain the pipeline
+  for (int b = 0; b < num_blocks + 2; b++) {
+    const int b_load  = b;
+    const int b_comp  = b - 1;
+    const int b_store = b - 2;
+
+    // --- STAGE 3: Store (Asynchronous SMEM -> DRAM) ---
+    if (b_store >= 0 && b_store < num_blocks) {
+      gemmini_mx_read_smem((uint64_t)C_temp[b_store],
+                           spad_dests[b_store % 2] * 16, // 16 words/row
+                           MATMUL_M * J_TILE * DIM); // 32 * 64 BF16 vals = 2048 u16 = 1024 u64
+    }
+
+    // --- STAGE 1: Load B tiles for next compute stage ---
+    if (b_load >= 0 && b_load < num_blocks) {
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int k = 0; k < tiles_K; k++) {
+        elem_t *dram_ptr = ((elem_t *)B_in) + k * DIM * MATMUL_N + (b_load * J_TILE) * DIM;
+        uint32_t sp_addr = b_bases[b_load % 2] + k * J_TILE * DIM;
+        // Load a full J_TILE-wide strip of B for this K-tile
+        gemmini_extended_mvin(dram_ptr, sp_addr, J_TILE * DIM, DIM);
+      }
+    }
+
+    // --- STAGE 2: Compute (MatMul on scratchpad data) ---
+    if (b_comp >= 0 && b_comp < num_blocks) {
+      // Configure output store for this block\'s width
+      gemmini_config_st(J_TILE * DIM / 4 * sizeof(out_t)); // 4 BF16/u64
+      // Configure requantizer for this block\'s bounds
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors_temp[b_comp],
+                                   /*i_bound*/tiles_I,
+                                   /*j_bound*/J_TILE, // Crucial: only this block\'s J-size
+                                   /*k_bound*/tiles_K,
+                                   /*scale_act_sel*/0, /*scale_w_sel*/0,
+                                   /*lut_update_granularity*/1);
+
+      // Execute the fused matmul loop on pre-loaded data
+      gemmini_loop_ws_spad(/*I*/tiles_I, /*J*/J_TILE, /*K*/tiles_K,
+                           /*pad_I*/PAD_I, /*pad_J*/0, /*pad_K*/PAD_K,
+                           /*A*/a_base,
+                           /*B*/b_bases[b_comp % 2] + b_tile_size, // B end addr
+                           /*D*/0, /*C*/spad_dests[b_comp % 2], // Double-buffered C
+                           /*A_transpose*/false, /*B_transpose*/false,
+                           /*full_C*/false, /*low_D*/false, /*ex_accumulate*/false,
+                           /*act*/NO_ACTIVATION,
+                           /*a_spad_id*/0, /*b_spad_id*/0, /*is_resadd*/false,
+                           /*skips*/0x38);
+    }
+  }
+
+  // --- PHASE 3: Final Synchronization and CPU-side Reconstruction ---
+
+  // Wait for all outstanding MX_READ_SMEM operations to complete
+  gemmini_fence();
+
+  // Reconstruct final non-contiguous outputs from temporary contiguous buffers
+  for (int b = 0; b < num_blocks; b++) {
+    for (int i = 0; i < MATMUL_M; i++) {
+      // Re-assemble C_hw: copy 64 columns from temp to final non-contiguous location
+      for (int j = 0; j < J_TILE * DIM; j++) { // J_TILE * 16 = 64
+        C_hw[i][b * (J_TILE * DIM) + j] = C_temp[b][i * (J_TILE * DIM) + j];
+      }
+      // Re-assemble scale_factors: copy 4 scale groups
+      for (int j = 0; j < J_TILE; j++) {
+        ((uint8_t *)scale_factors)[i * tiles_J + b * J_TILE + j] =
+            scale_factors_temp[b][i * J_TILE + j];
+      }
+    }
+  }
+}
+''',
+score=None,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='gemini-3.5-flash',
+code_gen_model='qwen.qwen3-coder-480b-a35b-v1:0',
+stdout=None,
+stderr=None)

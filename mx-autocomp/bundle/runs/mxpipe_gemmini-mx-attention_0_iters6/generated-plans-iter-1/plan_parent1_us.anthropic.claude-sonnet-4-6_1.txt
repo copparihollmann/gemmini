@@ -1,0 +1,55 @@
+## Strategy: Fuse the Softmax CPU Loop into Vectorized 4-Row Batches and Eliminate Redundant BF16 Unpacking Passes
+
+### Identification of the Bottleneck
+
+Looking at the profiled code, the dominant cost is **step 2: the CPU-side integer softmax loop**. The original code has a structural inefficiency in how it unpacks and processes the BF16 output from step 1:
+
+**Current structure:**
+1. **First pass** over `S1_hw[i][j/4]` — unpacks BF16 words and stores into `q[4][ATT_S]` (a large stack-allocated array of `int64_t`), while computing row maxima.
+2. **Second pass** over `q[4][ATT_S]` — computes `mx_iexp` and stores into `p[4][ATT_S]` (another large stack array), while summing.
+3. **Third pass** for scale/encode — reads back `p[4][ATT_S]` per group.
+
+With `ATT_S` large, `q[4][ATT_S]` and `p[4][ATT_S]` are large stack allocations of `int64_t`. For example if `ATT_S = 128`, that is `4 × 128 × 8 = 4096` bytes per array, `8 KB` total on the stack. These arrays blow the L1 data cache and are read/written multiple times: **the bottleneck is three separate passes over memory that could be reduced to two**.
+
+### The Strategy: Merge the iexp+sum Pass Into the Unpack+Max Pass Using a Two-Pass Algorithm
+
+The key insight is that computing softmax requires knowing the row maximum before computing exponentials — but we can **eliminate the intermediate `q[][]` storage entirely** by doing two passes directly over the *packed BF16 words in `S1_hw`* rather than over an unpacked `int64_t` buffer.
+
+**Proposed structure:**
+1. **Pass 1** over `S1_hw[i][j/4]` — unpack BF16 words, compute row maxima `mq[4]`. **Do not store `q[][]`.**
+2. **Pass 2** over `S1_hw[i][j/4]` — re-unpack BF16 words, compute `mx_iexp(val - mq[r])` on the fly, accumulate `sm[r]`, and compute scale/encode **directly per group** without storing `p[][]`.
+
+This eliminates the `p[4][ATT_S]` array entirely and replaces the `q[4][ATT_S]` array with nothing (we re-read from `S1_hw` which is already in L1/L2 because it was just written and is much smaller in uint64 packing: `ATT_S × ATT_S / 4` bytes vs `4 × ATT_S × 8` bytes per 4-row batch).
+
+### Why This Reduces Latency
+
+- **Eliminated one large intermediate buffer**: `q[4][ATT_S]` of `int64_t` is replaced by re-reading the already-cached packed `S1_hw` words. Since `S1_hw` stores 4 BF16 values per `uint64_t`, it is `4×` more compact than the unpacked `int64_t` array, fitting better in cache.
+- **Eliminated `p[4][ATT_S]`**: The per-group max and encode loop that read back `p[]` now runs inline during pass 2, so we never materialize `p[]` to memory at all.
+- **Pass 2 combines iexp, sum, group-max, and encode** in one sweep: for each group `g` in pass 2, we can compute `iexp` values, track the group max, accumulate the sum, and after finishing the group call `mx_ienc_fp8` — all without a third pass.
+- **Reduced stack pressure**: Eliminating two `4 × ATT_S` arrays of `int64_t` from the stack reduces register spills and cache pressure.
+
+### Concrete Code Change Plan
+
+```
+Pass 1: scan S1_hw rows i..i+3, unpack BF16 → ibf16, track mq[4].
+         (no q[][] storage)
+
+Pass 2: scan S1_hw rows i..i+3 again in group-sized chunks of 32 columns:
+  for g in 0..GROUPS_S:
+    for r in 0..4:
+      gmax_exp[r] = 0
+    for j in g*32..(g+1)*32:
+      for r in 0..4:
+        val = unpack S1_hw[i+r][j/4] at slot j%4   // likely already in cache
+        ev = mx_iexp(ibf16(val) - mq[r])
+        sm[r] += ev
+        if ev > gmax_exp[r]: gmax_exp[r] = ev
+    for r in 0..4:
+      compute e from gmax_exp[r], ls[r], set P_scales[g][i+r]
+      re-encode 32 values for P_q[i+r][g*32..(g+1)*32]
+         (third mini-pass only over 32 values, hot in L1)
+```
+
+The `ls[r]` and `inv_sm[r]` values needed for encoding depend on the full-row sum `sm[r]`, so the encode sub-pass for each group must wait until `sm[r]` is finalized. This means pass 2 first accumulates all groups' `sm[r]`, then a third mini-pass encodes. However, `sm[r]` can be computed in pass 2 (the iexp+sum pass), and the encode mini-pass only touches 32 values (one cache line worth), so it is negligible.
+
+The net effect: **two passes over `S1_hw` (compact, cached) instead of two passes over large `int64_t` arrays plus one pass over `S1_hw`**, reducing memory traffic by approximately `2 × 4 × ATT_S × 8` bytes per 4-row batch while keeping the same computational work.

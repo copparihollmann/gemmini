@@ -1,0 +1,1182 @@
+{'correct': False}
+Prev latency: 759108
+New latency: N/A
+Plan: ### Optimization Plan
+
+**Selected Strategy:** Strategy 9 (Accelerate the `mx_ilog2` function by replacing the software bit-scanning loop with the RISC-V Zbb `clz` instruction).
+
+#### Inefficiency Analysis
+In the CPU-bound I-BERT softmax step, the log-2 of 64-bit integer values (`sm` and `gmax`) is calculated for every row using the `mx_ilog2` function. The baseline implementation of `mx_ilog2` relies on a software-based bit-scanning loop that repeatedly shifts the value and increments a counter. This introduces substantial branch and instruction overhead inside the critical path of the softmax function.
+
+Since the underlying RISC-V processor supports the Bitmanip (Zbb) extension (as evidenced by the existing `zext.h` inline assembly), we can replace the software loop with a native `clz` (count leading zeros) hardware instruction. For a non-zero 64-bit unsigned integer $x$, its floor log2 is exactly `63 - clz(x)`. This reduces the log2 calculation from a multi-cycle loop to just one hardware instruction plus a subtraction.
+
+#### Refactoring Steps
+1. **Implement `mx_ilog2_fast`**: Create an inline helper function that checks if the input is `0` (returning `0` to match the baseline behavior) and otherwise uses inline assembly to execute the RISC-V Zbb `clz` instruction.
+2. **Replace calls in softmax**: Substitute all occurrences of `mx_ilog2` with `mx_ilog2_fast` inside the softmax loop.
+
+---
+
+### Optimized Code
+
+```c
+#include <stdint.h>
+#include "include/gemmini_testutils.h"
+
+// Fast hardware-accelerated ilog2 using RISC-V Zbb 'clz' instruction
+static inline int mx_ilog2_fast(uint64_t x) {
+  if (x == 0) return 0;
+  uint64_t leading_zeros;
+  asm ("clz %0, %1" : "=r"(leading_zeros) : "r"(x));
+  return 63 - leading_zeros;
+}
+
+// AUTO-GENERATED MHA kernel with optimized RISC-V Bitmanip BF16 unpacking.
+void solution(void) {
+  for (int h = 0; h < ATT_H; h++) {
+    int kv = h / (ATT_H / ATT_HKV);
+    const elem_t *Q_in = Qs[h];  const uint8_t *Q_sc = Qss[h];
+    const elem_t *KT_in = KTs[kv]; const uint8_t *KT_sc = KTss[kv];
+    const elem_t *V_in = Vs[kv];  const uint8_t *V_sc = Vss[kv];
+
+    // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+    {
+      int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)Q_sc, QSS_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)KT_sc, QSS_BYTES, 1);
+      gemmini_config_ld(ATT_D * sizeof(elem_t));
+      for (int i = 0; i < tiles_I; i++) {
+        for (int k = 0; k < tiles_K; k += 2) {
+          int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+        }
+      }
+      gemmini_config_ld(ATT_S * sizeof(elem_t));   // B=KT[D][S] stride N=S
+      for (int k = 0; k < tiles_K; k++) {
+        for (int j = 0; j < tiles_J; j += 2) {
+          int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                                b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+        }
+      }
+      gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+      gemmini_fence();
+    }
+
+    // ---- 2) FLOAT-FREE integer softmax + fp8 requant (I-BERT iexp) ----
+    for (int i = 0; i < ATT_S; i++) {
+      int64_t q[ATT_S];
+      int64_t mq = -((int64_t)1 << 62);
+      for (int j = 0; j < ATT_S; j += 4) {
+        uint64_t w = S1_hw[i][j / 4];
+        uint64_t r0, r1, r2, r3;
+
+        // Perform parallel extraction of 4x 16-bit halfwords from the 64-bit value using Bitmanip 'zext.h'
+        asm (
+            "zext.h %0, %4
+\t"
+            "srli %1, %4, 16
+\t"
+            "zext.h %1, %1
+\t"
+            "srli %2, %4, 32
+\t"
+            "zext.h %2, %2
+\t"
+            "srli %3, %4, 48"
+            : "=&r"(r0), "=&r"(r1), "=&r"(r2), "=&r"(r3)
+            : "r"(w)
+        );
+
+        // Process unpacked values (l = 0)
+        {
+          int col = j + 0;
+#if ATT_CAUSAL
+          if (col > i) {
+            q[col] = -((int64_t)1 << 62);
+          } else {
+#endif
+            int64_t qq = mx_ibf16_to_q((uint16_t)r0);
+            q[col] = qq;
+            if (qq > mq) mq = qq;
+#if ATT_CAUSAL
+          }
+#endif
+        }
+
+        // Process unpacked values (l = 1)
+        {
+          int col = j + 1;
+#if ATT_CAUSAL
+          if (col > i) {
+            q[col] = -((int64_t)1 << 62);
+          } else {
+#endif
+            int64_t qq = mx_ibf16_to_q((uint16_t)r1);
+            q[col] = qq;
+            if (qq > mq) mq = qq;
+#if ATT_CAUSAL
+          }
+#endif
+        }
+
+        // Process unpacked values (l = 2)
+        {
+          int col = j + 2;
+#if ATT_CAUSAL
+          if (col > i) {
+            q[col] = -((int64_t)1 << 62);
+          } else {
+#endif
+            int64_t qq = mx_ibf16_to_q((uint16_t)r2);
+            q[col] = qq;
+            if (qq > mq) mq = qq;
+#if ATT_CAUSAL
+          }
+#endif
+        }
+
+        // Process unpacked values (l = 3)
+        {
+          int col = j + 3;
+#if ATT_CAUSAL
+          if (col > i) {
+            q[col] = -((int64_t)1 << 62);
+          } else {
+#endif
+            int64_t qq = mx_ibf16_to_q((uint16_t)r3);
+            q[col] = qq;
+            if (qq > mq) mq = qq;
+#if ATT_CAUSAL
+          }
+#endif
+        }
+      }
+
+      int64_t p[ATT_S];
+      int64_t sm = 0;
+      int64_t gmax_arr[GROUPS_S];
+      for (int g = 0; g < GROUPS_S; g++) {
+        int64_t gmax = 0;
+        for (int j = g * 32; j < (g + 1) * 32; j++) {
+          int64_t pv = mx_iexp(q[j] - mq);
+          p[j] = pv;
+          sm += pv;
+          if (pv > gmax) gmax = pv;
+        }
+        gmax_arr[g] = gmax;
+      }
+      // Optimized using RISC-V Bitmanip clz
+      int ls = mx_ilog2_fast((uint64_t)sm);
+      uint64_t inv_sm = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;
+      for (int g = 0; g < GROUPS_S; g++) {
+        int64_t gmax = gmax_arr[g];
+        if (gmax == 0) {
+          P_scales[g][i] = 0;
+          for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = 0;
+          continue;
+        }
+        // Optimized using RISC-V Bitmanip clz
+        int e = mx_ilog2_fast((uint64_t)gmax) - ls - MX_P_TARGET_LOG2;
+        P_scales[g][i] = (uint8_t)(e + 127);
+        for (int j = g * 32; j < (g + 1) * 32; j++) {
+          P_q[i][j] = mx_ienc_fp8(p[j], inv_sm, ls, e);
+        }
+      }
+    }
+
+    // ---- 3) O = P @ V on Gemmini (bf16 out) ----
+    {
+      int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+      gemmini_mx_load_scales((uint64_t)V_sc, VSS_BYTES, 1);
+      gemmini_config_ld(ATT_S * sizeof(elem_t));
+      for (int i = 0; i < tiles_I; i++) {
+        for (int k = 0; k < tiles_K; k += 2) {
+          int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+        }
+      }
+      gemmini_config_ld(ATT_D * sizeof(elem_t));   // B=V[S][D] stride N=D
+      for (int k = 0; k < tiles_K; k++) {
+        for (int j = 0; j < tiles_J; j += 2) {
+          int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                                b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+        }
+      }
+      gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      gemmini_mx_read_smem(&O_hw[h][0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+      gemmini_fence();
+    }
+  }
+}
+```
+
+CodeCandidate(parent=CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED baseline MHA kernel (S=64, D=64, H=4, H_kv=2, causal=0, fp8:e4m3).
+void solution(void) {
+  for (int h = 0; h < ATT_H; h++) {
+    int kv = h / (ATT_H / ATT_HKV);
+    const elem_t *Q_in = Qs[h];  const uint8_t *Q_sc = Qss[h];
+    const elem_t *KT_in = KTs[kv]; const uint8_t *KT_sc = KTss[kv];
+    const elem_t *V_in = Vs[kv];  const uint8_t *V_sc = Vss[kv];
+  // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)Q_sc, QSS_BYTES, 0);
+    gemmini_mx_load_scales((uint64_t)KT_sc, QSS_BYTES, 1);
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) { int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM); }
+    gemmini_config_ld(ATT_S * sizeof(elem_t));   // B=KT[D][S] stride N=S -> slot (k*tiles_J+j)
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) { int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM); }
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+    gemmini_fence();
+  }
+
+  // ---- 2) FLOAT-FREE integer softmax + fp8 requant (I-BERT iexp; host has no FPU) ----
+  for (int i = 0; i < ATT_S; i++) {
+    int64_t q[ATT_S];
+    int64_t mq = -((int64_t)1 << 62);
+    for (int j = 0; j < ATT_S; j += 4) {                       // unpack 4 bf16/word -> Q(1/1024) int + max
+      uint64_t w = S1_hw[i][j / 4];
+      for (int l = 0; l < 4; l++) {
+#if ATT_CAUSAL
+        if (j + l > i) { q[j + l] = -((int64_t)1 << 62); continue; }   // causal: future col -> iexp()=0
+#endif
+        int64_t qq = mx_ibf16_to_q((uint16_t)((w >> (l * 16)) & 0xFFFF));
+        q[j + l] = qq; if (qq > mq) mq = qq;
+      }
+    }
+    int64_t p[ATT_S];
+    int64_t sm = 0;
+    int64_t gmax_arr[GROUPS_S];                                // fused group-max: capture per-group max IN the iexp pass
+    for (int g = 0; g < GROUPS_S; g++) {                       // (group-nested, register-scalar gmax) -> removes the
+      int64_t gmax = 0;                                        // separate 16384-elem max scan. Output bit-identical.
+      for (int j = g * 32; j < (g + 1) * 32; j++) { int64_t pv = mx_iexp(q[j] - mq); p[j] = pv; sm += pv; if (pv > gmax) gmax = pv; }
+      gmax_arr[g] = gmax;
+    }
+    int ls = mx_ilog2((uint64_t)sm);
+    uint64_t inv_sm = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;   // one rounded reciprocal/row
+    for (int g = 0; g < GROUPS_S; g++) {
+      int64_t gmax = gmax_arr[g];
+      if (gmax == 0) { P_scales[g][i] = 0; for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = 0; continue; }
+      // group e8m0 scale so the group-max lands at ~2^MX_P_TARGET_LOG2 (moderate; avoids e4 overflow)
+      int e = mx_ilog2((uint64_t)gmax) - ls - MX_P_TARGET_LOG2;
+      P_scales[g][i] = (uint8_t)(e + 127);
+      for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = mx_ienc_fp8(p[j], inv_sm, ls, e);
+    }
+  }
+
+  // ---- 3) O = P @ V on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+    gemmini_mx_load_scales((uint64_t)V_sc, VSS_BYTES, 1);
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) { int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM); }
+    gemmini_config_ld(ATT_D * sizeof(elem_t));   // B=V[S][D] stride N=D -> slot (k*tiles_J+j)
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) { int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM); }
+    gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[h][0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+    gemmini_fence();
+  }
+  }
+}
+''',
+score=786929,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'Accelerator-bound: compute and data-movement look balanced; tune tiling / scratchpad occupancy for more overlap.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''### Optimization Plan
+
+We will apply **Strategy 2: RISC-V Bitmanip (B-extension) assembly for BF16 unpacking** to accelerate the extraction of individual 16-bit BF16 elements from the 64-bit packed words.
+
+1. **Identify the Bottleneck**: In the second stage of the attention block (softmax + fp8 requantization), the host CPU loops over the attention matrix row-by-row and extracts 4 BF16 values from each 64-bit word `S1_hw[i][j / 4]`. This extraction uses a loop (`for (int l = 0; l < 4; l++)`) with shift (`>>`) and masking (`& 0xFFFF`) operations.
+2. **Apply RISC-V B-Extension Assembly**: 
+   - We will manually unroll the inner loop of size 4.
+   - We will replace the shifts and masks with highly optimized inline assembly utilizing the RISC-V Bitmanip extension instruction `zext.h` (Zero-extend Halfword) along with standard logical right shifts (`srli`). This extracts all four 16-bit halfwords into registers in parallel with minimal instruction overhead.
+3. **Preserve Functionality and Constraints**:
+   - All Gemmini configurations, scale loading sequences, and memory fence sequences remain identical to guarantee bit-exact output.
+   - The causal masking behavior `#if ATT_CAUSAL` is fully preserved.
+
+---
+
+### Optimized Code
+
+```c
+#include <stdint.h>
+#include "include/gemmini_testutils.h"
+
+// AUTO-GENERATED MHA kernel with optimized RISC-V Bitmanip BF16 unpacking.
+void solution(void) {
+  for (int h = 0; h < ATT_H; h++) {
+    int kv = h / (ATT_H / ATT_HKV);
+    const elem_t *Q_in = Qs[h];  const uint8_t *Q_sc = Qss[h];
+    const elem_t *KT_in = KTs[kv]; const uint8_t *KT_sc = KTss[kv];
+    const elem_t *V_in = Vs[kv];  const uint8_t *V_sc = Vss[kv];
+
+    // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+    {
+      int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)Q_sc, QSS_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)KT_sc, QSS_BYTES, 1);
+      gemmini_config_ld(ATT_D * sizeof(elem_t));
+      for (int i = 0; i < tiles_I; i++) {
+        for (int k = 0; k < tiles_K; k += 2) {
+          int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+        }
+      }
+      gemmini_config_ld(ATT_S * sizeof(elem_t));   // B=KT[D][S] stride N=S
+      for (int k = 0; k < tiles_K; k++) {
+        for (int j = 0; j < tiles_J; j += 2) {
+          int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                                b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+        }
+      }
+      gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+      gemmini_fence();
+    }
+
+    // ---- 2) FLOAT-FREE integer softmax + fp8 requant (I-BERT iexp) ----
+    for (int i = 0; i < ATT_S; i++) {
+      int64_t q[ATT_S];
+      int64_t mq = -((int64_t)1 << 62);
+      for (int j = 0; j < ATT_S; j += 4) {
+        uint64_t w = S1_hw[i][j / 4];
+        uint64_t r0, r1, r2, r3;
+
+        // Perform parallel extraction of 4x 16-bit halfwords from the 64-bit value using Bitmanip \'zext.h\'
+        asm (
+            "zext.h %0, %4\n\t"
+            "srli %1, %4, 16\n\t"
+            "zext.h %1, %1\n\t"
+            "srli %2, %4, 32\n\t"
+            "zext.h %2, %2\n\t"
+            "srli %3, %4, 48"
+            : "=&r"(r0), "=&r"(r1), "=&r"(r2), "=&r"(r3)
+            : "r"(w)
+        );
+
+        // Process unpacked values (l = 0)
+        {
+          int col = j + 0;
+#if ATT_CAUSAL
+          if (col > i) {
+            q[col] = -((int64_t)1 << 62);
+          } else {
+#endif
+            int64_t qq = mx_ibf16_to_q((uint16_t)r0);
+            q[col] = qq;
+            if (qq > mq) mq = qq;
+#if ATT_CAUSAL
+          }
+#endif
+        }
+
+        // Process unpacked values (l = 1)
+        {
+          int col = j + 1;
+#if ATT_CAUSAL
+          if (col > i) {
+            q[col] = -((int64_t)1 << 62);
+          } else {
+#endif
+            int64_t qq = mx_ibf16_to_q((uint16_t)r1);
+            q[col] = qq;
+            if (qq > mq) mq = qq;
+#if ATT_CAUSAL
+          }
+#endif
+        }
+
+        // Process unpacked values (l = 2)
+        {
+          int col = j + 2;
+#if ATT_CAUSAL
+          if (col > i) {
+            q[col] = -((int64_t)1 << 62);
+          } else {
+#endif
+            int64_t qq = mx_ibf16_to_q((uint16_t)r2);
+            q[col] = qq;
+            if (qq > mq) mq = qq;
+#if ATT_CAUSAL
+          }
+#endif
+        }
+
+        // Process unpacked values (l = 3)
+        {
+          int col = j + 3;
+#if ATT_CAUSAL
+          if (col > i) {
+            q[col] = -((int64_t)1 << 62);
+          } else {
+#endif
+            int64_t qq = mx_ibf16_to_q((uint16_t)r3);
+            q[col] = qq;
+            if (qq > mq) mq = qq;
+#if ATT_CAUSAL
+          }
+#endif
+        }
+      }
+
+      int64_t p[ATT_S];
+      int64_t sm = 0;
+      int64_t gmax_arr[GROUPS_S];
+      for (int g = 0; g < GROUPS_S; g++) {
+        int64_t gmax = 0;
+        for (int j = g * 32; j < (g + 1) * 32; j++) {
+          int64_t pv = mx_iexp(q[j] - mq);
+          p[j] = pv;
+          sm += pv;
+          if (pv > gmax) gmax = pv;
+        }
+        gmax_arr[g] = gmax;
+      }
+      int ls = mx_ilog2((uint64_t)sm);
+      uint64_t inv_sm = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;
+      for (int g = 0; g < GROUPS_S; g++) {
+        int64_t gmax = gmax_arr[g];
+        if (gmax == 0) {
+          P_scales[g][i] = 0;
+          for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = 0;
+          continue;
+        }
+        int e = mx_ilog2((uint64_t)gmax) - ls - MX_P_TARGET_LOG2;
+        P_scales[g][i] = (uint8_t)(e + 127);
+        for (int j = g * 32; j < (g + 1) * 32; j++) {
+          P_q[i][j] = mx_ienc_fp8(p[j], inv_sm, ls, e);
+        }
+      }
+    }
+
+    // ---- 3) O = P @ V on Gemmini (bf16 out) ----
+    {
+      int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+      gemmini_mx_load_scales((uint64_t)V_sc, VSS_BYTES, 1);
+      gemmini_config_ld(ATT_S * sizeof(elem_t));
+      for (int i = 0; i < tiles_I; i++) {
+        for (int k = 0; k < tiles_K; k += 2) {
+          int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+        }
+      }
+      gemmini_config_ld(ATT_D * sizeof(elem_t));   // B=V[S][D] stride N=D
+      for (int k = 0; k < tiles_K; k++) {
+        for (int j = 0; j < tiles_J; j += 2) {
+          int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                                b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+        }
+      }
+      gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      gemmini_mx_read_smem(&O_hw[h][0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+      gemmini_fence();
+    }
+  }
+}
+```''',
+code='''#include <stdint.h>
+#include "include/gemmini_testutils.h"
+
+// AUTO-GENERATED MHA kernel with optimized RISC-V Bitmanip BF16 unpacking.
+void solution(void) {
+  for (int h = 0; h < ATT_H; h++) {
+    int kv = h / (ATT_H / ATT_HKV);
+    const elem_t *Q_in = Qs[h];  const uint8_t *Q_sc = Qss[h];
+    const elem_t *KT_in = KTs[kv]; const uint8_t *KT_sc = KTss[kv];
+    const elem_t *V_in = Vs[kv];  const uint8_t *V_sc = Vss[kv];
+
+    // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+    {
+      int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)Q_sc, QSS_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)KT_sc, QSS_BYTES, 1);
+      gemmini_config_ld(ATT_D * sizeof(elem_t));
+      for (int i = 0; i < tiles_I; i++) {
+        for (int k = 0; k < tiles_K; k += 2) {
+          int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+        }
+      }
+      gemmini_config_ld(ATT_S * sizeof(elem_t));   // B=KT[D][S] stride N=S
+      for (int k = 0; k < tiles_K; k++) {
+        for (int j = 0; j < tiles_J; j += 2) {
+          int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                                b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+        }
+      }
+      gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+      gemmini_fence();
+    }
+
+    // ---- 2) FLOAT-FREE integer softmax + fp8 requant (I-BERT iexp) ----
+    for (int i = 0; i < ATT_S; i++) {
+      int64_t q[ATT_S];
+      int64_t mq = -((int64_t)1 << 62);
+      for (int j = 0; j < ATT_S; j += 4) {
+        uint64_t w = S1_hw[i][j / 4];
+        uint64_t r0, r1, r2, r3;
+
+        // Perform parallel extraction of 4x 16-bit halfwords from the 64-bit value using Bitmanip \'zext.h\'
+        asm (
+            "zext.h %0, %4\n\t"
+            "srli %1, %4, 16\n\t"
+            "zext.h %1, %1\n\t"
+            "srli %2, %4, 32\n\t"
+            "zext.h %2, %2\n\t"
+            "srli %3, %4, 48"
+            : "=&r"(r0), "=&r"(r1), "=&r"(r2), "=&r"(r3)
+            : "r"(w)
+        );
+
+        // Process unpacked values (l = 0)
+        {
+          int col = j + 0;
+#if ATT_CAUSAL
+          if (col > i) {
+            q[col] = -((int64_t)1 << 62);
+          } else {
+#endif
+            int64_t qq = mx_ibf16_to_q((uint16_t)r0);
+            q[col] = qq;
+            if (qq > mq) mq = qq;
+#if ATT_CAUSAL
+          }
+#endif
+        }
+
+        // Process unpacked values (l = 1)
+        {
+          int col = j + 1;
+#if ATT_CAUSAL
+          if (col > i) {
+            q[col] = -((int64_t)1 << 62);
+          } else {
+#endif
+            int64_t qq = mx_ibf16_to_q((uint16_t)r1);
+            q[col] = qq;
+            if (qq > mq) mq = qq;
+#if ATT_CAUSAL
+          }
+#endif
+        }
+
+        // Process unpacked values (l = 2)
+        {
+          int col = j + 2;
+#if ATT_CAUSAL
+          if (col > i) {
+            q[col] = -((int64_t)1 << 62);
+          } else {
+#endif
+            int64_t qq = mx_ibf16_to_q((uint16_t)r2);
+            q[col] = qq;
+            if (qq > mq) mq = qq;
+#if ATT_CAUSAL
+          }
+#endif
+        }
+
+        // Process unpacked values (l = 3)
+        {
+          int col = j + 3;
+#if ATT_CAUSAL
+          if (col > i) {
+            q[col] = -((int64_t)1 << 62);
+          } else {
+#endif
+            int64_t qq = mx_ibf16_to_q((uint16_t)r3);
+            q[col] = qq;
+            if (qq > mq) mq = qq;
+#if ATT_CAUSAL
+          }
+#endif
+        }
+      }
+
+      int64_t p[ATT_S];
+      int64_t sm = 0;
+      int64_t gmax_arr[GROUPS_S];
+      for (int g = 0; g < GROUPS_S; g++) {
+        int64_t gmax = 0;
+        for (int j = g * 32; j < (g + 1) * 32; j++) {
+          int64_t pv = mx_iexp(q[j] - mq);
+          p[j] = pv;
+          sm += pv;
+          if (pv > gmax) gmax = pv;
+        }
+        gmax_arr[g] = gmax;
+      }
+      int ls = mx_ilog2((uint64_t)sm);
+      uint64_t inv_sm = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;
+      for (int g = 0; g < GROUPS_S; g++) {
+        int64_t gmax = gmax_arr[g];
+        if (gmax == 0) {
+          P_scales[g][i] = 0;
+          for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = 0;
+          continue;
+        }
+        int e = mx_ilog2((uint64_t)gmax) - ls - MX_P_TARGET_LOG2;
+        P_scales[g][i] = (uint8_t)(e + 127);
+        for (int j = g * 32; j < (g + 1) * 32; j++) {
+          P_q[i][j] = mx_ienc_fp8(p[j], inv_sm, ls, e);
+        }
+      }
+    }
+
+    // ---- 3) O = P @ V on Gemmini (bf16 out) ----
+    {
+      int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+      gemmini_mx_load_scales((uint64_t)V_sc, VSS_BYTES, 1);
+      gemmini_config_ld(ATT_S * sizeof(elem_t));
+      for (int i = 0; i < tiles_I; i++) {
+        for (int k = 0; k < tiles_K; k += 2) {
+          int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+        }
+      }
+      gemmini_config_ld(ATT_D * sizeof(elem_t));   // B=V[S][D] stride N=D
+      for (int k = 0; k < tiles_K; k++) {
+        for (int j = 0; j < tiles_J; j += 2) {
+          int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                                b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+        }
+      }
+      gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      gemmini_mx_read_smem(&O_hw[h][0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+      gemmini_fence();
+    }
+  }
+}
+''',
+score=759108,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'Accelerator-bound: compute and data-movement look balanced; tune tiling / scratchpad occupancy for more overlap.'],
+plan_gen_model='gemini-3.5-flash',
+code_gen_model='qwen.qwen3-coder-480b-a35b-v1:0',
+stdout=None,
+stderr=None),
+plan='''### Optimization Plan
+
+**Selected Strategy:** Strategy 9 (Accelerate the `mx_ilog2` function by replacing the software bit-scanning loop with the RISC-V Zbb `clz` instruction).
+
+#### Inefficiency Analysis
+In the CPU-bound I-BERT softmax step, the log-2 of 64-bit integer values (`sm` and `gmax`) is calculated for every row using the `mx_ilog2` function. The baseline implementation of `mx_ilog2` relies on a software-based bit-scanning loop that repeatedly shifts the value and increments a counter. This introduces substantial branch and instruction overhead inside the critical path of the softmax function.
+
+Since the underlying RISC-V processor supports the Bitmanip (Zbb) extension (as evidenced by the existing `zext.h` inline assembly), we can replace the software loop with a native `clz` (count leading zeros) hardware instruction. For a non-zero 64-bit unsigned integer $x$, its floor log2 is exactly `63 - clz(x)`. This reduces the log2 calculation from a multi-cycle loop to just one hardware instruction plus a subtraction.
+
+#### Refactoring Steps
+1. **Implement `mx_ilog2_fast`**: Create an inline helper function that checks if the input is `0` (returning `0` to match the baseline behavior) and otherwise uses inline assembly to execute the RISC-V Zbb `clz` instruction.
+2. **Replace calls in softmax**: Substitute all occurrences of `mx_ilog2` with `mx_ilog2_fast` inside the softmax loop.
+
+---
+
+### Optimized Code
+
+```c
+#include <stdint.h>
+#include "include/gemmini_testutils.h"
+
+// Fast hardware-accelerated ilog2 using RISC-V Zbb \'clz\' instruction
+static inline int mx_ilog2_fast(uint64_t x) {
+  if (x == 0) return 0;
+  uint64_t leading_zeros;
+  asm ("clz %0, %1" : "=r"(leading_zeros) : "r"(x));
+  return 63 - leading_zeros;
+}
+
+// AUTO-GENERATED MHA kernel with optimized RISC-V Bitmanip BF16 unpacking.
+void solution(void) {
+  for (int h = 0; h < ATT_H; h++) {
+    int kv = h / (ATT_H / ATT_HKV);
+    const elem_t *Q_in = Qs[h];  const uint8_t *Q_sc = Qss[h];
+    const elem_t *KT_in = KTs[kv]; const uint8_t *KT_sc = KTss[kv];
+    const elem_t *V_in = Vs[kv];  const uint8_t *V_sc = Vss[kv];
+
+    // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+    {
+      int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)Q_sc, QSS_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)KT_sc, QSS_BYTES, 1);
+      gemmini_config_ld(ATT_D * sizeof(elem_t));
+      for (int i = 0; i < tiles_I; i++) {
+        for (int k = 0; k < tiles_K; k += 2) {
+          int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+        }
+      }
+      gemmini_config_ld(ATT_S * sizeof(elem_t));   // B=KT[D][S] stride N=S
+      for (int k = 0; k < tiles_K; k++) {
+        for (int j = 0; j < tiles_J; j += 2) {
+          int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                                b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+        }
+      }
+      gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+      gemmini_fence();
+    }
+
+    // ---- 2) FLOAT-FREE integer softmax + fp8 requant (I-BERT iexp) ----
+    for (int i = 0; i < ATT_S; i++) {
+      int64_t q[ATT_S];
+      int64_t mq = -((int64_t)1 << 62);
+      for (int j = 0; j < ATT_S; j += 4) {
+        uint64_t w = S1_hw[i][j / 4];
+        uint64_t r0, r1, r2, r3;
+
+        // Perform parallel extraction of 4x 16-bit halfwords from the 64-bit value using Bitmanip \'zext.h\'
+        asm (
+            "zext.h %0, %4\n\t"
+            "srli %1, %4, 16\n\t"
+            "zext.h %1, %1\n\t"
+            "srli %2, %4, 32\n\t"
+            "zext.h %2, %2\n\t"
+            "srli %3, %4, 48"
+            : "=&r"(r0), "=&r"(r1), "=&r"(r2), "=&r"(r3)
+            : "r"(w)
+        );
+
+        // Process unpacked values (l = 0)
+        {
+          int col = j + 0;
+#if ATT_CAUSAL
+          if (col > i) {
+            q[col] = -((int64_t)1 << 62);
+          } else {
+#endif
+            int64_t qq = mx_ibf16_to_q((uint16_t)r0);
+            q[col] = qq;
+            if (qq > mq) mq = qq;
+#if ATT_CAUSAL
+          }
+#endif
+        }
+
+        // Process unpacked values (l = 1)
+        {
+          int col = j + 1;
+#if ATT_CAUSAL
+          if (col > i) {
+            q[col] = -((int64_t)1 << 62);
+          } else {
+#endif
+            int64_t qq = mx_ibf16_to_q((uint16_t)r1);
+            q[col] = qq;
+            if (qq > mq) mq = qq;
+#if ATT_CAUSAL
+          }
+#endif
+        }
+
+        // Process unpacked values (l = 2)
+        {
+          int col = j + 2;
+#if ATT_CAUSAL
+          if (col > i) {
+            q[col] = -((int64_t)1 << 62);
+          } else {
+#endif
+            int64_t qq = mx_ibf16_to_q((uint16_t)r2);
+            q[col] = qq;
+            if (qq > mq) mq = qq;
+#if ATT_CAUSAL
+          }
+#endif
+        }
+
+        // Process unpacked values (l = 3)
+        {
+          int col = j + 3;
+#if ATT_CAUSAL
+          if (col > i) {
+            q[col] = -((int64_t)1 << 62);
+          } else {
+#endif
+            int64_t qq = mx_ibf16_to_q((uint16_t)r3);
+            q[col] = qq;
+            if (qq > mq) mq = qq;
+#if ATT_CAUSAL
+          }
+#endif
+        }
+      }
+
+      int64_t p[ATT_S];
+      int64_t sm = 0;
+      int64_t gmax_arr[GROUPS_S];
+      for (int g = 0; g < GROUPS_S; g++) {
+        int64_t gmax = 0;
+        for (int j = g * 32; j < (g + 1) * 32; j++) {
+          int64_t pv = mx_iexp(q[j] - mq);
+          p[j] = pv;
+          sm += pv;
+          if (pv > gmax) gmax = pv;
+        }
+        gmax_arr[g] = gmax;
+      }
+      // Optimized using RISC-V Bitmanip clz
+      int ls = mx_ilog2_fast((uint64_t)sm);
+      uint64_t inv_sm = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;
+      for (int g = 0; g < GROUPS_S; g++) {
+        int64_t gmax = gmax_arr[g];
+        if (gmax == 0) {
+          P_scales[g][i] = 0;
+          for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = 0;
+          continue;
+        }
+        // Optimized using RISC-V Bitmanip clz
+        int e = mx_ilog2_fast((uint64_t)gmax) - ls - MX_P_TARGET_LOG2;
+        P_scales[g][i] = (uint8_t)(e + 127);
+        for (int j = g * 32; j < (g + 1) * 32; j++) {
+          P_q[i][j] = mx_ienc_fp8(p[j], inv_sm, ls, e);
+        }
+      }
+    }
+
+    // ---- 3) O = P @ V on Gemmini (bf16 out) ----
+    {
+      int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+      gemmini_mx_load_scales((uint64_t)V_sc, VSS_BYTES, 1);
+      gemmini_config_ld(ATT_S * sizeof(elem_t));
+      for (int i = 0; i < tiles_I; i++) {
+        for (int k = 0; k < tiles_K; k += 2) {
+          int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+        }
+      }
+      gemmini_config_ld(ATT_D * sizeof(elem_t));   // B=V[S][D] stride N=D
+      for (int k = 0; k < tiles_K; k++) {
+        for (int j = 0; j < tiles_J; j += 2) {
+          int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                                b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+        }
+      }
+      gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      gemmini_mx_read_smem(&O_hw[h][0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+      gemmini_fence();
+    }
+  }
+}
+```''',
+code='''#include <stdint.h>
+#include "include/gemmini_testutils.h"
+
+// Fast hardware-accelerated ilog2 using RISC-V Zbb \'clz\' instruction
+static inline int mx_ilog2_fast(uint64_t x) {
+  if (x == 0) return 0;
+  uint64_t leading_zeros;
+  asm ("clz %0, %1" : "=r"(leading_zeros) : "r"(x));
+  return 63 - leading_zeros;
+}
+
+// AUTO-GENERATED MHA kernel with optimized RISC-V Bitmanip BF16 unpacking.
+void solution(void) {
+  for (int h = 0; h < ATT_H; h++) {
+    int kv = h / (ATT_H / ATT_HKV);
+    const elem_t *Q_in = Qs[h];  const uint8_t *Q_sc = Qss[h];
+    const elem_t *KT_in = KTs[kv]; const uint8_t *KT_sc = KTss[kv];
+    const elem_t *V_in = Vs[kv];  const uint8_t *V_sc = Vss[kv];
+
+    // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+    {
+      int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)Q_sc, QSS_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)KT_sc, QSS_BYTES, 1);
+      gemmini_config_ld(ATT_D * sizeof(elem_t));
+      for (int i = 0; i < tiles_I; i++) {
+        for (int k = 0; k < tiles_K; k += 2) {
+          int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+        }
+      }
+      gemmini_config_ld(ATT_S * sizeof(elem_t));   // B=KT[D][S] stride N=S
+      for (int k = 0; k < tiles_K; k++) {
+        for (int j = 0; j < tiles_J; j += 2) {
+          int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                                b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+        }
+      }
+      gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+      gemmini_fence();
+    }
+
+    // ---- 2) FLOAT-FREE integer softmax + fp8 requant (I-BERT iexp) ----
+    for (int i = 0; i < ATT_S; i++) {
+      int64_t q[ATT_S];
+      int64_t mq = -((int64_t)1 << 62);
+      for (int j = 0; j < ATT_S; j += 4) {
+        uint64_t w = S1_hw[i][j / 4];
+        uint64_t r0, r1, r2, r3;
+
+        // Perform parallel extraction of 4x 16-bit halfwords from the 64-bit value using Bitmanip \'zext.h\'
+        asm (
+            "zext.h %0, %4\n\t"
+            "srli %1, %4, 16\n\t"
+            "zext.h %1, %1\n\t"
+            "srli %2, %4, 32\n\t"
+            "zext.h %2, %2\n\t"
+            "srli %3, %4, 48"
+            : "=&r"(r0), "=&r"(r1), "=&r"(r2), "=&r"(r3)
+            : "r"(w)
+        );
+
+        // Process unpacked values (l = 0)
+        {
+          int col = j + 0;
+#if ATT_CAUSAL
+          if (col > i) {
+            q[col] = -((int64_t)1 << 62);
+          } else {
+#endif
+            int64_t qq = mx_ibf16_to_q((uint16_t)r0);
+            q[col] = qq;
+            if (qq > mq) mq = qq;
+#if ATT_CAUSAL
+          }
+#endif
+        }
+
+        // Process unpacked values (l = 1)
+        {
+          int col = j + 1;
+#if ATT_CAUSAL
+          if (col > i) {
+            q[col] = -((int64_t)1 << 62);
+          } else {
+#endif
+            int64_t qq = mx_ibf16_to_q((uint16_t)r1);
+            q[col] = qq;
+            if (qq > mq) mq = qq;
+#if ATT_CAUSAL
+          }
+#endif
+        }
+
+        // Process unpacked values (l = 2)
+        {
+          int col = j + 2;
+#if ATT_CAUSAL
+          if (col > i) {
+            q[col] = -((int64_t)1 << 62);
+          } else {
+#endif
+            int64_t qq = mx_ibf16_to_q((uint16_t)r2);
+            q[col] = qq;
+            if (qq > mq) mq = qq;
+#if ATT_CAUSAL
+          }
+#endif
+        }
+
+        // Process unpacked values (l = 3)
+        {
+          int col = j + 3;
+#if ATT_CAUSAL
+          if (col > i) {
+            q[col] = -((int64_t)1 << 62);
+          } else {
+#endif
+            int64_t qq = mx_ibf16_to_q((uint16_t)r3);
+            q[col] = qq;
+            if (qq > mq) mq = qq;
+#if ATT_CAUSAL
+          }
+#endif
+        }
+      }
+
+      int64_t p[ATT_S];
+      int64_t sm = 0;
+      int64_t gmax_arr[GROUPS_S];
+      for (int g = 0; g < GROUPS_S; g++) {
+        int64_t gmax = 0;
+        for (int j = g * 32; j < (g + 1) * 32; j++) {
+          int64_t pv = mx_iexp(q[j] - mq);
+          p[j] = pv;
+          sm += pv;
+          if (pv > gmax) gmax = pv;
+        }
+        gmax_arr[g] = gmax;
+      }
+      // Use standard library function if custom function is not available
+      int ls = (sm == 0) ? 0 : 63 - __builtin_clzl((unsigned long)sm);
+      uint64_t inv_sm = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;
+      for (int g = 0; g < GROUPS_S; g++) {
+        int64_t gmax = gmax_arr[g];
+        if (gmax == 0) {
+          P_scales[g][i] = 0;
+          for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = 0;
+          continue;
+        }
+        // Use standard library function for ilog2
+        int e = ((gmax == 0) ? 0 : 63 - __builtin_clzl((unsigned long)gmax)) - ls - MX_P_TARGET_LOG2;
+        P_scales[g][i] = (uint8_t)(e + 127);
+        for (int j = g * 32; j < (g + 1) * 32; j++) {
+          P_q[i][j] = mx_ienc_fp8(p[j], inv_sm, ls, e);
+        }
+      }
+    }
+
+    // ---- 3) O = P @ V on Gemmini (bf16 out) ----
+    {
+      int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+      gemmini_mx_load_scales((uint64_t)V_sc, VSS_BYTES, 1);
+      gemmini_config_ld(ATT_S * sizeof(elem_t));
+      for (int i = 0; i < tiles_I; i++) {
+        for (int k = 0; k < tiles_K; k += 2) {
+          int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+        }
+      }
+      gemmini_config_ld(ATT_D * sizeof(elem_t));   // B=V[S][D] stride N=D
+      for (int k = 0; k < tiles_K; k++) {
+        for (int j = 0; j < tiles_J; j += 2) {
+          int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                                b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+        }
+      }
+      gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      gemmini_mx_read_smem(&O_hw[h][0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+      gemmini_fence();
+    }
+  }
+}
+''',
+score=inf,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='gemini-3.5-flash',
+code_gen_model='qwen.qwen3-coder-480b-a35b-v1:0',
+stdout="auto_comp_test.c:(.text.startup+0x53c): undefined reference to `mx_ilog2_fast'\n/scratch/agustin/projects/chipyard-mx/.conda-env/riscv-tools/bin/../lib/gcc/riscv64-unknown-elf/13.2.0/../../../../riscv64-unknown-elf/bin/ld: auto_comp_test.c:(.text.startup+0x5e2): undefined reference to `mx_ilog2_fast'\ncollect2: error: ld returned 1 exit status\nmake[1]: *** [/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/Makefile:145: auto_comp_test-baremetal] Error 1\nmake: *** [Makefile:20: bareMetalC] Error 2\n3602 |         const acc_t qc = c / (a*bert_scale*bert_scale);\n|                          ^\n/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/auto_comp_test.c: In function 'main':\n/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/auto_comp_test.c:517:16: warning: implicit declaration of function 'mx_ilog2_fast'; did you mean 'mx_ilog2'? [-Wimplicit-function-declaration]\n517 |       int ls = mx_ilog2_fast((uint64_t)sm);\n|                ^~~~~~~~~~~~~\n|                mx_ilog2\n/scratch/agustin/projects/chipyard-mx/.conda-env/riscv-tools/bin/../lib/gcc/riscv64-unknown-elf/13.2.0/../../../../riscv64-unknown-elf/bin/ld: warning: auto_comp_test-baremetal has a LOAD segment with RWX permissions\n/scratch/agustin/projects/chipyard-mx/.conda-env/riscv-tools/bin/../lib/gcc/riscv64-unknown-elf/13.2.0/../../../../riscv64-unknown-elf/bin/ld: /tmp/ccpBkoeJ.o: in function `main':\nmake[1]: Leaving directory '/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/bareMetalC'",
+stderr=None)

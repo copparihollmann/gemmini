@@ -1,0 +1,124 @@
+## Analysis
+
+The current code iterates over `(i0, j0)` output blocks. For each `(i0, j0)` pair, it:
+1. Calls `gemmini_flush(0)` — expensive
+2. Re-issues `gemmini_extended3_config_ex` — redundant across iterations
+3. Copies scale factors via `memcpy` into staging buffers `A_s` and `B_s`
+4. Re-issues `gemmini_mx_load_scales` for both A and B — re-loads scales every iteration
+5. Mvins A tiles for the current `i0` block
+6. Mvins B tiles for the current `j0` block
+7. Runs the hardware loop
+
+**Key inefficiency:** B tiles are loaded fresh for every `(i0, j0)` pair. For a fixed `j0`, B tiles are **identical** across all `i0` iterations. The strategy to apply is **strategy 5: reuse loaded B (weight) tiles across multiple I-tile iterations without re-mvin**.
+
+## Plan: Reuse B Tiles Across I-tile Iterations (Strategy 5)
+
+### Current loop structure
+```
+for i0 in BLOCKS_M:
+  for j0 in BLOCKS_N:
+    flush + config + load_scales(A[i0], B[j0]) + mvin_A[i0] + mvin_B[j0] + compute
+```
+
+### Problem
+For each `j0`, the B tiles at `b_base + (k * tiles + j) * DIM` are identical regardless of `i0`. They are re-loaded `BLOCKS_M` times unnecessarily.
+
+### Fix: Swap loop order to `j0` outer, `i0` inner
+
+By making `j0` the outer loop and `i0` the inner loop:
+- Load B tiles **once per `j0`** into the scratchpad
+- For each `i0` within that `j0`: only load A tiles and run compute
+- B tiles remain in scratchpad across all `i0` iterations for the same `j0`
+
+### Scale factor handling
+
+The A scales vary per `i0`, B scales vary per `j0`. With the swapped loop:
+- `gemmini_mx_load_scales` for B is called **once per `j0`** (hoisted outside `i0` loop)
+- `gemmini_mx_load_scales` for A is called **once per `i0`** (inside inner loop)
+
+Both must be re-issued before each `gemmini_loop_ws_spad` per the programming model. However, since B scales don't change within the `i0` loop, we still must re-issue them before each compute call (programming model requirement). But we can avoid the `memcpy` staging for B scales outside the inner loop.
+
+More importantly, `gemmini_flush` must be moved outside both loops — it is only needed once to reset hardware state.
+
+### Scratchpad layout check
+
+For a given `j0`, B occupies `tiles * tiles_K * DIM` rows at the top. A occupies `tiles * tiles_K * DIM` rows at `a_base = 0`. Total = `2 * tiles * tiles_K * DIM`. With `tiles = BLK/DIM` and `tiles_K = MATMUL_K/DIM`, this is the same as before — no constraint violation.
+
+### Summary of changes
+
+1. Move `gemmini_flush(0)` and `gemmini_extended3_config_ex` **outside both loops** (issued once)
+2. Swap loop order: `j0` becomes outer, `i0` becomes inner
+3. Load B scales staging (`memcpy` for `B_s`) and **mvin B tiles once per `j0`** (before `i0` loop)
+4. Inside `i0` loop: only stage `A_s`, call `gemmini_mx_load_scales` for both A and B (B scales don't change within `i0` — but the programming model requires both to be issued before each `loop_ws_spad`; B_s pointer is stable so this is cheap), mvin A tiles, then compute
+5. This eliminates `BLOCKS_M - 1` redundant B mvin sequences per `j0`, reducing total B mvin calls from `BLOCKS_M * BLOCKS_N` to `BLOCKS_N`
+
+Here is the rewritten code:
+
+```c
+void solution(void) {
+  // Flush and configure once outside all loops
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  int tiles = BLK / DIM;
+  int tiles_K = MATMUL_K / DIM;
+  uint32_t a_base = 0;
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+  int SPAD_DEST = 128;
+
+  // Outer loop over J (weight/B blocks) — B tiles loaded once per j0
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+    // Stage B scale factors for this j0 (done once per j0)
+    for (int g = 0; g < MATMUL_K / 32; g++)
+      memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+
+    // MVIN B tiles once for this j0
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+    for (int j = 0; j < tiles; j++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                              b_base + (k * tiles + j) * DIM, DIM, DIM);
+
+    // Inner loop over I (activation/A blocks) — B tiles reused from scratchpad
+    for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      // Stage A scale factors for this i0
+      for (int g = 0; g < MATMUL_K / 32; g++)
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+
+      // Load scales: A (sel=0) and B (sel=1) must both be issued before loop_ws_spad
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      // MVIN A tiles for this i0
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+      // Configure output and compute
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      if (mrows == BLK && ncols == BLK) {
+        gemmini_mx_read_smem(&C_hw[i0 * BLK][j0 * BLK / BF16_PER_WORD],
+                             SPAD_DEST * 16, BLK * BLK);
+      } else {
+        for (int r = 0; r < mrows; r++)
+          gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                               SPAD_DEST * 16 + r * BLK, ncols);
+      }
+    }
+  }
+  gemmini_fence();
+}
+```

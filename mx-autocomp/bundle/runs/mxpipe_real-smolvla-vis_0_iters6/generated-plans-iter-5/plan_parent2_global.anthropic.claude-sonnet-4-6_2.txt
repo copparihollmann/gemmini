@@ -1,0 +1,82 @@
+## Analysis of the Current Code
+
+The current code has this structure:
+```
+for i0 in BLOCKS_M:
+    memcpy A scales (hoisted outside j0)
+    for j0 in BLOCKS_N:
+        memcpy B scales
+        gemmini_flush + config + load_scales(A) + load_scales(B)
+        mvin A tiles (tiles × tiles_K individual mvin calls)
+        mvin B tiles (tiles × tiles_K individual mvin calls)
+        config_st + mxquant_config_mvout
+        loop_ws_spad
+        for r in mrows: gemmini_mx_read_smem(...)  ← one call per row
+        gemmini_fence()
+```
+
+The `gemmini_mx_read_smem` is called **once per row** (`mrows` times per output tile), where `mrows` can be up to `BLK` rows. This means up to `BLK` separate RoCC commands just to drain results, when a single bulk call covering all rows at once would suffice.
+
+## Selected Strategy: Strategy 6 — Replace row-by-row `gemmini_mx_read_smem` with a single bulk call
+
+### Why This Strategy
+
+The current code issues `mrows` separate `gemmini_mx_read_smem` calls per `(i0, j0)` block:
+```c
+for (int r = 0; r < mrows; r++)
+    gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                         SPAD_DEST * 16 + r * BLK, ncols);
+```
+
+Each call drains `ncols` BF16 elements from one row. The `mx_smem` layout is row-major with `BLK` BF16 elements per row (stride = `BLK` words). Since `C_hw` is also a contiguous 2D array with row stride `MATMUL_N / BF16_PER_WORD` (i.e., `MATMUL_N` BF16 elements per row), we need to check whether the output rows in DRAM are contiguous enough to batch.
+
+Looking at the smem offsets: row `r` starts at `SPAD_DEST * 16 + r * BLK` (words). The total contiguous region from row 0 through row `mrows-1` spans `mrows * BLK` words. Similarly in DRAM, `C_hw[i0*BLK + r][(j0*BLK)/BF16_PER_WORD]` for consecutive `r` values are separated by `MATMUL_N` BF16 elements = one full row of `C_hw`.
+
+Since `ncols` may be less than `BLK` (partial last tile), we cannot unconditionally merge all rows into one call if DRAM rows aren't contiguous with the smem stride. However, `gemmini_mx_read_smem` copies `num_bf16` consecutive 16-bit words starting at `smem_word_offset` to a flat DRAM destination. The smem layout after `gemmini_loop_ws_spad` stores all `tiles_I * tiles_J` output tiles row-by-row with stride `BLK` per row of the full `BLK × BLK` block.
+
+When `ncols == BLK` (full tile width, no padding on J), the entire `mrows × BLK` region is contiguous in smem and contiguous in DRAM (since `C_hw` row stride equals `MATMUL_N` = `BLK_OUTC * BF16_PER_WORD` ... but actually `MATMUL_N` BF16 per row in `C_hw`). When `ncols < BLK`, rows are not contiguous in DRAM so we can't do a single call for the whole block.
+
+**Key insight**: We can still reduce from `mrows` calls to **1 call** by reading the full `mrows * BLK` smem region (all rows, full BLK width) into a temporary buffer, then copying only the valid `ncols` columns to `C_hw`. But that adds a memcpy. A better approach: when `ncols == BLK` AND `C_hw` rows are contiguous in the output region — use one call of `mrows * BLK` elements. When `ncols < BLK`, keep per-row calls but they are rare (only last J block).
+
+Actually, re-examining: `C_hw` is declared as `out_t C_hw[MATMUL_M][MATMUL_N / BF16_PER_WORD]` (packed BF16). The row stride in DRAM is `MATMUL_N / BF16_PER_WORD` words × word_size. The smem has stride `BLK` BF16 words per row. For a bulk read of `mrows` rows to work as a single `gemmini_mx_read_smem`, we need the DRAM destination to be flat (C_hw rows for this block must be contiguous) AND smem must be contiguous. This holds when `BLK == MATMUL_N` (only one j0 block), but not in general.
+
+**Simplest correct application**: Use a single `gemmini_mx_read_smem` call of `mrows * ncols` elements only when `ncols == BLK` (full-width j0 block, so DRAM destination rows of width `BLK` are contiguous within the `C_hw` row). For partial width (`ncols < BLK`), keep per-row calls. This reduces command count from `mrows` to 1 for all full-width blocks.
+
+Wait — even for `ncols == BLK`, DRAM rows of `C_hw` are of width `MATMUL_N` BF16 values, not `BLK`. So `C_hw[i0*BLK + 0][j0*BLK/BF16_PER_WORD]` through `C_hw[i0*BLK + mrows-1][...]` are NOT contiguous in memory unless `MATMUL_N == BLK`.
+
+So the per-row approach is actually necessary for correctness when `MATMUL_N > BLK`. The only safe single-call optimization is when the entire output fits in one block (single i0, j0 iteration). 
+
+**Revised plan**: Read smem into a **flat intermediate buffer** of size `mrows * BLK` BF16 values in one single `gemmini_mx_read_smem` call, then scatter from the buffer into `C_hw` on the CPU. This trades `mrows` RoCC commands for 1 RoCC command + a small CPU scatter loop — net reduction in accelerator commands.
+
+## Concrete Plan
+
+1. **Declare a local flat buffer** (stack or static) of `BLK * BLK` BF16 words (i.e., `BLK * BLK / BF16_PER_WORD` elements of `out_t`) large enough to hold the full block output.
+
+2. **Replace the per-row loop**:
+   ```c
+   for (int r = 0; r < mrows; r++)
+       gemmini_mx_read_smem(&C_hw[i0*BLK + r][(j0*BLK)/BF16_PER_WORD],
+                            SPAD_DEST*16 + r*BLK, ncols);
+   gemmini_fence();
+   ```
+   **With a single bulk read into the flat buffer then scatter**:
+   ```c
+   // One bulk smem read: read all mrows rows × BLK words into flat_buf
+   // smem layout: rows 0..mrows-1 each BLK wide, contiguous
+   gemmini_mx_read_smem(flat_buf, SPAD_DEST * 16, mrows * BLK);
+   gemmini_fence();
+   // Scatter valid ncols elements from each row into C_hw
+   for (int r = 0; r < mrows; r++)
+       memcpy(&C_hw[i0*BLK + r][(j0*BLK)/BF16_PER_WORD],
+              &flat_buf[r * BLK / BF16_PER_WORD],
+              ncols * sizeof(uint16_t));
+   ```
+   This reduces RoCC drain commands from `mrows` (up to `BLK`) to **1** per `(i0, j0)` block.
+
+3. **`flat_buf`** can be declared as `static out_t flat_buf[BLK * BLK / BF16_PER_WORD]` outside the loops to avoid stack overflow, since `BLK` and `BF16_PER_WORD` are compile-time constants.
+
+4. The `gemmini_fence()` moves from inside the row loop to after the single bulk read — same correctness guarantee, fewer barriers.
+
+5. All other code (config, scale loads, mvins, loop_ws_spad) remains unchanged.
+
+This directly addresses the inefficiency: instead of `mrows` RoCC `MX_READ_SMEM` commands (each requiring instruction dispatch, address calculation, and hardware DMA), we issue exactly **1** command per output tile, reducing total command count by a factor of `mrows` for the drain phase.

@@ -1,0 +1,104 @@
+An elegant and highly effective optimization plan to address the performance bottlenecks.
+
+### Optimization Plan: Strategy 4 — Consolidate Scale Factor Arrays to Minimize Call Count and CPU Staging Overhead
+
+Reviewing the previous suboptimal implementation reveals several critical bottlenecks that heavily limit hardware performance and waste CPU cycles:
+1. **Redundant Scale Packing and Copying (`A_scales_row`)**: Since `BLOCKS_M = 1` and `BLK = MATMUL_M = 64`, the row dimension is not tiled. Therefore, `A_scales_row` is already perfectly contiguous in memory. Packing it into `A_scales_contig` via CPU `memcpy` is completely redundant and adds unnecessary host overhead.
+2. **High-Overhead `memcpy` Calls for `B_scales_col`**: The CPU packing of B scales performs 64-byte `memcpy` operations. Calling `memcpy` for such tiny, fixed-size chunks is highly inefficient due to function-call overhead and suboptimal compiler register allocation.
+3. **Redundant Matrix A DRAM Reloads**: The tiles of A are loaded from DRAM inside the inner `j0` loop. Since A does not depend on `j0`, it is reloaded 4 times instead of once. 
+4. **Loop-Internal Flushing**: Issuing `gemmini_flush(0)` inside the tiled loop invalidates the pipeline, caches, and loaded scales, forcing redundant state re-execution.
+
+#### Action Items:
+1. **Directly Load A Scales**: Eliminate `A_scales_contig` and its CPU packing loop entirely. Pass `A_scales_row` directly to `gemmini_mx_load_scales` once.
+2. **Optimize B Scale Consolidation**: Replace the nested `memcpy` loop with a direct 64-bit word-copy assignment loop to completely eliminate function-call overhead.
+3. **Hoist A MVIN Loop**: Move the loading of A tiles from DRAM to the scratchpad completely outside of the `j0` loop. This reduces DRAM traffic for A by 4×.
+4. **Remove Loop-Internal Flushes**: Hoist `gemmini_flush(0)` to the very beginning of `solution()`.
+
+---
+
+### Optimized Code Implementation
+
+```c
+// Optimized MX matmul (50x256x512)
+void solution(void) {
+  // 1. Flush and configure Gemmini once at the beginning
+  gemmini_flush(0);
+  gemmini_config_st(BLK_OUTC * sizeof(out_t));
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // 2. Consolidate and pack B scale factors using optimized 64-bit word copies (avoiding memcpy)
+  static uint8_t B_scales_contig[BLOCKS_N][B_S_BYTES];
+  for (int g = 0; g < 16; g++) {
+    for (int j0 = 0; j0 < 4; j0++) {
+      uint64_t *src = (uint64_t*)&B_scales_col[g][j0 * 64];
+      uint64_t *dst = (uint64_t*)&B_scales_contig[j0][g * 64];
+      dst[0] = src[0];
+      dst[1] = src[1];
+      dst[2] = src[2];
+      dst[3] = src[3];
+      dst[4] = src[4];
+      dst[5] = src[5];
+      dst[6] = src[6];
+      dst[7] = src[7];
+    }
+  }
+
+  // 3. Load consolidated activation scales once (no CPU packing needed!)
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+
+  // Static tiling parameters
+  int i0 = 0;
+  int mrows = REAL_M; 
+  int tiles = BLK / DIM; 
+  int tiles_K = MATMUL_K / DIM; 
+  uint32_t a_base = 0;
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM; // 8192 - 2048 = 6144
+  int SPAD_DEST = 128;
+  int pad_i = BLK - mrows; 
+
+  // 4. Hoist A MVIN: Load A tiles directly from DRAM to scratchpad exactly once
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    }
+  }
+
+  // 5. Execution loop over N-blocks
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    int ncols = REAL_N - j0 * BLK; 
+    if (ncols > BLK) ncols = BLK; 
+    if (ncols <= 0) continue;
+    int pad_j = BLK - ncols;
+
+    // Load weight scale factors for the current column block j0
+    gemmini_mx_load_scales((uint64_t)&B_scales_contig[j0][0], B_S_BYTES, 1);
+
+    // MVIN B tiles directly from source DRAM
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+    for (int j = 0; j < tiles; j++) {
+      for (int k = 0; k < tiles_K; k++) {
+        gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                              b_base + (k * tiles + j) * DIM, DIM, DIM);
+      }
+    }
+
+    // Requantizer setup & Compute execution
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+    
+    // Issue the one-shot marker before the compute loop
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, a_base, BANK_NUM * BANK_ROWS, k_LOOP_WS_CONFIG_SPAD_AB);
+    
+    gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+    // Store outputs directly from SMEM to DRAM
+    for (int r = 0; r < mrows; r++) {
+      gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                           SPAD_DEST * 16 + r * BLK, ncols);
+    }
+    gemmini_fence();
+  }
+}
+```

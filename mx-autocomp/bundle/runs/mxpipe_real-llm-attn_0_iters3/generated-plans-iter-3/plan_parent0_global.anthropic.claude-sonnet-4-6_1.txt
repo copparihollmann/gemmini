@@ -1,0 +1,80 @@
+## Analysis
+
+Looking at the original code, I can see that `gemmini_mx_read_smem` is called once per row (`mrows` calls per (i0,j0) block):
+
+```c
+for (int r = 0; r < mrows; r++)
+    gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                         SPAD_DEST * 16 + r * BLK, ncols);
+gemmini_fence();
+```
+
+This issues up to `mrows` (up to `BLK/DIM = tiles`) separate RoCC instructions to drain the output. Strategy 5 directly addresses this: batch the entire output block into a single `gemmini_mx_read_smem` call when the output is contiguous.
+
+## Plan for Strategy 5
+
+**Observation:** The output in `mx_smem` is laid out contiguously: row `r` starts at `SPAD_DEST*16 + r*BLK` (word offset), and consecutive rows are stored adjacently. The destination DRAM pointer `&C_hw[i0*BLK + r][(j0*BLK)/BF16_PER_WORD]` advances by one row of `ncols` BF16 elements per step — but only if consecutive rows in C_hw are themselves contiguous in memory (i.e., `C_hw` is a 2D array with row stride = total columns / BF16_PER_WORD, and `j0*BLK` is the start of the output column block).
+
+**Key insight:** The `smem_off_bf16` parameter in `gemmini_mx_read_smem` is a word offset into `mx_smem`, and `num_bf16` is the total number of BF16 values to copy. If the DRAM destination is contiguous across all `mrows` rows (i.e., the entire `mrows × ncols` region is a single flat buffer starting at `&C_hw[i0*BLK][j0*BLK/BF16_PER_WORD]`), then we can replace the loop with a single call:
+
+```c
+gemmini_mx_read_smem(&C_hw[i0 * BLK + 0][(j0 * BLK) / BF16_PER_WORD],
+                     SPAD_DEST * 16,
+                     mrows * ncols);
+```
+
+This transfers `mrows * ncols` BF16 values starting from offset `SPAD_DEST*16` in one instruction instead of `mrows` instructions, reducing instruction count from up to `BLK` calls down to 1.
+
+**Correctness check:** The smem layout places row `r` at smem offset `SPAD_DEST*16 + r*BLK`, so the full region from row 0 to row `mrows-1` occupies `mrows*BLK` contiguous BF16 slots starting at `SPAD_DEST*16` (since `BLK` is the padded block width, and `ncols ≤ BLK`). The DRAM destination `C_hw[i0*BLK][(j0*BLK)/BF16_PER_WORD]` is the flat start of this output tile, and `C_hw` rows are contiguous in memory. The hardware copies `num_bf16` values linearly, which matches the contiguous smem layout.
+
+## Rewritten Code
+
+```c
+void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+
+    // A scales only depend on i0: copy once per i0, reuse across all j0.
+    for (int g = 0; g < MATMUL_K / 32; g++)
+      memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      // B scales depend on j0: copy once per (i0,j0).
+      for (int g = 0; g < MATMUL_K / 32; g++)
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int j = 0; j < tiles; j++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      // Drain entire mrows×ncols output block in a single smem read instead of one call per row.
+      gemmini_mx_read_smem(&C_hw[i0 * BLK + 0][(j0 * BLK) / BF16_PER_WORD],
+                           SPAD_DEST * 16,
+                           mrows * ncols);
+      gemmini_fence();
+    }
+  }
+}
+```

@@ -1,0 +1,56 @@
+## Analysis
+
+Looking at the code, the main loop structure is:
+
+```
+for i0:
+  for j0:
+    1. gemmini_flush + config_ex
+    2. load A scales + B scales
+    3. mvin A tiles (tiles × tiles_K instructions)
+    4. mvin B tiles (tiles × tiles_K instructions)
+    5. config_st + mxquant_config_mvout
+    6. gemmini_loop_ws_spad (compute)
+    7. gemmini_mx_read_smem (per row)
+    8. gemmini_fence()
+```
+
+The A-tile mvin for block `i0` happens in the same iteration as the compute for block `i0`. The key observation is: **A tiles only depend on `i0`, not on `j0`**. So for a fixed `i0`, the A tiles are the same across all `j0` iterations. We can load A tiles once for a given `i0` and reuse them across all `j0` iterations.
+
+But the strategy selected is **strategy 2**: interleave A mvin instructions for the next `i0` block with the `gemmini_loop_ws_spad` compute of the current block to pipeline data loading with execution, hiding A-load latency behind compute.
+
+## Plan
+
+The idea is to use **double-buffering on the scratchpad** for A tiles: while the accelerator is running `gemmini_loop_ws_spad` for `(i0, j0)`, we simultaneously issue mvin instructions for the A tiles of `i0+1` (into the second scratchpad buffer), so that by the time we need to compute `(i0+1, j0)`, the A tiles are already loaded.
+
+### Concrete changes:
+
+1. **Split the scratchpad into two A-tile buffers**: 
+   - `a_base_0 = 0` (first buffer, for even `i0`)
+   - `a_base_1 = tiles * tiles_K * DIM` (second buffer, for odd `i0`)
+   - B tiles stay at the top: `b_base = BANK_NUM*BANK_ROWS - tiles*tiles_K*DIM`
+   - Verify no overlap: `a_base_1 + tiles*tiles_K*DIM = 2*tiles*tiles_K*DIM`. With `tiles=BLK/DIM=4` (assuming BLK=64), `tiles_K=32`, DIM=16: `2*4*32*16=4096 rows`. B needs `tiles*tiles_K*DIM=2048 rows` at top. Total = 6144 ≤ 8192. ✓
+
+2. **Restructure the outer loop**: For each `i0`, iterate over all `j0` with the already-loaded A buffer, and **during the compute of each `(i0, j0)` (after `gemmini_loop_ws_spad` is issued)**, prefetch A tiles for `i0+1` into the alternate buffer.
+
+3. **Specifically**: 
+   - Before the `i0` loop, pre-load A tiles for `i0=0` into `a_base[0]`.
+   - In the `j0` inner loop: issue `gemmini_loop_ws_spad` using the current `a_base[i0 % 2]`, then immediately issue mvin instructions for `i0+1`'s A tiles into `a_base[(i0+1) % 2]` — these mvins are queued to the DMA engine and can execute concurrently with the systolic array compute. At the last `j0` for `i0`, we need to also load B for `i0+1, j0=0`, but since B changes every `j0`, we only prefetch A.
+   - The key win: A-load latency for `i0+1` is hidden behind the `gemmini_loop_ws_spad` execution of `i0`'s last (or any) `j0` block.
+
+4. **Since A scales also only depend on `i0`**, load A scales once per `i0` outside the `j0` loop (this is already implicit since `gemmini_loop_ws_spad` only issues after both scales are loaded — but B scales must still be loaded inside `j0`). The programming model requires scales be loaded before the compute that uses them, which is satisfied as long as we load `A_scales[i0+1]` after issuing the current `gemmini_loop_ws_spad` (which doesn't use `i0+1` scales).
+
+5. **Exact restructuring**:
+   - Prologue: load A tiles for `i0=0` into `a_buf[0]`.
+   - Outer loop over `i0`:
+     - Load A scales for `i0` (once per `i0`, before any `j0`).
+     - Inner loop over `j0`:
+       - Load B scales for `j0`.
+       - Load B tiles for `j0`.
+       - `gemmini_mxquant_config_mvout`.
+       - `gemmini_loop_ws_spad` using `a_buf[i0 % 2]`.
+       - **Prefetch A tiles for `i0+1`** into `a_buf[(i0+1) % 2]` (if `i0+1 < BLOCKS_M`), issued right after `loop_ws_spad` so DMA overlaps with compute.
+       - `gemmini_mx_read_smem` + `gemmini_fence`.
+   - This ensures A tiles for `i0+1` are loaded while `i0`'s compute runs.
+
+This plan applies strategy 2 precisely, using double-buffered A-tile slots and issuing next-A mvins immediately after `gemmini_loop_ws_spad` for the current block, hiding the A-load latency behind systolic array execution.

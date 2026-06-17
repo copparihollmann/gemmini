@@ -1,0 +1,98 @@
+void solution(void) {
+  int tiles   = BLK / DIM;
+  int tiles_K = MATMUL_K / DIM;
+
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+  uint32_t a_base = 0;
+  int SPAD_DEST = 128;
+
+  // Step 1: Configure execution ONCE — format and dataflow are loop-invariant.
+  // Config registers persist until overwritten; no need to re-issue per tile.
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                              1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // Configure output stride ONCE — BLK_OUTC * sizeof(out_t) is constant.
+  gemmini_config_st(BLK_OUTC * sizeof(out_t));
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    int ncols = REAL_N - j0 * BLK;
+    if (ncols > BLK) ncols = BLK;
+    if (ncols <= 0) continue;
+
+    // Stage B scales ONCE per j0.
+    for (int g = 0; g < MATMUL_K / 32; g++)
+      memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+
+    // Mvin B tiles ONCE per j0 into the top of the scratchpad.
+    // Set B-stride config here (before B mvins).
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+    for (int j = 0; j < tiles; j++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin(
+          (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+          b_base + (k * tiles + j) * DIM, DIM, DIM);
+
+    // Hoist A-stride config to once per j0, outside the i0 loop.
+    // A's row stride is MATMUL_K — constant across all i0 iterations.
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+
+    for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      // Stage A scales once per (i0, j0).
+      for (int g = 0; g < MATMUL_K / 32; g++)
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+
+      // PROF accel
+      gemmini_flush(0);
+
+      // Step 2: Load A and B scales into hardware.
+      // sel=0 → mx_scale_a_mem (activations/A), sel=1 → mx_scale_b_mem (weights/B).
+      // config_ex already issued once above; no need to repeat it here.
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      // Step 3: Mvin A tiles for this i0 row-block.
+      // A-stride config was set above (outside i0 loop); B tiles already resident.
+      // No gemmini_config_ld needed here — stride is still MATMUL_K from above.
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+      // Step 4: Configure requantized mvout.
+      // gemmini_config_st already issued once before j0 loop.
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                   tiles, tiles, tiles_K, 0, 0, 1);
+
+      // Step 5: Execute fused hardware matmul.
+      // mx_loop_spad_marker (funct 24) is one-shot and re-issued inside the macro
+      // before every gemmini_loop_ws_spad call.
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0,
+                           a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                           false, false, false, false, false,
+                           NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Step 6: Issue all read_smem DMA commands without stalling between iterations.
+      // The RoCC instruction queue is ordered — the drain of i0's results completes
+      // before i0+1's compute writes new results into mx_smem, so no fence is needed here.
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(
+          &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+          SPAD_DEST * 16 + r * BLK, ncols);
+
+      // Fence removed from here — deferred to after the i0 loop.
+    }
+
+    // Step 7: Single fence after all i0 iterations for this j0 block.
+    // All DMA drains (gemmini_mx_read_smem) across all i0 iterations are now
+    // visible to the host before the next j0 iteration or output consumption.
+    // This reduces fence stalls from BLOCKS_M * BLOCKS_N to BLOCKS_N.
+    gemmini_fence();
+  }
+}

@@ -1,0 +1,92 @@
+```c
+#include <stdint.h>
+#include <string.h>
+
+// AUTO-GENERATED outer-tiled MX matmul baseline (41x512x512).
+void solution(void) {
+  // 1. Pre-gather the MX scale factors into contiguous arrays outside the compute loops.
+  // This entirely eliminates the expensive host memcpy staging from the critical path.
+  static uint8_t A_s_pre[BLOCKS_M][MATMUL_K / 32][BLK];
+  static uint8_t B_s_pre[BLOCKS_N][MATMUL_K / 32][BLK];
+  
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    int mrows = REAL_M - i0 * BLK; 
+    if (mrows > BLK) mrows = BLK;
+    if (mrows > 0) {
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s_pre[i0][g][0], &A_scales_row[g][i0 * BLK], BLK);
+      }
+    }
+  }
+  
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    int ncols = REAL_N - j0 * BLK; 
+    if (ncols > BLK) ncols = BLK;
+    if (ncols > 0) {
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&B_s_pre[j0][g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+    }
+  }
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Partial last M/N block: compute only the real rows/cols, pad the rest.
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+      
+      int tiles = BLK / DIM;
+      int tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      gemmini_flush(0);
+      
+      // Configure MX format fields (FP8 -> BF16 output, no LUT)
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      
+      // Load the pre-gathered, contiguous block scales directly
+      gemmini_mx_load_scales((uint64_t)A_s_pre[i0], A_S_BYTES, 0); // sel 0 for A (activation) scales
+      gemmini_mx_load_scales((uint64_t)B_s_pre[j0], B_S_BYTES, 1); // sel 1 for B (weight) scales
+
+      // 2. Configure independent DMA ports to overlap DRAM reads.
+      // Configure mvin (port id=0) for A's stride
+      gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), ACC_SCALE_IDENTITY, false, 0);
+      // Configure mvin2 (port id=1) for B's stride
+      gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), ACC_SCALE_IDENTITY, false, 1);
+
+      // Interleave RoCC dispatch for A and B. The hardware DMA engine will fetch both concurrently.
+      for (int t = 0; t < tiles; t++) {
+        for (int k = 0; k < tiles_K; k++) {
+          // A matrix via Primary Port (mvin)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + t * DIM) * MATMUL_K + k * DIM),
+                                a_base + (t * tiles_K + k) * DIM, DIM, DIM);
+                                
+          // B matrix via Secondary Port (mvin2)
+          gemmini_extended_mvin2((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + t * DIM)),
+                                 b_base + (k * tiles + t) * DIM, DIM, DIM);
+        }
+      }
+
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      // Configure output quantizer bounding and granularity
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      
+      // Execute systolic array macro-loop
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Accelerator-centric readout: per-row hardware DMA from smem straight into the bf16-packed output
+      for (int r = 0; r < mrows; r++) {
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      }
+      
+      // Fence MUST be issued to guarantee DRAM consistency before host accesses the results
+      gemmini_fence();
+    }
+  }
+}
+```

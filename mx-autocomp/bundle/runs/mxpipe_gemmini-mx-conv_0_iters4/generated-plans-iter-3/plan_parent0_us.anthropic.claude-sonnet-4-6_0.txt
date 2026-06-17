@@ -1,0 +1,62 @@
+## Analysis of the Current Code
+
+Looking at the current code, I need to identify which strategy offers the most impact.
+
+The code has an im2col section with a triply-nested inner loop that computes `A_buf`. Let me look at what's happening:
+
+```c
+for (int i = 0; i < tiles_I; i++) {
+    for (int li = 0; li < DIM; li++) {
+        int patch_idx = i * DIM + li;
+        int pi = patch_idx / PATCHES_X;
+        int pj = patch_idx % PATCHES_X;
+        for (int c = 0; c < CONV_C; c++)
+            for (int dy = 0; dy < CONV_KSZ; dy++)
+                for (int dx = 0; dx < CONV_KSZ; dx++)
+                    A_buf[patch_idx][c * CONV_KSZ * CONV_KSZ + dy * CONV_KSZ + dx] =
+                        X_in[c][pi * CONV_KSZ + dy][pj * CONV_KSZ + dx];
+    }
+    for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin(...);
+}
+```
+
+Inside the innermost loop, `pi * CONV_KSZ + dy` and `pj * CONV_KSZ + dx` are recomputed on every iteration of the `dx` loop, and `c * CONV_KSZ * CONV_KSZ + dy * CONV_KSZ + dx` is recomputed on every iteration. These are **redundant operations inside loops** — a clear target for **Strategy 4: hoist redundant operations out of loops**.
+
+## Plan: Hoist Redundant Operations Out of Loops (Strategy 4)
+
+**Specific changes:**
+
+1. **Hoist `patch_idx / PATCHES_X` and `patch_idx % PATCHES_X`**: These are already hoisted out of the `c/dy/dx` loops correctly, but `pi * CONV_KSZ` and `pj * CONV_KSZ` are recomputed on every `(c, dy, dx)` iteration. Compute `int y_base = pi * CONV_KSZ` and `int x_base = pj * CONV_KSZ` once per `li` iteration and reuse them.
+
+2. **Hoist `c * CONV_KSZ * CONV_KSZ` out of the `dy` loop**: Compute `int c_off = c * CONV_KSZ * CONV_KSZ` once per `c` iteration.
+
+3. **Hoist `dy * CONV_KSZ` out of the `dx` loop**: Compute `int dy_off = dy * CONV_KSZ` once per `dy` iteration.
+
+4. **Hoist `X_in[c][y_base + dy]` row pointer out of the `dx` loop**: Since `X_in[c][y_base + dy]` indexes a fixed row for all `dx` values, cache `elem_t *x_row = &X_in[c][y_base + dy][x_base]` once per `dy` iteration and use pointer arithmetic in the `dx` loop.
+
+5. **Hoist `A_buf[patch_idx]` pointer**: Compute `elem_t *a_row = A_buf[patch_idx]` once per `li` iteration and index with `a_row[c_off + dy_off + dx]`.
+
+The transformed inner loops become:
+
+```c
+for (int li = 0; li < DIM; li++) {
+    int patch_idx = i * DIM + li;
+    int pi = patch_idx / PATCHES_X;
+    int pj = patch_idx % PATCHES_X;
+    int y_base = pi * CONV_KSZ;   // hoisted: used by all c,dy
+    int x_base = pj * CONV_KSZ;   // hoisted: used by all c,dx
+    elem_t *a_row = A_buf[patch_idx]; // hoisted: fixed for this li
+    for (int c = 0; c < CONV_C; c++) {
+        int c_off = c * CONV_KSZ * CONV_KSZ; // hoisted out of dy loop
+        for (int dy = 0; dy < CONV_KSZ; dy++) {
+            int dy_off = c_off + dy * CONV_KSZ; // hoisted out of dx loop
+            const elem_t *x_row = &X_in[c][y_base + dy][x_base]; // hoisted out of dx loop
+            for (int dx = 0; dx < CONV_KSZ; dx++)
+                a_row[dy_off + dx] = x_row[dx];
+        }
+    }
+}
+```
+
+This eliminates repeated multiplications and index recomputations inside the innermost loop, reducing CPU work during the im2col phase which directly reduces the latency before mvin commands are issued and the accelerator can begin DMA transfers.

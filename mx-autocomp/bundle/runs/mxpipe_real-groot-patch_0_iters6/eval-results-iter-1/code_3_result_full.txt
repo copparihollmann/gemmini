@@ -1,0 +1,209 @@
+{'correct': True, 'test_results': {0: True}, 'compiled': True, 'latency_spike_raw': 21499, 'latency': 21499}
+Prev latency: 17428
+New latency: 21499
+Plan: ## Analysis of the Current Code
+
+Looking at the innermost mvin loops, the A-tile mvin loop contains:
+
+```c
+for (int i = 0; i < tiles; i++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                          a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+```
+
+Each iteration computes `(i0 * BLK + i * DIM) * MATMUL_K + k * DIM` — a multiply-heavy expression with three multiplications per call: `i0*BLK`, `i*DIM`, the product with `MATMUL_K`, and `k*DIM`. Similarly for B:
+
+```c
+for (int j = 0; j < tiles; j++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                          b_base + (k * tiles + j) * DIM, DIM, DIM);
+```
+
+This recomputes `k * DIM * MATMUL_N` and `j0*BLK + j*DIM` on every inner iteration.
+
+## Selected Strategy: #5 — Use Direct Pointer Arithmetic with Running Pointer
+
+### Plan
+
+**For A tiles (outer `i`, inner `k`):**
+- Before the `i`-loop, compute `elem_t *a_row_base = ((elem_t*)A_in) + i0 * BLK * MATMUL_K`.
+- At the start of each `i`-iteration, set `elem_t *a_ptr = a_row_base + i * DIM * MATMUL_K`. This replaces `(i0*BLK + i*DIM)*MATMUL_K`.
+- Inside the `k`-loop, start with `a_ptr` and after each iteration increment it by `DIM` (one FP8 tile column along K). The spad address `a_base + (i*tiles_K + k)*DIM` similarly becomes a running variable initialized to `a_base + i*tiles_K*DIM` and incremented by `DIM` each `k`-step.
+
+**For B tiles (outer `j`, inner `k`):**
+- Before the `j`-loop, compute `elem_t *b_col_base = ((elem_t*)B_in) + j0 * BLK`.
+- At the start of each `j`-iteration, set `elem_t *b_ptr = b_col_base + j * DIM`. This gives the starting column offset.
+- Inside the `k`-loop, instead of recomputing `k * DIM * MATMUL_N`, maintain a running pointer incremented by `DIM * MATMUL_N` each `k`-step. The spad address `b_base + (k*tiles + j)*DIM` becomes a running variable initialized to `b_base + j*DIM` and incremented by `tiles*DIM` each `k`-step.
+
+**For spad addresses:** Both `a_spad` and `b_spad` running variables replace the multiply-based index expressions with additions of fixed strides (`DIM` for A, `tiles*DIM` for B).
+
+This eliminates all integer multiplications inside the `k`-loop body for both A and B mvins, converting them to pointer additions and integer additions — cheaper operations that reduce the command-issue overhead in the innermost loop, which executes `tiles * tiles_K` times per `(i0, j0)` block.
+
+CodeCandidate(parent=CodeCandidate(parent=None,
+plan='''prior autocomp winner (mxpipe_real-groot-patch_0_iters3)''',
+code='''// AUTO-GENERATED outer-tiled MX matmul baseline (41x512x512).
+void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+   for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Partial last M/N block: compute only the real rows/cols, pad the rest.
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+      // PROF cpu_stage
+      // Stage only the tiny per-32-group scales; A/B data is mvin\'d DIRECTLY
+      // from DRAM (no host-side block memcpy — that was 98% of the cycles).
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+      // PROF accel
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K (full block-aligned tiles)
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+      for (int j = 0; j < tiles; j++)                    // B[k][j0*BLK+j] -> slot (k*tiles + j)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      // Accelerator-centric readout: per-row hardware DMA from smem straight into the
+      // bf16-packed row-major output (block-internal smem row stride is BLK).
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+}
+''',
+score=17428,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'CPU/host data staging detected (2 memcpy, ~0 scalar copy loops). Host staging is typically the dominant cost on this accelerator and autocomp cannot speed it up directly: mvin tiles STRIDED straight from the source DRAM arrays instead of copying through a host buffer, and keep partial sums in shared memory (bf16 accumulate) rather than accumulating on the CPU.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''## Analysis of the Current Code
+
+Looking at the innermost mvin loops, the A-tile mvin loop contains:
+
+```c
+for (int i = 0; i < tiles; i++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                          a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+```
+
+Each iteration computes `(i0 * BLK + i * DIM) * MATMUL_K + k * DIM` — a multiply-heavy expression with three multiplications per call: `i0*BLK`, `i*DIM`, the product with `MATMUL_K`, and `k*DIM`. Similarly for B:
+
+```c
+for (int j = 0; j < tiles; j++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                          b_base + (k * tiles + j) * DIM, DIM, DIM);
+```
+
+This recomputes `k * DIM * MATMUL_N` and `j0*BLK + j*DIM` on every inner iteration.
+
+## Selected Strategy: #5 — Use Direct Pointer Arithmetic with Running Pointer
+
+### Plan
+
+**For A tiles (outer `i`, inner `k`):**
+- Before the `i`-loop, compute `elem_t *a_row_base = ((elem_t*)A_in) + i0 * BLK * MATMUL_K`.
+- At the start of each `i`-iteration, set `elem_t *a_ptr = a_row_base + i * DIM * MATMUL_K`. This replaces `(i0*BLK + i*DIM)*MATMUL_K`.
+- Inside the `k`-loop, start with `a_ptr` and after each iteration increment it by `DIM` (one FP8 tile column along K). The spad address `a_base + (i*tiles_K + k)*DIM` similarly becomes a running variable initialized to `a_base + i*tiles_K*DIM` and incremented by `DIM` each `k`-step.
+
+**For B tiles (outer `j`, inner `k`):**
+- Before the `j`-loop, compute `elem_t *b_col_base = ((elem_t*)B_in) + j0 * BLK`.
+- At the start of each `j`-iteration, set `elem_t *b_ptr = b_col_base + j * DIM`. This gives the starting column offset.
+- Inside the `k`-loop, instead of recomputing `k * DIM * MATMUL_N`, maintain a running pointer incremented by `DIM * MATMUL_N` each `k`-step. The spad address `b_base + (k*tiles + j)*DIM` becomes a running variable initialized to `b_base + j*DIM` and incremented by `tiles*DIM` each `k`-step.
+
+**For spad addresses:** Both `a_spad` and `b_spad` running variables replace the multiply-based index expressions with additions of fixed strides (`DIM` for A, `tiles*DIM` for B).
+
+This eliminates all integer multiplications inside the `k`-loop body for both A and B mvins, converting them to pointer additions and integer additions — cheaper operations that reduce the command-issue overhead in the innermost loop, which executes `tiles * tiles_K` times per `(i0, j0)` block.''',
+code='''void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+   for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      // Mvin A tiles using running pointer arithmetic
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      {
+        elem_t *a_row_base = ((elem_t*)A_in) + (i0 * BLK) * MATMUL_K;
+        for (int i = 0; i < tiles; i++) {
+          elem_t *a_ptr = a_row_base + i * DIM * MATMUL_K;
+          uint32_t a_spad = a_base + i * tiles_K * DIM;
+          for (int k = 0; k < tiles_K; k++) {
+            gemmini_extended_mvin((void*)a_ptr, a_spad, DIM, DIM);
+            a_ptr  += DIM;
+            a_spad += DIM;
+          }
+        }
+      }
+
+      // Mvin B tiles using running pointer arithmetic
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      {
+        elem_t *b_col_base = ((elem_t*)B_in) + j0 * BLK;
+        for (int j = 0; j < tiles; j++) {
+          elem_t *b_ptr = b_col_base + j * DIM;
+          uint32_t b_spad = b_base + j * DIM;
+          for (int k = 0; k < tiles_K; k++) {
+            gemmini_extended_mvin((void*)b_ptr, b_spad, DIM, DIM);
+            b_ptr  += DIM * MATMUL_N;
+            b_spad += tiles * DIM;
+          }
+        }
+      }
+
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+}
+''',
+score=None,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='global.anthropic.claude-sonnet-4-6',
+code_gen_model='global.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None)

@@ -1,0 +1,70 @@
+An elegant and highly effective optimization plan to address the inefficiencies in the provided code is to apply **Strategy 12: Load the scale factors for the entire A and B matrices once at the beginning** of the kernel, combined with removing the CPU-side tiling.
+
+### Analysis of Inefficiencies
+1. **Redundant CPU-Side Tiling:** The original code tiles the 64×64 matrix multiplication into multiple smaller blocks (`BLK`). However, a 64×64 matrix multiplication fits entirely within Gemmini's 256KB scratchpad and 64KB accumulator.
+2. **Costly Scale Re-formatting and Loading:** The code performs CPU-side scale factor formatting and loads partitioned blocks of scales in every nested loop iteration. Because the scales for the entire A and B matrices easily fit into Gemmini's scale memories, they can be loaded once.
+3. **High DMA Instruction Overhead:** The code issues multiple small `mvin` and `mx_read_smem` calls instead of utilizing larger continuous transfers.
+
+### Optimization Plan
+1. **Eliminate CPU-Side Tiling:** Run the entire `MATMUL_M` × `MATMUL_N` × `MATMUL_K` matrix multiplication in a single hardware loop invocation (`gemmini_loop_ws_spad`).
+2. **One-Time Scale Loading (Strategy 12):** Load the scale factors `A_scales_row` and `B_scales_col` entirely at the beginning of the function, eliminating the need for `A_scales_perf`, `B_scales_perf`, and the costly pre-formatting loops.
+3. **Coalesced Memory Transfers:** 
+   - Load A and B tiles in `4 * DIM` (64-byte) chunks using `gemmini_extended_mvin` to maximize DMA burst transfer efficiency.
+   - Drain the entire output `C_hw` with a single `gemmini_mx_read_smem` call, replacing the row-by-row CPU loop.
+
+---
+
+### Optimized Code
+
+```c
+#include <stdint.h>
+#include "include/gemmini_testutils.h"
+
+// Strategy 12: Load the scale factors for the entire A and B matrices into their 
+// respective Gemmini scale memories once at the beginning of the kernel.
+void solution(void) {
+  // 1. Configure execution for weight-stationary FP8 matmul with BF16 output
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 
+                              1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // 2. Load the entire A and B scale factors once
+  gemmini_mx_load_scales((uint64_t)A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)B_scales_col, sizeof(B_scales_col), 1);
+
+  // Define full-matrix tile parameters
+  int tiles_I = MATMUL_M / DIM;
+  int tiles_J = MATMUL_N / DIM;
+  int tiles_K = MATMUL_K / DIM;
+
+  uint32_t a_base = 0;
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+  int SPAD_DEST = 0;
+
+  // 3. Load entire A matrix in coalesced DMA sweeps (64 elements wide)
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i * DIM) * MATMUL_K),
+                          a_base + (i * tiles_K) * DIM, MATMUL_K, DIM);
+  }
+
+  // 4. Load entire B matrix in coalesced DMA sweeps (64 elements wide)
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int k = 0; k < tiles_K; k++) {
+    gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N),
+                          b_base + (k * tiles_J) * DIM, MATMUL_N, DIM);
+  }
+
+  // 5. Configure requantizer write-back scale memory and bounds
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // 6. Execute full weight-stationary tiled matmul in hardware
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+                       a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                       false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // 7. Drain entire BF16 result matrix to DRAM in a single DMA transfer
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```

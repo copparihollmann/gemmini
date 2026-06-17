@@ -1,0 +1,38 @@
+## Analysis of the Current Code
+
+Looking at the mvin loops in both matmul kernels (S1 = Q @ K^T and O = P @ V), I can see they already use batched mvins with `batch=2` (cols = `bb * DIM` where `bb` can be 2). However, let me examine more carefully:
+
+**S1 kernel (Q @ K^T):**
+- A (Q) tiles: `tiles_K = ATT_D / DIM` — iterates `k` stepping by 2, uses `bb*DIM` cols ✓
+- B (KT) tiles: `tiles_J = ATT_S / DIM` — iterates `j` stepping by 2, uses `bb*DIM` cols ✓
+
+**O kernel (P @ V):**
+- A (P) tiles: `tiles_K = ATT_S / DIM` — iterates `k` stepping by 2, uses `bb*DIM` cols ✓  
+- B (V) tiles: `tiles_J = ATT_D / DIM` — iterates `j` stepping by 2, uses `bb*DIM` cols ✓
+
+Wait — the `bb` clamping logic (`int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2`) handles the boundary correctly but the **inner loop** for B tiles iterates over `j` stepping by 2, with `bb = (tiles_J - j < 2) ? (tiles_J - j) : 2`. This is already batch=2.
+
+## Strategy Selection
+
+**Strategy 2: Batch the mvin with block_mvin (batch=2, cols=32)**
+
+Looking more carefully, the current code has `bb * DIM` cols where `bb ∈ {1, 2}` — so batch=2 is *attempted* but only when the remaining count allows it. The real issue is the **stride configuration**:
+
+- For A tiles in S1: `gemmini_config_ld(ATT_D * sizeof(elem_t))` — stride is `ATT_D` bytes (full row width). Batching 2 consecutive k-tiles (columns k and k+1) means loading 2×DIM = 32 contiguous columns from the same row. Since A is laid out row-major with stride ATT_D, consecutive k-tiles ARE contiguous in memory — this is valid.
+- For B tiles: similarly, consecutive j-tiles are contiguous in memory with the configured stride.
+
+The code already does batch=2. But the **`bb` computation is re-evaluated per iteration** and the loop structure issues one `gemmini_extended_mvin` per pair. This is correct. Let me reconsider what's missing.
+
+## Actual Plan: Apply Strategy 2 — Increase Batch Size to 2 Consistently
+
+The current code already attempts batch=2 but uses a complex `bb` clamping inline. The actual bottleneck is that when tile counts are odd, some mvins fall back to batch=1. More importantly, in the **O kernel**, `tiles_J = ATT_D / DIM` for B and `tiles_K = ATT_S / DIM` for A — depending on ATT_D and ATT_S, these may already be even. But the strategy is to ensure all mvin calls use batch=2 (cols=32) as the validated sweet spot, using `gemmini_extended_mvin` with `cols=2*DIM=32, rows=DIM`, stepping by 2 in the tile loop, with a scalar fallback only at the boundary (if the tile count is odd).
+
+The plan is to **replace the inline `bb` clamp with a clean batch=2 loop + scalar tail** for all four mvin loops (A and B in both kernels), ensuring every non-tail call uses exactly `cols=32, rows=DIM`, reducing the total number of mvin instructions by ~2×.
+
+**Specific changes:**
+1. In the S1 Q mvin loop: keep stepping k by 2, emit `gemmini_extended_mvin(..., 32, DIM)` when `tiles_K - k >= 2`, else `gemmini_extended_mvin(..., 16, DIM)`.
+2. In the S1 KT mvin loop: same for j.
+3. In the O P mvin loop: same for k.
+4. In the O V mvin loop: same for j.
+
+This halves the mvin instruction count (from N to N/2 + possible 1 tail), reducing command-queue pressure and DMA setup overhead, which directly reduces latency since mvin instruction dispatch is a significant cost at this tile count.

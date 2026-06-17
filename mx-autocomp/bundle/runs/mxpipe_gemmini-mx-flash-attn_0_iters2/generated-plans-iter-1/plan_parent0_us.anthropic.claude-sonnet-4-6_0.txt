@@ -1,0 +1,90 @@
+# Optimization Plan: Strategy 12 — Eliminate Per-Tile `KT_sc_tile` Stack Buffer by Pre-Allocating a Persistent Global Buffer
+
+## Problem Identification
+
+In the current code, every iteration of the outer tile loop `t` allocates and fills a `static uint8_t KT_sc_tile[(ATT_D / 32) * BT]` buffer inside the `// 1) scores tile` block:
+
+```c
+static uint8_t KT_sc_tile[(ATT_D / 32) * BT];
+for (int sg = 0; sg < ATT_D / 32; sg++)
+  for (int sn = 0; sn < BT; sn++)
+    KT_sc_tile[sg * BT + sn] = KT_scales_col[sg][t * BT + sn];
+gemmini_mx_load_scales((uint64_t)KT_sc_tile, (ATT_D / 32) * BT, 1);
+```
+
+This has two inefficiencies:
+1. The `static` declaration inside the function means the buffer sits at a fixed address, but the repack loop itself runs every tile iteration, doing `(ATT_D/32) * BT = 2 * 64 = 128` scalar stores per tile across `N_TILES` tiles. These stores touch a buffer that may not be hot in cache because the previous tile's scalar softmax computation (step 2) has thrashed the cache with `S1_hw`, `M_run`, `L_run`, `O_acc`, `P_s`, `P_q` arrays.
+2. The repack is done **serially before** `gemmini_mx_load_scales` can be issued, creating a dependency chain: repack → load_scales → mvin → compute, with no overlap.
+
+## Proposed Change
+
+**Pre-allocate a persistent global buffer `KT_sc_packed` and fill tile `t+1`'s scale repack during the scalar softmax computation phase of tile `t`** (the step-2 loop). This amortizes the repack work into time that is otherwise purely CPU-bound scalar computation, eliminating it from the critical path of tile `t+1`'s Gemmini setup sequence.
+
+Concretely:
+
+### Step 1: Move the buffer to global scope
+
+Replace the `static` local declaration with a global (or file-scope) buffer:
+
+```c
+static uint8_t KT_sc_packed[2][(ATT_D / 32) * BT];  // double-buffered: [ping/pong]
+```
+
+Using a double-buffer (`[2][...]`) with index `t % 2` avoids aliasing between the fill (happening during tile `t`'s step 2) and the read (happening during tile `t+1`'s step 1). Since step 2 of tile `t` completes entirely before step 1 of tile `t+1` begins (sequential execution), a single buffer also works, but the double-buffer makes the intent explicit and safe.
+
+### Step 2: Pre-fill the next tile's scales at the end of step 2
+
+At the **end** of the step-2 scalar loop body (after all softmax and `P_q` encoding for tile `t`), add a prefill for tile `t+1`:
+
+```c
+// At end of step 2, prefill KT scales for tile t+1 (if t+1 < N_TILES)
+if (t + 1 < N_TILES) {
+  int next = t + 1;
+  int buf = (t + 1) % 2;
+  for (int sg = 0; sg < ATT_D / 32; sg++)
+    for (int sn = 0; sn < BT; sn++)
+      KT_sc_packed[buf][sg * BT + sn] = KT_scales_col[sg][next * BT + sn];
+}
+```
+
+### Step 3: Before the outer loop, prime tile 0's buffer
+
+Before the `for (int t = 0; t < N_TILES; t++)` loop begins, fill `KT_sc_packed[0]` for `t=0`:
+
+```c
+for (int sg = 0; sg < ATT_D / 32; sg++)
+  for (int sn = 0; sn < BT; sn++)
+    KT_sc_packed[0][sg * BT + sn] = KT_scales_col[sg][sn];  // t=0
+```
+
+### Step 4: Replace the in-loop repack with the pre-filled buffer
+
+In step 1 of the tile loop, remove the repack loop entirely and replace the `gemmini_mx_load_scales` call to read from the pre-filled buffer:
+
+```c
+// Before (remove this):
+// static uint8_t KT_sc_tile[(ATT_D / 32) * BT];
+// for (int sg = 0; sg < ATT_D / 32; sg++)
+//   for (int sn = 0; sn < BT; sn++)
+//     KT_sc_tile[sg * BT + sn] = KT_scales_col[sg][t * BT + sn];
+// gemmini_mx_load_scales((uint64_t)KT_sc_tile, (ATT_D / 32) * BT, 1);
+
+// After:
+gemmini_mx_load_scales((uint64_t)KT_sc_packed[t % 2], (ATT_D / 32) * BT, 1);
+```
+
+## Why This Improves Performance
+
+- The repack loop (128 scalar scatter-gather reads from `KT_scales_col` + stores to `KT_sc_packed`) now executes **during** step 2's CPU-bound softmax computation, which already dominates that phase's time. It is hidden behind existing work rather than sitting on the critical path.
+- The buffer `KT_sc_packed[t % 2]` is written during step 2 (while step 2's other arrays `P_q`, `P_s`, etc. are being written) and read at the very start of step 1 of the next iteration. By that point it is likely still warm in L1/L2 cache because it was just written, making `gemmini_mx_load_scales` DMA initiation faster.
+- The `static` keyword inside the function, while giving a fixed address, still causes the compiler to emit initialization guards and the buffer address may be cold after the large step-2 working set. A global `static` at file scope is consistently hot.
+- No change to the Gemmini instruction sequence, tile layout, scale correctness, or numerical results — the same repacked bytes are loaded, just prepared earlier.
+
+## Summary of Changes
+
+| Location | Change |
+|----------|--------|
+| File scope | Add `static uint8_t KT_sc_packed[2][(ATT_D/32)*BT]` |
+| Before tile loop | Prime `KT_sc_packed[0]` for `t=0` |
+| Step 1 (per tile) | Remove repack loop; use `KT_sc_packed[t%2]` in `gemmini_mx_load_scales` |
+| Step 2 (per tile) | At end, fill `KT_sc_packed[(t+1)%2]` for next tile if `t+1 < N_TILES` |

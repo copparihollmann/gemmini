@@ -1,0 +1,85 @@
+Looking at the error message and the code, I can identify several issues that would cause incorrect results:
+
+1. The code is missing the final `gemmini_mx_read_smem` call and has incorrect memory addressing
+2. The output reading logic is flawed - it's trying to read per row but not properly handling the BF16 packing
+3. The scratchpad layout calculations may have issues
+
+Let me fix the code while maintaining the optimization approach:
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+
+// Optimized Phase 3 Solution
+void solution(void) {
+  // B_s_pool needs to be unique per j0 to avoid write-after-read races when gemmini_fence() is deferred.
+  static uint8_t B_s_pool[BLOCKS_N][MATMUL_K / 32][BLK] __attribute__((aligned(4)));
+
+  int tiles = BLK / DIM;
+  int tiles_K = MATMUL_K / DIM;
+  uint32_t a_base = 0;
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+  int SPAD_DEST = 128;
+
+  gemmini_flush(0);
+
+  // 1. Configure execution formats and strides (only once)
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // 2. Load A scales directly from the contiguous DRAM array (0 CPU-staging cost!)
+  gemmini_mx_load_scales((uint64_t)A_scales_row, A_S_BYTES, 0);
+
+  // 3. Hoist the loading of the A matrix from DRAM to scratchpad (runs once instead of 16x)
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i * DIM) * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    }
+  }
+
+  // 4. Process B columns sequentially
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    int ncols = REAL_N - j0 * BLK;
+    if (ncols > BLK) ncols = BLK;
+    if (ncols <= 0) continue;
+
+    int pad_j = BLK - ncols;
+
+    // Stage B scales for the current column block to its unique staging slot
+    for (int g = 0; g < MATMUL_K / 32; g++) {
+      memcpy(&B_s_pool[j0][g][0], &B_scales_col[g][j0 * BLK], BLK);
+    }
+
+    // Load B scales
+    gemmini_mx_load_scales((uint64_t)B_s_pool[j0], B_S_BYTES, 1);
+
+    // Load B data into scratchpad
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+    for (int j = 0; j < tiles; j++) {
+      for (int k = 0; k < tiles_K; k++) {
+        gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                              b_base + (k * tiles + j) * DIM, DIM, DIM);
+      }
+    }
+
+    // Configure the output writer
+    gemmini_config_st(BLK_OUTC * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+
+    // Compute using the persistent A in scratchpad
+    gemmini_loop_ws_spad(tiles, tiles, tiles_K, BLK - REAL_M, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+    // Read out results to DRAM - fixed to properly handle BF16 packing
+    int bf16_ncols = (ncols + 1) / 2 * 2; // Round up to nearest even number for BF16 packing
+    gemmini_mx_read_smem((uint64_t)&C_hw[0][j0 * BLK / BF16_PER_WORD], 
+                         SPAD_DEST * 16, 
+                         REAL_M * bf16_ncols);
+  }
+
+  // Defer final synchronization to the very end
+  gemmini_fence();
+}
+```

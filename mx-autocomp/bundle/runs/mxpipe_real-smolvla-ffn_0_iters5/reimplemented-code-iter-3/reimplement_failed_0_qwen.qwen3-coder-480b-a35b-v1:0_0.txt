@@ -1,0 +1,99 @@
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+
+// Define compile-time constants for shape & parameters
+#define REAL_M 50
+#define REAL_N 256
+#define MATMUL_K 512
+
+#define MATMUL_M 64  // Padded to multiple of DIM
+#define MATMUL_N 256
+
+#define DIM 16
+#define BF16_PER_WORD 4
+#define OUT_COLS (MATMUL_N / BF16_PER_WORD)
+
+typedef uint8_t  elem_t;
+typedef uint64_t out_t;
+
+// Optimized solution implementing Strategy 3
+void solution(void) {
+  // 1. Flush and configure GEMMINI for WS FP8/BF16 mode
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 
+                              1, 1, 0, 0, false, 
+                              0, 0, 3, 0); // FP8 act/wgt, BF16 out, uselut=0
+
+  // 2. Load the entire activation scale-factor buffer once
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+
+  // 3. Cache the entire A matrix into the scratchpad
+  uint32_t a_base = 0;
+  int tiles_I = MATMUL_M / DIM;  // 4 tiles
+  int tiles_K = MATMUL_K / DIM;  // 32 tiles
+
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *dram_ptr = ((elem_t*)A_in) + (i * DIM) * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void*)dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  // 4. Process B in blocks of size N = 64 (satisfying accumulator limits)
+  int BLK_N = 64;
+  int tiles_J_block = BLK_N / DIM; // 4 tiles
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J_block * DIM; // 8192 - 32 * 4 * 16 = 6144
+  int SPAD_DEST = 128;
+
+  static uint8_t B_scales_block[16 * 64]; // 16 scale groups along K, 64 columns
+  uint32_t scale_factors[512] __attribute__((aligned(32)));
+
+  // Initialize scale_factors to zero
+  for (int i = 0; i < 512; i++) {
+    scale_factors[i] = 0;
+  }
+
+  gemmini_config_st((BLK_N / BF16_PER_WORD) * sizeof(out_t));
+
+  for (int j0 = 0; j0 < MATMUL_N / BLK_N; j0++) {
+    // Pack B scales for current block
+    for (int g = 0; g < 16; g++) {
+      memcpy(&B_scales_block[g * 64], &B_scales_col[g][j0 * 64], 64);
+    }
+
+    // Load packed scales for the current block of B
+    gemmini_mx_load_scales((uint64_t)B_scales_block, sizeof(B_scales_block), 1);
+
+    // Stream the current block of B into scratchpad
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+    for (int j = 0; j < tiles_J_block; j++) {
+      for (int k = 0; k < tiles_K; k++) {
+        elem_t *dram_ptr = ((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK_N + j * DIM);
+        uint32_t sp_addr = b_base + (j * tiles_K + k) * DIM;
+        gemmini_extended_mvin((void*)dram_ptr, sp_addr, DIM, DIM);
+      }
+    }
+
+    // Requantizer configuration
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J_block, tiles_K, 0, 0, 1);
+
+    // Issue the one-shot scratchpad base marker
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, a_base, BANK_NUM * BANK_ROWS, k_LOOP_WS_CONFIG_SPAD_AB);
+
+    // Compute via weight-stationary systolic loop
+    // pad_i = 14 (since REAL_M = 50, MATMUL_M = 64), pad_j = 0, pad_k = 0
+    gemmini_loop_ws_spad(tiles_I, tiles_J_block, tiles_K, 
+                         14, 0, 0, 
+                         a_base, BANK_NUM * BANK_ROWS, 0, 
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+    // Drain BF16-packed results directly from Shared Memory (SMEM) to destination DRAM
+    for (int r = 0; r < REAL_M; r++) {
+      gemmini_mx_read_smem(&C_hw[r][j0 * BLK_N], SPAD_DEST * 16 + r * BLK_N, BLK_N);
+    }
+    gemmini_fence();
+  }
+}

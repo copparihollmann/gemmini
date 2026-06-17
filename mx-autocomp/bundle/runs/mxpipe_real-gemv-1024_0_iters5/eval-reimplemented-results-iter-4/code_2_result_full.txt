@@ -1,0 +1,587 @@
+{'correct': False}
+Prev latency: 61275
+New latency: N/A
+Plan: An elegant way to optimize this tiled FP8 matrix multiplication is to apply **Strategy 7: Split execution loops into a "core" phase processing perfectly aligned full tiles and a "fringe" phase for partial edge tiles, completely removing branching and dynamic padding logic from the hot path.**
+
+### Analysis of Inefficiencies in the Original Code
+In the baseline code, the outer loops for `i0` and `j0` compute the actual row/column counts `mrows` and `ncols` and the padding parameters `pad_i` and `pad_j` dynamically for every single block. This introduces several overheads on the host CPU:
+1. **Branching and dynamic calculations:** The compiler cannot optimize loop boundaries, scale-factor loading, or output DMAs because the block dimensions are treated as variable.
+2. **Dynamic strides and sizes:** `gemmini_mx_read_smem` has to handle dynamic `ncols` instead of compile-time constants, which prevents the compiler from optimizing address generation and loop unrolling.
+
+### Optimization Plan
+1. **Extract Block Processing to an Inlined Helper:** Create a `static inline void run_block(...)` helper function that processes a single block. By declaring it `inline`, passing compile-time constants (like `BLK`) for fully-aligned blocks allows the compiler to perform constant propagation, entirely optimizing away boundary checks, padding math, and dynamic loops for the core phase.
+2. **Separate Core and Fringe Phases:**
+   - **Core Phase:** Run the main nested loops for `i0` and `j0` over all perfectly aligned full blocks (`core_BLOCKS_M = REAL_M / BLK` and `core_BLOCKS_N = REAL_N / BLK`). For these blocks, `mrows = BLK` and `ncols = BLK`, so `pad_i = 0` and `pad_j = 0`.
+   - **Bottom Fringe Phase:** Handle the bottom edge (last row block `i0 = BLOCKS_M - 1` if it is partial) for all core column blocks.
+   - **Right Fringe Phase:** Handle the right edge (last column block `j0 = BLOCKS_N - 1` if it is partial) for all core row blocks.
+   - **Corner Fringe Phase:** Handle the single bottom-right block if both dimensions have partial fringe blocks.
+3. **Move Pool Buffers to File Scope:** Move the static scale staging pools `A_s_pool` and `B_s_pool` to file scope to avoid redeclaring large static arrays inside nested helper functions, ensuring safe and efficient memory layout.
+
+---
+
+### Optimized Code
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+#include "include/matmul_fp8_64x64.h"
+
+#define DIM 16
+#define ADDR_LEN 32
+
+// Staging buffers for block scale factors to avoid write-after-read races
+static uint8_t A_s_pool[BLOCKS_M][BLOCKS_N][MATMUL_K / 32][BLK];
+static uint8_t B_s_pool[BLOCKS_M][BLOCKS_N][MATMUL_K / 32][BLK];
+
+// Inline helper to execute a single block with constant propagation support
+static inline void run_block(int i0, int j0, int mrows, int ncols) {
+  // Stage per-32-group scales to the designated block buffer
+  for (int g = 0; g < MATMUL_K / 32; g++) {
+    memcpy(&A_s_pool[i0][j0][g][0], &A_scales_row[g][i0 * BLK], BLK);
+    memcpy(&B_s_pool[i0][j0][g][0], &B_scales_col[g][j0 * BLK], BLK);
+  }
+
+  int tiles = BLK / DIM;
+  int tiles_K = MATMUL_K / DIM;
+  uint32_t a_base = 0;
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+  int SPAD_DEST = 128;
+  int pad_i = BLK - mrows;
+  int pad_j = BLK - ncols;
+
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)A_s_pool[i0][j0], A_S_BYTES, 0);
+  gemmini_mx_load_scales((uint64_t)B_s_pool[i0][j0], B_S_BYTES, 1);
+
+  // Load A tiles
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    }
+  }
+
+  // Load B tiles
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int j = 0; j < tiles; j++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                            b_base + (k * tiles + j) * DIM, DIM, DIM);
+    }
+  }
+
+  // Requantizer Configuration and Execution
+  gemmini_config_st(BLK_OUTC * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // Read results from shared memory
+  for (int r = 0; r < mrows; r++) {
+    gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                         SPAD_DEST * 16 + r * BLK, ncols);
+  }
+}
+
+// Main orchestrated tiled matmul split into core and fringe phases
+void solution(void) {
+  int core_BLOCKS_M = REAL_M / BLK;
+  int core_BLOCKS_N = REAL_N / BLK;
+
+  // 1. Core Phase: Execute fully aligned blocks with compile-time constant BLK dimensions
+  for (int i0 = 0; i0 < core_BLOCKS_M; i0++) {
+    for (int j0 = 0; j0 < core_BLOCKS_N; j0++) {
+      run_block(i0, j0, BLK, BLK);
+    }
+  }
+
+  // 2. Bottom Fringe Phase: Execute the last partial row block across core columns
+  if (core_BLOCKS_M < BLOCKS_M) {
+    int i0 = BLOCKS_M - 1;
+    int mrows = REAL_M - i0 * BLK;
+    if (mrows > 0) {
+      for (int j0 = 0; j0 < core_BLOCKS_N; j0++) {
+        run_block(i0, j0, mrows, BLK);
+      }
+    }
+  }
+
+  // 3. Right Fringe Phase: Execute the last partial column block across core rows
+  if (core_BLOCKS_N < BLOCKS_N) {
+    int j0 = BLOCKS_N - 1;
+    int ncols = REAL_N - j0 * BLK;
+    if (ncols > 0) {
+      for (int i0 = 0; i0 < core_BLOCKS_M; i0++) {
+        run_block(i0, j0, BLK, ncols);
+      }
+    }
+  }
+
+  // 4. Corner Fringe Phase: Execute the bottom-right corner block
+  if (core_BLOCKS_M < BLOCKS_M && core_BLOCKS_N < BLOCKS_N) {
+    int i0 = BLOCKS_M - 1;
+    int j0 = BLOCKS_N - 1;
+    int mrows = REAL_M - i0 * BLK;
+    int ncols = REAL_N - j0 * BLK;
+    if (mrows > 0 && ncols > 0) {
+      run_block(i0, j0, mrows, ncols);
+    }
+  }
+
+  // Enforce memory synchronization barrier
+  gemmini_fence();
+}
+```
+
+CodeCandidate(parent=CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED outer-tiled MX matmul baseline (1x1024x1024).
+void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+   for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Partial last M/N block: compute only the real rows/cols, pad the rest.
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+      // PROF cpu_stage
+      // Stage only the tiny per-32-group scales; A/B data is mvin\'d DIRECTLY
+      // from DRAM (no host-side block memcpy — that was 98% of the cycles).
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+      // PROF accel
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K (full block-aligned tiles)
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+      for (int j = 0; j < tiles; j++)                    // B[k][j0*BLK+j] -> slot (k*tiles + j)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      // Accelerator-centric readout: per-row hardware DMA from smem straight into the
+      // bf16-packed row-major output (block-internal smem row stride is BLK).
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+}
+''',
+score=61441,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'CPU/host data staging detected (2 memcpy, ~0 scalar copy loops). Host staging is typically the dominant cost on this accelerator and autocomp cannot speed it up directly: mvin tiles STRIDED straight from the source DRAM arrays instead of copying through a host buffer, and keep partial sums in shared memory (bf16 accumulate) rather than accumulating on the CPU.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''An elegant and highly effective way to optimize this MX-Gemmini kernel is to **apply Strategy 3: minimize `gemmini_fence` calls by deferring synchronization to after the full tile batch completes.**
+
+### Optimization Plan
+
+1. **The Inefficiency**: In the original code, `gemmini_fence()` is invoked at the end of every `(i0, j0)` block iteration. This forces the host CPU to block and wait for the Gemmini hardware to complete all DMA transfers (`gemmini_mx_read_smem`) and computations for the current block before issuing the instructions for the next block. This completely prevents overlapping of CPU-side staging/instruction issuance with coprocessor execution.
+2. **The Optimization**: We will move `gemmini_fence()` completely outside of the nested outer loops to the very end of `solution()`. This allows the CPU to continuously stream and queue up instructions for all blocks into the coprocessor\'s hardware instruction queue without any blocking overhead.
+3. **Preventing Race Conditions**: When `gemmini_fence()` is deferred to the end, the CPU will run far ahead of the coprocessor. If we reuse a single staging buffer (`A_s` and `B_s`) across iterations, the CPU will overwrite the scale factors of subsequent blocks before the coprocessor has finished reading the scale factors from the previous block via DMA. To prevent this write-after-read race condition, we will allocate unique scale staging buffers for each block in a pooled static array: `A_s_pool[BLOCKS_M][BLOCKS_N][MATMUL_K / 32][BLK]`. Each iteration `(i0, j0)` will write to and load scales from its own dedicated portion of the pool.
+
+---
+
+### Optimized Code
+
+```c
+// AUTO-GENERATED outer-tiled MX matmul baseline (1x1024x1024) - Optimized Phase 1
+void solution(void) {
+  // Define unique scale factor staging buffers for each block to avoid write-after-read races
+  // when gemmini_fence() is deferred to the end of the full batch.
+  static uint8_t A_s_pool[BLOCKS_M][BLOCKS_N][MATMUL_K / 32][BLK];
+  static uint8_t B_s_pool[BLOCKS_M][BLOCKS_N][MATMUL_K / 32][BLK];
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Partial last M/N block: compute only the real rows/cols, pad the rest.
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      // Stage only the tiny per-32-group scales to their unique block buffer
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s_pool[i0][j0][g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s_pool[i0][j0][g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)A_s_pool[i0][j0], A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s_pool[i0][j0], B_S_BYTES, 1);
+
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K (full block-aligned tiles)
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+      for (int j = 0; j < tiles; j++)                    // B[k][j0*BLK+j] -> slot (k*tiles + j)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Accelerator-centric readout: per-row hardware DMA from smem straight into the
+      // bf16-packed row-major output (block-internal smem row stride is BLK).
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+    }
+  }
+
+  // Defer synchronization to after the entire batch has been successfully queued.
+  gemmini_fence();
+}
+```''',
+code='''// AUTO-GENERATED outer-tiled MX matmul baseline (1x1024x1024) - Optimized Phase 1
+void solution(void) {
+  // Define unique scale factor staging buffers for each block to avoid write-after-read races
+  // when gemmini_fence() is deferred to the end of the full batch.
+  static uint8_t A_s_pool[BLOCKS_M][BLOCKS_N][MATMUL_K / 32][BLK];
+  static uint8_t B_s_pool[BLOCKS_M][BLOCKS_N][MATMUL_K / 32][BLK];
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Partial last M/N block: compute only the real rows/cols, pad the rest.
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      // Stage only the tiny per-32-group scales to their unique block buffer
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s_pool[i0][j0][g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s_pool[i0][j0][g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)A_s_pool[i0][j0], A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s_pool[i0][j0], B_S_BYTES, 1);
+
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K (full block-aligned tiles)
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+      for (int j = 0; j < tiles; j++)                    // B[k][j0*BLK+j] -> slot (k*tiles + j)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Accelerator-centric readout: per-row hardware DMA from smem straight into the
+      // bf16-packed row-major output (block-internal smem row stride is BLK).
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+    }
+  }
+
+  // Defer synchronization to after the entire batch has been successfully queued.
+  gemmini_fence();
+}
+''',
+score=61275,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'CPU/host data staging detected (2 memcpy, ~0 scalar copy loops). Host staging is typically the dominant cost on this accelerator and autocomp cannot speed it up directly: mvin tiles STRIDED straight from the source DRAM arrays instead of copying through a host buffer, and keep partial sums in shared memory (bf16 accumulate) rather than accumulating on the CPU.'],
+plan_gen_model='gemini-3.5-flash',
+code_gen_model='qwen.qwen3-coder-480b-a35b-v1:0',
+stdout=None,
+stderr=None),
+plan='''An elegant way to optimize this tiled FP8 matrix multiplication is to apply **Strategy 7: Split execution loops into a "core" phase processing perfectly aligned full tiles and a "fringe" phase for partial edge tiles, completely removing branching and dynamic padding logic from the hot path.**
+
+### Analysis of Inefficiencies in the Original Code
+In the baseline code, the outer loops for `i0` and `j0` compute the actual row/column counts `mrows` and `ncols` and the padding parameters `pad_i` and `pad_j` dynamically for every single block. This introduces several overheads on the host CPU:
+1. **Branching and dynamic calculations:** The compiler cannot optimize loop boundaries, scale-factor loading, or output DMAs because the block dimensions are treated as variable.
+2. **Dynamic strides and sizes:** `gemmini_mx_read_smem` has to handle dynamic `ncols` instead of compile-time constants, which prevents the compiler from optimizing address generation and loop unrolling.
+
+### Optimization Plan
+1. **Extract Block Processing to an Inlined Helper:** Create a `static inline void run_block(...)` helper function that processes a single block. By declaring it `inline`, passing compile-time constants (like `BLK`) for fully-aligned blocks allows the compiler to perform constant propagation, entirely optimizing away boundary checks, padding math, and dynamic loops for the core phase.
+2. **Separate Core and Fringe Phases:**
+   - **Core Phase:** Run the main nested loops for `i0` and `j0` over all perfectly aligned full blocks (`core_BLOCKS_M = REAL_M / BLK` and `core_BLOCKS_N = REAL_N / BLK`). For these blocks, `mrows = BLK` and `ncols = BLK`, so `pad_i = 0` and `pad_j = 0`.
+   - **Bottom Fringe Phase:** Handle the bottom edge (last row block `i0 = BLOCKS_M - 1` if it is partial) for all core column blocks.
+   - **Right Fringe Phase:** Handle the right edge (last column block `j0 = BLOCKS_N - 1` if it is partial) for all core row blocks.
+   - **Corner Fringe Phase:** Handle the single bottom-right block if both dimensions have partial fringe blocks.
+3. **Move Pool Buffers to File Scope:** Move the static scale staging pools `A_s_pool` and `B_s_pool` to file scope to avoid redeclaring large static arrays inside nested helper functions, ensuring safe and efficient memory layout.
+
+---
+
+### Optimized Code
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+#include "include/matmul_fp8_64x64.h"
+
+#define DIM 16
+#define ADDR_LEN 32
+
+// Staging buffers for block scale factors to avoid write-after-read races
+static uint8_t A_s_pool[BLOCKS_M][BLOCKS_N][MATMUL_K / 32][BLK];
+static uint8_t B_s_pool[BLOCKS_M][BLOCKS_N][MATMUL_K / 32][BLK];
+
+// Inline helper to execute a single block with constant propagation support
+static inline void run_block(int i0, int j0, int mrows, int ncols) {
+  // Stage per-32-group scales to the designated block buffer
+  for (int g = 0; g < MATMUL_K / 32; g++) {
+    memcpy(&A_s_pool[i0][j0][g][0], &A_scales_row[g][i0 * BLK], BLK);
+    memcpy(&B_s_pool[i0][j0][g][0], &B_scales_col[g][j0 * BLK], BLK);
+  }
+
+  int tiles = BLK / DIM;
+  int tiles_K = MATMUL_K / DIM;
+  uint32_t a_base = 0;
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+  int SPAD_DEST = 128;
+  int pad_i = BLK - mrows;
+  int pad_j = BLK - ncols;
+
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)A_s_pool[i0][j0], A_S_BYTES, 0);
+  gemmini_mx_load_scales((uint64_t)B_s_pool[i0][j0], B_S_BYTES, 1);
+
+  // Load A tiles
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    }
+  }
+
+  // Load B tiles
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int j = 0; j < tiles; j++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                            b_base + (k * tiles + j) * DIM, DIM, DIM);
+    }
+  }
+
+  // Requantizer Configuration and Execution
+  gemmini_config_st(BLK_OUTC * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // Read results from shared memory
+  for (int r = 0; r < mrows; r++) {
+    gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                         SPAD_DEST * 16 + r * BLK, ncols);
+  }
+}
+
+// Main orchestrated tiled matmul split into core and fringe phases
+void solution(void) {
+  int core_BLOCKS_M = REAL_M / BLK;
+  int core_BLOCKS_N = REAL_N / BLK;
+
+  // 1. Core Phase: Execute fully aligned blocks with compile-time constant BLK dimensions
+  for (int i0 = 0; i0 < core_BLOCKS_M; i0++) {
+    for (int j0 = 0; j0 < core_BLOCKS_N; j0++) {
+      run_block(i0, j0, BLK, BLK);
+    }
+  }
+
+  // 2. Bottom Fringe Phase: Execute the last partial row block across core columns
+  if (core_BLOCKS_M < BLOCKS_M) {
+    int i0 = BLOCKS_M - 1;
+    int mrows = REAL_M - i0 * BLK;
+    if (mrows > 0) {
+      for (int j0 = 0; j0 < core_BLOCKS_N; j0++) {
+        run_block(i0, j0, mrows, BLK);
+      }
+    }
+  }
+
+  // 3. Right Fringe Phase: Execute the last partial column block across core rows
+  if (core_BLOCKS_N < BLOCKS_N) {
+    int j0 = BLOCKS_N - 1;
+    int ncols = REAL_N - j0 * BLK;
+    if (ncols > 0) {
+      for (int i0 = 0; i0 < core_BLOCKS_M; i0++) {
+        run_block(i0, j0, BLK, ncols);
+      }
+    }
+  }
+
+  // 4. Corner Fringe Phase: Execute the bottom-right corner block
+  if (core_BLOCKS_M < BLOCKS_M && core_BLOCKS_N < BLOCKS_N) {
+    int i0 = BLOCKS_M - 1;
+    int j0 = BLOCKS_N - 1;
+    int mrows = REAL_M - i0 * BLK;
+    int ncols = REAL_N - j0 * BLK;
+    if (mrows > 0 && ncols > 0) {
+      run_block(i0, j0, mrows, ncols);
+    }
+  }
+
+  // Enforce memory synchronization barrier
+  gemmini_fence();
+}
+```''',
+code='''#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+#include "include/matmul_fp8_64x64.h"
+
+#define DIM 16
+#define ADDR_LEN 32
+
+// Staging buffers for block scale factors to avoid write-after-read races
+static uint8_t A_s_pool[BLOCKS_M][BLOCKS_N][MATMUL_K / 32][BLK];
+static uint8_t B_s_pool[BLOCKS_M][BLOCKS_N][MATMUL_K / 32][BLK];
+
+// Helper to execute a single block 
+void run_block(int i0, int j0, int mrows, int ncols) {
+  // Stage per-32-group scales to the designated block buffer
+  for (int g = 0; g < MATMUL_K / 32; g++) {
+    memcpy(&A_s_pool[i0][j0][g][0], &A_scales_row[g][i0 * BLK], BLK);
+    memcpy(&B_s_pool[i0][j0][g][0], &B_scales_col[g][j0 * BLK], BLK);
+  }
+
+  const int tiles_I = (mrows + DIM - 1) / DIM;  // Ceiling division
+  const int tiles_J = (ncols + DIM - 1) / DIM;  // Ceiling division
+  const int tiles_K = MATMUL_K / DIM;
+  const uint32_t a_base = 0;
+  const uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_J * tiles_K * DIM;
+  const int SPAD_DEST = 128;
+  const int pad_i = tiles_I * DIM - mrows;
+  const int pad_j = tiles_J * DIM - ncols;
+
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)A_s_pool[i0][j0], A_S_BYTES, 0);
+  gemmini_mx_load_scales((uint64_t)B_s_pool[i0][j0], B_S_BYTES, 1);
+
+  // Load A tiles
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    }
+  }
+
+  // Load B tiles
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                            b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+    }
+  }
+
+  // Requantizer Configuration and Execution
+  gemmini_config_st(BLK_OUTC * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // Read results from shared memory
+  for (int r = 0; r < mrows; r++) {
+    gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                         SPAD_DEST * 16 + r * BLK, ncols);
+  }
+}
+
+// Main orchestrated tiled matmul split into core and fringe phases
+void solution(void) {
+  const int core_BLOCKS_M = REAL_M / BLK;
+  const int core_BLOCKS_N = REAL_N / BLK;
+
+  // 1. Core Phase: Execute fully aligned blocks with compile-time constant BLK dimensions
+  for (int i0 = 0; i0 < core_BLOCKS_M; i0++) {
+    for (int j0 = 0; j0 < core_BLOCKS_N; j0++) {
+      run_block(i0, j0, BLK, BLK);
+    }
+  }
+
+  // 2. Bottom Fringe Phase: Execute the last partial row block across core columns
+  if (core_BLOCKS_M < BLOCKS_M) {
+    const int i0 = BLOCKS_M - 1;
+    const int mrows = REAL_M - i0 * BLK;
+    if (mrows > 0) {
+      for (int j0 = 0; j0 < core_BLOCKS_N; j0++) {
+        run_block(i0, j0, mrows, BLK);
+      }
+    }
+  }
+
+  // 3. Right Fringe Phase: Execute the last partial column block across core rows
+  if (core_BLOCKS_N < BLOCKS_N) {
+    const int j0 = BLOCKS_N - 1;
+    const int ncols = REAL_N - j0 * BLK;
+    if (ncols > 0) {
+      for (int i0 = 0; i0 < core_BLOCKS_M; i0++) {
+        run_block(i0, j0, BLK, ncols);
+      }
+    }
+  }
+
+  // 4. Corner Fringe Phase: Execute the bottom-right corner block
+  if (core_BLOCKS_M < BLOCKS_M && core_BLOCKS_N < BLOCKS_N) {
+    const int i0 = BLOCKS_M - 1;
+    const int j0 = BLOCKS_N - 1;
+    const int mrows = REAL_M - i0 * BLK;
+    const int ncols = REAL_N - j0 * BLK;
+    if (mrows > 0 && ncols > 0) {
+      run_block(i0, j0, mrows, ncols);
+    }
+  }
+
+  // Enforce memory synchronization barrier
+  gemmini_fence();
+}
+''',
+score=inf,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='gemini-3.5-flash',
+code_gen_model='qwen.qwen3-coder-480b-a35b-v1:0',
+stdout="auto_comp_test.c:(.text.startup+0x4c): undefined reference to `run_block'\ncollect2: error: ld returned 1 exit status\nmake[1]: *** [/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/Makefile:145: auto_comp_test-baremetal] Error 1\nmake: *** [Makefile:20: bareMetalC] Error 2\n|                                                ~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~\n/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/auto_comp_test.c:124:10: warning: 'full_is_equal' accessing 131072 bytes in a region of size 8 [-Wstringop-overflow=]\n124 |     if (!full_is_equal(OUTPUT_MATRIX_NAME, gold)) {\n|          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/auto_comp_test.c:124:10: note: referencing argument 2 of type 'const out_t[64][256]' {aka 'const long unsigned int[64][256]'}\n/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/auto_comp_test.c:53:5: note: in a call to function 'full_is_equal'\n53 | int full_is_equal(out_t x[MATMUL_M][OUT_COLS], const out_t y[MATMUL_M][OUT_COLS]) {\n|     ^~~~~~~~~~~~~\n/scratch/agustin/projects/chipyard-mx/.conda-env/riscv-tools/bin/../lib/gcc/riscv64-unknown-elf/13.2.0/../../../../riscv64-unknown-elf/bin/ld: warning: auto_comp_test-baremetal has a LOAD segment with RWX permissions\n/scratch/agustin/projects/chipyard-mx/.conda-env/riscv-tools/bin/../lib/gcc/riscv64-unknown-elf/13.2.0/../../../../riscv64-unknown-elf/bin/ld: /tmp/ccyc8FDM.o: in function `main':\nmake[1]: Leaving directory '/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/bareMetalC'",
+stderr=None)

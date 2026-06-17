@@ -1,0 +1,72 @@
+An effective performance strategy to reduce execution time for this program is **Exploiting Scale Memory Persistence via Invariant Scale Factor Hoisting**.
+
+### How This Strategy Works and Improves Performance
+
+In the baseline implementation, both the activation scale factors (`A_s`) and weight scale factors (`B_s`) are loaded into Gemmini's scale memory using `gemmini_mx_load_scales` inside the innermost `j0` loop. 
+
+However, Gemmini's internal scale-factor buffers (`mx_scale_a_mem` and `mx_scale_b_mem`) are stateful and persistent until they are explicitly overwritten. Since the activation scale factors (`A_s`) only depend on the outer loop index `i0`, they remain completely invariant across all iterations of the inner `j0` loop. 
+
+By hoisting the activation scale factor loading (`gemmini_mx_load_scales` with `sel=0`) and the TLB flush (`gemmini_flush`) out of the inner `j0` loop and into the outer `i0` loop, we eliminate $BLOCKS\_N - 1$ redundant scale loads per outer loop step. Since `gemmini_mx_load_scales` initiates a DRAM DMA stream that incurs synchronization and memory bus overhead, hoisting this instruction significantly reduces RoCC command queue pressure and saves critical off-chip memory bandwidth.
+
+### Rewritten Code
+
+```c
+void solution(void) {
+  // Hoist invariant configuration outside all loops
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+
+    // A scales only depend on i0: copy once per i0, reuse across all j0.
+    for (int g = 0; g < MATMUL_K / 32; g++)
+      memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+
+    // Hoist the TLB flush and the invariant A-scale load to the outer loop.
+    // Gemmini's mx_scale_a_mem (sel=0) will persist across all j0 iterations.
+    gemmini_flush(0);
+    gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      // B scales depend on j0: copy once per (i0,j0).
+      for (int g = 0; g < MATMUL_K / 32; g++)
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      // Load only the weight scale factors (sel=1) in the inner loop.
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int j = 0; j < tiles; j++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+
+      gemmini_fence();
+    }
+  }
+}
+```

@@ -1,0 +1,121 @@
+void solution(void) {
+  // ---- flash attention: tile K/V along sequence, online softmax ----
+  for (int i = 0; i < ATT_S; i++) { M_run[i] = -1e30f; L_run[i] = 0.0f; }
+  memset(O_acc, 0, ATT_S * ATT_D * sizeof(float));
+
+  // Precompute tile counts (invariant across all t)
+  const int tiles_I_qk = ATT_S / DIM, tiles_J_qk = BT / DIM, tiles_K_qk = ATT_D / DIM;
+  const int tiles_I_pv = ATT_S / DIM, tiles_J_pv = ATT_D / DIM, tiles_K_pv = BT / DIM;
+  const uint32_t a_base_qk = 0;
+  const uint32_t b_base_qk = BANK_NUM * BANK_ROWS - tiles_K_qk * tiles_J_qk * DIM;
+  const uint32_t a_base_pv = 0;
+  const uint32_t b_base_pv = BANK_NUM * BANK_ROWS - tiles_K_pv * tiles_J_pv * DIM;
+  const int SPAD_DEST = 128;
+
+  // Hoist: one-time setup invariant across all tile iterations
+  // (Strategy 13: hoist config_ex, config_st, and flush outside tile loop)
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                               1, 1, 0, 0, false, 0, 0, 3, 0);
+  // Q@KT uses BLK_OUTC stride for output; set it once here before the loop.
+  gemmini_config_st(BLK_OUTC * sizeof(out_t));
+
+  for (int t = 0; t < N_TILES; t++) {
+    // 1) scores tile S1 = Q @ K_t^T   [S x BT] on Gemmini
+    {
+      // gemmini_flush and config_ex hoisted above; config_st(BLK_OUTC) set
+      // either by the hoist (first iteration) or the restore at end of loop body.
+      gemmini_mx_load_scales((uint64_t)&Q_scales_row, sizeof(Q_scales_row), 0);
+      static uint8_t KT_sc_tile[(ATT_D / 32) * BT];
+      for (int sg = 0; sg < ATT_D / 32; sg++)
+        for (int sn = 0; sn < BT; sn++)
+          KT_sc_tile[sg * BT + sn] = KT_scales_col[sg][t * BT + sn];
+      gemmini_mx_load_scales((uint64_t)KT_sc_tile, (ATT_D / 32) * BT, 1);
+      gemmini_config_ld(ATT_D * sizeof(elem_t));
+      for (int i = 0; i < tiles_I_qk; i++)
+        for (int k = 0; k < tiles_K_qk; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                                a_base_qk + (i * tiles_K_qk + k) * DIM, DIM, DIM);
+      gemmini_config_ld(ATT_S * sizeof(elem_t));
+      for (int j = 0; j < tiles_J_qk; j++)
+        for (int k = 0; k < tiles_K_qk; k++)
+          gemmini_extended_mvin2((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + t * BT + j * DIM),
+                                 b_base_qk + (k * tiles_J_qk + j) * DIM, DIM, DIM);
+      // config_st(BLK_OUTC) already active (hoisted or restored at end of previous iteration)
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I_qk, tiles_J_qk, tiles_K_qk,
+                                   0, 0, 1);
+      gemmini_loop_ws_spad(tiles_I_qk, tiles_J_qk, tiles_K_qk, 0, 0, 0,
+                           a_base_qk, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                           false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * BT);
+      gemmini_fence();
+    }
+
+    // 2) online softmax update + fp8 requant of P_t (CPU)
+    for (int i = 0; i < ATT_S; i++) {
+      float m_new = M_run[i];
+      float row[BT];
+      for (int j = 0; j < BT; j++) {
+        uint16_t b = (uint16_t)((S1_hw[i][j / 4] >> ((j % 4) * 16)) & 0xFFFF);
+        row[j] = bf16_to_f(b);
+        if (row[j] > m_new) m_new = row[j];
+      }
+      float corr = exp_f(M_run[i] - m_new);
+      float l_new = L_run[i] * corr;
+      for (int j = 0; j < BT; j++) { row[j] = exp_f(row[j] - m_new); l_new += row[j]; }
+      for (int d = 0; d < ATT_D; d++) O_acc[i][d] *= corr;
+      M_run[i] = m_new; L_run[i] = l_new;
+      for (int g = 0; g < GROUPS_BT; g++) {
+        float gmax = 0.0f;
+        for (int j = g * 32; j < (g + 1) * 32; j++)
+          if (f_abs(row[j]) > gmax) gmax = f_abs(row[j]);
+        int e = 0;
+        if (gmax > 0.0f) e = f_exp(gmax / 16.0f) + 1;
+        float inv_scale = pow2i(-e);
+        P_s[g][i] = (uint8_t)(e + 127);
+        for (int j = g * 32; j < (g + 1) * 32; j++)
+          P_q[i][j] = fp8_e4m3_rtz(row[j] * inv_scale);
+      }
+    }
+
+    // 3) O_tile = P_t @ V_t  [S x D] on Gemmini; accumulate in fp32
+    {
+      // config_ex still active (hoisted); no flush needed
+      gemmini_mx_load_scales((uint64_t)P_s, GROUPS_BT * ATT_S, 0);
+      gemmini_mx_load_scales((uint64_t)&V_scales_col[t * GROUPS_BT][0], GROUPS_BT * ATT_D, 1);
+      gemmini_config_ld(BT * sizeof(elem_t));
+      for (int i = 0; i < tiles_I_pv; i++)
+        for (int k = 0; k < tiles_K_pv; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * BT + k * DIM),
+                                a_base_pv + (i * tiles_K_pv + k) * DIM, DIM, DIM);
+      gemmini_config_ld(ATT_D * sizeof(elem_t));
+      for (int j = 0; j < tiles_J_pv; j++)
+        for (int k = 0; k < tiles_K_pv; k++)
+          gemmini_extended_mvin2((void*)(((elem_t*)V_in) + (t * BT + k * DIM) * ATT_D + j * DIM),
+                                 b_base_pv + (k * tiles_J_pv + j) * DIM, DIM, DIM);
+      gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I_pv, tiles_J_pv, tiles_K_pv,
+                                   0, 0, 1);
+      gemmini_loop_ws_spad(tiles_I_pv, tiles_J_pv, tiles_K_pv, 0, 0, 0,
+                           a_base_pv, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                           false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      gemmini_mx_read_smem(&O_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+      gemmini_fence();
+      for (int i = 0; i < ATT_S; i++)
+        for (int d = 0; d < ATT_D; d++) {
+          uint16_t b = (uint16_t)((O_hw[i][d / 4] >> ((d % 4) * 16)) & 0xFFFF);
+          O_acc[i][d] += bf16_to_f(b);
+        }
+
+      // Restore config_st to BLK_OUTC for the next iteration's Q@KT phase.
+      if (t + 1 < N_TILES)
+        gemmini_config_st(BLK_OUTC * sizeof(out_t));
+    }
+  }
+
+  // final normalization by the online denominator
+  for (int i = 0; i < ATT_S; i++) {
+    float inv_l = 1.0f / L_run[i];
+    for (int d = 0; d < ATT_D; d++) O_acc[i][d] *= inv_l;
+  }
+}

@@ -1,0 +1,84 @@
+An elegant and highly effective optimization strategy for this hardware target is **DMA Command Batching via Multi-Tile Loading**.
+
+### Optimization Plan: DMA Command Batching
+
+#### 1. The Inefficiency
+In the baseline code, loading the input tiles of matrices $A$ and $B$ into the scratchpad is done on a single-tile (16x16) basis. This results in:
+* **64 separate `mvin` calls for $A$** ($4 \times 16$)
+* **64 separate `mvin` calls for $B$** ($16 \times 4$)
+
+This total of **128 individual RoCC instructions** incurs a massive CPU dispatch overhead and keeps the host pipeline busy translating and queuing commands rather than overlapping execution.
+
+#### 2. The Strategy
+Gemmini's scratchpad DMA controller supports loading up to `MAX_BLOCK_LEN = 4` contiguous $16 \times 16$ tiles in a single instruction by configuring the column width to $4 \times \text{DIM} = 64$.
+* **For A**: The $K$ dimension has $tk = 16$ tiles, which are stored contiguously in DRAM. We can batch the $16$ tiles into $4$ chunks of $4$ tiles each. This reduces the number of $A$ `mvin` calls from 64 to 16.
+* **For B**: For each step in $K$, the $J$ dimension has $tj = 4$ tiles, which are also contiguous in DRAM. We can load all 4 tiles of $B$ along the $J$ dimension at once. This reduces the number of $B$ `mvin` calls from 64 to 16.
+
+This simple change reduces the total number of `mvin` calls from **128 down to 32**, eliminating 96 RoCC instructions and dramatically reducing instruction dispatch latency.
+
+---
+
+### Optimized Code
+
+```c
+#include <stdint.h>
+#include "include/gemmini_testutils.h"
+
+// Optimized MX matmul kernel (128x128x256, fp6:e3m2)
+void solution(void) {
+  {
+    int ti = MATMUL_M / DIM / 2, tj = MATMUL_N / DIM / 2, tk = MATMUL_K / DIM;
+    uint32_t ab = 0;
+    uint32_t bb = BANK_NUM * BANK_ROWS - tk * tj * DIM;
+    int SDST = 128;
+
+    // 1. Configure execution format to FP6
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 1, 1, 3, 1);
+
+    // 2. Load scale factors
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+    // 3. Load quantization look-up tables
+    gemmini_mx_load_lut((uint64_t)B_lut_p, 1, 0);
+    gemmini_mx_load_lut((uint64_t)A_lut_p, 1, 1);
+
+    // 4. Batch-load A tiles (4 tiles per mvin command)
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i = 0; i < ti; i++) {
+      for (int k = 0; k < tk; k += 4) {
+        gemmini_extended_mvin(
+          (void*)(((elem_t*)A_in_hw) + i * DIM * MATMUL_K + k * DIM), 
+          ab + (i * tk + k) * DIM, 
+          4 * DIM, 
+          DIM
+        );
+      }
+    }
+
+    // 4. Batch-load B tiles (4 tiles per mvin command)
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2);
+    for (int k = 0; k < tk; k++) {
+      gemmini_extended_mvin(
+        (void*)(((elem_t*)B_in) + k * DIM * (MATMUL_N / 2)), 
+        bb + (k * tj) * DIM, 
+        4 * DIM, 
+        DIM
+      );
+    }
+
+    // 5. Configure write-back and requantizer
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti, tj, tk, 0, 0, 9);
+
+    // 6. Compute weight-stationary tiled matmul in hardware
+    gemmini_loop_ws_spad(ti, tj, tk, 0, 0, 0, ab, BANK_NUM * BANK_ROWS, 0, SDST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+    // 7. Drain BF16-packed outputs
+    gemmini_mx_read_smem(&C_hw[0][0], SDST * 16, MATMUL_M * MATMUL_N);
+
+    // 8. Memory barrier
+    gemmini_fence();
+  }
+}
+```

@@ -1,0 +1,126 @@
+## Analysis
+
+Looking at the original code, I need to identify the key inefficiency to address with a single strategy.
+
+**Current B tile layout in the original code:**
+```c
+uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+```
+This uses a `(k, j)` row-major ordering for B tiles in the scratchpad.
+
+**What `gemmini_loop_ws_spad` expects:**
+From the architecture docs and reference pattern: B tiles must be at `b_base + (j*tiles_K + k)*DIM`. The hardware loop iterates weight-stationary, meaning for each `(i,j)` output tile, it sweeps `k=0..tiles_K-1`. For this to work correctly, the B tile for column-block `j` and reduction `k` must be at `b_base + (j*tiles_K + k)*DIM`.
+
+The original uses `(k*tiles_J + j)` which is a different layout. This is a correctness/layout issue. Looking more carefully at whether this affects correctness or just the strategies...
+
+**Strategy 13: Hoist `gemmini_config_ld` outside mvin loops**
+
+The original code issues `gemmini_config_ld` once for A (stride = `MATMUL_K * sizeof(elem_t)`) and once for B (stride = `MATMUL_N * sizeof(elem_t)`), which is already outside the loops. This is fine.
+
+**Strategy 12: Batch multiple contiguous A rows into a single mvin call**
+
+For A tiles: `dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM`. When `k` increases by 1, the pointer advances by `DIM` bytes — but rows in DRAM are `MATMUL_K` bytes wide, so consecutive `k` tiles are NOT contiguous. When `i` increases by 1, consecutive rows of the same `k` ARE spaced `DIM * MATMUL_K` bytes apart, not contiguous. So batching along K isn't straightforward, but batching along I (multiple rows at once) is possible if we issue `DIM*rows_per_block` cols with the right stride.
+
+Actually, looking at `gemmini_extended_mvin(dram_ptr, sp_addr, cols, rows)` — the `rows` parameter can be up to `MAX_BLOCK_LEN=4`. With `gemmini_config_ld(MATMUL_K * sizeof(elem_t))`, each row in DRAM is `MATMUL_K` bytes wide. We can load multiple rows at once by increasing `rows` parameter to up to 4.
+
+For A tiles at fixed `k`, as `i` varies: `dram_ptr = A_in + i*DIM*MATMUL_K + k*DIM`. These are `MATMUL_K` bytes apart in DRAM (exactly the stride), and in the scratchpad they'd need to be at `a_base + (i*tiles_K+k)*DIM` — but for different `i` values, the scratchpad addresses are `tiles_K*DIM` apart, not 1*DIM apart. So batching along i-dimension doesn't map cleanly to contiguous spad rows.
+
+**Strategy 13** is the clearest win here — but it's already done.
+
+**Strategy 9: Reorder I/J/K loop nest** — The B mvin loop is `k,j` but should be `j,k` to match the expected spad layout `b_base + (j*tiles_K + k)*DIM`.
+
+The plan: Apply **strategy 9** — reorder the B mvin loop from `(k,j)` to `(j,k)` to match the correct scratchpad layout `b_base + (j*tiles_K + k)*DIM`, and use `b_base + (j*tiles_K + k)*DIM` addressing. This fixes the B tile layout to match what `gemmini_loop_ws_spad` expects for weight-stationary reuse.
+
+## Plan
+
+**Strategy 9: Reorder I/J/K loop nest to maximize weight-stationary B-tile reuse**
+
+**Problem:** The original B mvin loop uses order `(k outer, j inner)` with address `b_base + (k*tiles_J + j)*DIM`. However, `gemmini_loop_ws_spad` in weight-stationary mode expects B tiles indexed as `b_base + (j*tiles_K + k)*DIM` — for each output column-block `j`, all K-tiles for that column are contiguous. The current layout `(k*tiles_J + j)` places tiles grouped by K-slice first, then J — the transpose of the expected layout.
+
+**Fix:** Swap the B mvin loop to `(j outer, k inner)` and change the spad address to `b_base + (j*tiles_K + k)*DIM`, matching the reference pattern exactly. Also update `SPAD_DEST` to `128` to match the reference (placing output in the correct smem region), and fix `gemmini_config_st` to use `OUT_COLS * sizeof(out_t)` for the BF16-packed output stride.
+
+```c
+void solution(void) {
+
+  int tiles_I = MATMUL_M / DIM;
+  int tiles_J = MATMUL_N / DIM;
+  int tiles_K = MATMUL_K / DIM;
+
+  uint32_t a_base   = 0;
+  uint32_t b_base   = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+  int      SPAD_DEST = 128;
+
+  uint32_t scale_factors[512] = {0};
+
+  gemmini_flush(0);
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+
+#ifdef SPIKE_SIM
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+#else
+  load_scale_factors((volatile uint64_t *)GEMMINI_SF_MEM_A,
+                     (uint8_t *)&A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *)GEMMINI_SF_MEM_B,
+                     (uint8_t *)&B_scales_col, MATMUL_N, MATMUL_K);
+#endif
+
+  // ---- MVIN A: tile (i,k) -> a_base + (i*tiles_K + k)*DIM ----
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void *)dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  // ---- MVIN B: tile (j,k) -> b_base + (j*tiles_K + k)*DIM ----
+  // Reordered to (j outer, k inner) so scratchpad layout matches
+  // b_base + (j*tiles_K + k)*DIM, which is what gemmini_loop_ws_spad
+  // weight-stationary expects when sweeping k for each (i,j) output tile.
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+
+  for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base + (j * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void *)dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+      tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // ---- Compute ----
+  gemmini_loop_ws_spad(
+      tiles_I, tiles_J, tiles_K,
+      0, 0, 0,
+      a_base,
+      BANK_NUM * BANK_ROWS,
+      0,
+      SPAD_DEST,
+      false, false,
+      false, false, false,
+      NO_ACTIVATION,
+      0, 0,
+      false,
+      0x38);
+
+#ifdef SPIKE_SIM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+#else
+  for (int i = 0; i < tiles_J * tiles_I * 2; i++) {
+    gemmini_mvout((void*)((uint64_t*)C_hw + i * 2 * DIM), SPAD_DEST + i * DIM);
+  }
+  gemmini_fence();
+#endif
+}
+```
+
+The key change is the B mvin loop reordered from `(k outer, j inner)` with address `b_base + (k*tiles_J + j)*DIM` to `(j outer, k inner)` with address `b_base + (j*tiles_K + k)*DIM`. This ensures the scratchpad layout of B tiles is exactly what the weight-stationary hardware loop expects, enabling correct and efficient weight-stationary reuse across all I iterations without re-loading B tiles.

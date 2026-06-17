@@ -1,0 +1,46 @@
+## Analysis of the Current Code
+
+The current code has an outer loop over `j0` (N-blocks) and inner loop over `i0` (M-blocks). For each `(i0, j0)` pair, it:
+1. Loads A and B scales
+2. Mvins A tiles
+3. Runs `gemmini_loop_ws_spad`
+4. Calls `gemmini_mx_read_smem` row-by-row inside a loop
+5. Calls `gemmini_fence()` once per `(i0, j0)` pair
+
+The key inefficiency targeted by **strategy 3** (minimize `gemmini_fence` calls) is that `gemmini_fence()` is called once per `(i0, j0)` tile pair — i.e., `BLOCKS_M * BLOCKS_N` times total. Each fence is a full memory barrier that stalls the pipeline.
+
+However, looking more carefully, the most impactful strategy here is **strategy 1: loop tiling** — specifically, the current code already tiles but uses small `BLK`-sized tiles. The feedback says scratchpad utilization is 0KB out of 256KB, meaning the tiles are tiny relative to scratchpad capacity. We should increase tile sizes to fill the scratchpad.
+
+But wait — strategy 3 is also clearly applicable: the `gemmini_fence()` inside the `i0` loop fires on every iteration. We can batch multiple `gemmini_mx_read_smem` calls across all `i0` iterations for a given `j0`, then issue a **single** `gemmini_fence()` after all reads for that `j0` block. However, since each `(i0, j0)` pair writes to distinct, non-overlapping regions of `C_hw`, and `mx_smem` is reused each iteration (overwritten by the next `gemmini_loop_ws_spad`), we **cannot** defer `gemmini_mx_read_smem` past the next `gemmini_loop_ws_spad` call.
+
+Therefore the correct application of strategy 3 is: move the `gemmini_fence()` to after the inner `r` loop but check if we can defer it to the end of the `i0` loop — but since `mx_smem` is overwritten each `gemmini_loop_ws_spad`, we must drain before the next compute. The fence can be deferred only until after all `gemmini_mx_read_smem` calls for one tile complete, which it already is per iteration.
+
+The most impactful applicable strategy is **strategy 1: loop tiling** — increase tile sizes to better utilize the scratchpad (currently near 0 utilization).
+
+## Plan: Loop Tiling to Increase Scratchpad Utilization
+
+**Problem:** The current code uses `BLK`-sized tiles for both I and J dimensions, leaving the scratchpad nearly empty. The scratchpad can hold up to 8192 rows total. We should choose tile sizes `TI`, `TJ` such that `(TI*tiles_K + TJ*tiles_K)*DIM ≤ 8192`, maximizing the tiles processed per `gemmini_loop_ws_spad` invocation. Larger tiles mean:
+- Fewer `gemmini_loop_ws_spad` calls (amortizing setup overhead)
+- Fewer `gemmini_mx_load_scales` calls
+- Fewer `gemmini_fence` calls
+- Better reuse of B tiles across multiple A tile rows
+
+**Concrete changes:**
+
+1. **Choose larger tile sizes:** Set `tiles_I = BLOCKS_M` and `tiles_J = BLOCKS_N` (i.e., process the entire matrix in one shot if it fits), or the largest multiple of DIM that satisfies the scratchpad constraint `(TI*TK + TJ*TK)*DIM ≤ 8192` and accumulator constraint `TI*TJ*DIM ≤ 256`.
+
+2. **Restructure loops:** Instead of looping over `i0` and `j0` with small `BLK` steps, compute the maximum `tiles_I` and `tiles_J` that fit simultaneously in the scratchpad, then loop with those larger strides.
+
+3. **Single `gemmini_loop_ws_spad` per outer tile:** Each call processes `TI × TJ × tiles_K` worth of output, amortizing all fixed costs (config, scale loads, fence) over more computation.
+
+4. **Single `gemmini_fence` per outer tile:** After draining all rows of the output tile with `gemmini_mx_read_smem`, issue one `gemmini_fence` — reducing total fence count from `BLOCKS_M * BLOCKS_N` to `ceil(REAL_M/TI_BLK) * ceil(REAL_N/TJ_BLK)`.
+
+5. **B tile reuse:** With larger `TJ`, more B columns are loaded per scratchpad fill, and B is reused across all `TI` A-rows in the same call — reducing B mvin traffic relative to compute.
+
+**Scratchpad layout check:** With `tiles_K = MATMUL_K/DIM`, `TI` I-tiles, `TJ` J-tiles:
+- A occupies: `TI * tiles_K * DIM` rows
+- B occupies: `TJ * tiles_K * DIM` rows  
+- Total: `(TI + TJ) * tiles_K * DIM ≤ 8192`
+- Accumulator: `TI * TJ * DIM ≤ 256` → `TI * TJ ≤ 16`
+
+With `tiles_K = MATMUL_K/16`, choose `TI` and `TJ` as large as possible subject to both constraints, then outer-loop over `i0` and `j0` in steps of `TI*DIM` and `TJ*DIM` respectively. This fills the scratchpad fully and minimizes overhead per output element.

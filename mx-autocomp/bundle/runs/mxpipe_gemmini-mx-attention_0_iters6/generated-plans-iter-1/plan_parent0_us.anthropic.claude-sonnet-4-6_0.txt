@@ -1,0 +1,39 @@
+## Analysis
+
+Looking at the code, I need to identify the bottleneck and select the best single strategy.
+
+The code has three phases:
+1. **S1 = Q @ K^T** on Gemmini → `gemmini_mx_read_smem` → `gemmini_fence()` → S1_hw filled
+2. **Softmax** on CPU (processes all 128 rows of S1_hw sequentially)
+3. **O = P @ V** on Gemmini
+
+The critical observation: after `gemmini_loop_ws_spad` completes, `gemmini_mx_read_smem` is a DMA that copies results from `mx_smem` to DRAM (`S1_hw`). The current code issues `gemmini_mx_read_smem`, then `gemmini_fence()` (blocking until ALL rows are in DRAM), then starts the softmax CPU computation row by row.
+
+**Strategy 4** is directly applicable: overlap the softmax CPU computation with the `gemmini_mx_read_smem` DMA transfer. The DMA fills S1_hw row by row; the CPU can process row `i` once row `i` is complete, without waiting for all 128 rows to be transferred.
+
+## Plan
+
+**Strategy: Overlap softmax CPU computation with `gemmini_mx_read_smem` DMA**
+
+### Specific Changes
+
+1. **Remove the `gemmini_fence()` that follows `gemmini_mx_read_smem`** in section 1 (move it to after the loop, or eliminate it entirely since section 1's fence is only needed before the CPU reads S1_hw).
+
+2. **Issue `gemmini_mx_read_smem` immediately** (no fence yet), then enter the softmax loop. For each row `i` from 0 to ATT_S-1:
+   - Insert a **row-level fence/poll**: since there's no fine-grained per-row fence primitive, we use the fact that the DMA writes rows sequentially. We can exploit that `gemmini_fence()` is a full barrier — instead, we process rows with a small offset: issue `gemmini_mx_read_smem`, then for row `i`, spin-wait by reading `S1_hw[i][0]` (cache-coherent DRAM) until it appears non-stale, OR simply **pipeline by processing rows 0..i-1 while row i..ATT_S-1 are still being DMA'd**.
+
+3. **Practical implementation**: Since we cannot issue per-row fences cheaply, the cleanest overlap is:
+   - Issue `gemmini_mx_read_smem` (starts DMA for all ATT_S*ATT_S BF16 values = 128×128×2 bytes = 32KB)
+   - Immediately begin softmax on row 0: the DMA transfers sequentially, so by the time we finish processing row `i` on the CPU (which takes non-trivial scalar work: 128 unpacks + iexp + reciprocal), row `i+1` is likely already in DRAM
+   - Issue `gemmini_fence()` **before** reading the first row (but after `mx_read_smem` is issued), to ensure row 0 is visible — actually, issue the fence **lazily**: fence once before starting, then rows are available as the DMA progresses
+   - The correct approach: issue `gemmini_mx_read_smem`, then `gemmini_fence()` once (ensures DMA started and is coherent), then process all softmax rows. This hides the *tail* of the DMA behind CPU computation for later rows.
+
+4. **Concrete restructuring**:
+   - After `gemmini_loop_ws_spad`, issue `gemmini_mx_read_smem` 
+   - Issue `gemmini_fence()` once (ensures DMA is in flight and memory coherent)
+   - Begin softmax loop immediately — for row `i`, the DMA for rows 0..i-1 is already complete (since DMA is sequential and CPU scalar work per row is slower than DMA per row), effectively hiding DMA latency behind computation
+   - This reorders: instead of `read_smem → fence → [all DMA completes] → softmax`, we get `read_smem → fence → softmax-row-0 (DMA row 1,2,... happening) → softmax-row-1 → ...` hiding the smem→DRAM transfer latency of later rows behind scalar CPU work on earlier rows.
+
+5. **No changes needed to section 3** (P@V Gemmini call); the `gemmini_flush(0)` at the start of section 3 ensures the accelerator is ready.
+
+This transformation is semantically equivalent because `gemmini_fence()` is still issued before any row of S1_hw is read, guaranteeing memory coherence. The DMA completes before or during the softmax loop, hiding transfer latency behind useful scalar work.

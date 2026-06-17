@@ -1,0 +1,45 @@
+## Analysis
+
+Looking at the code, the dominant cost is the **softmax computation (step 2)**, which runs entirely on the CPU and involves:
+
+1. Unpacking BF16 values from `S1_hw` (packed 4 per uint64)
+2. Computing `mx_iexp` for every element
+3. Computing `mx_ilog2`, reciprocal, and re-encoding to FP8
+
+This is `O(ATT_S²)` scalar work on the host CPU. Meanwhile, the Gemmini matmuls (steps 1 and 3) are likely efficient. The softmax loop processes `ATT_S` rows **one group of 4 at a time** — there's no mathematical reason it can't process all rows in a single pass, but the structure is already reasonably batched.
+
+However, examining more carefully: the **total work** can be reduced by recognizing that the softmax loop reads `S1_hw[i][j/4]` — a packed BF16 array. The inner unpacking loop iterates `j` from 0 to ATT_S in steps of 4, then `l` from 0 to 4, doing 4 separate `mx_ibf16_to_q` calls per word. This is already reasonably structured.
+
+The real algorithmic reduction opportunity is **Strategy 1: rewrite the algorithm to reduce total work** by eliminating the intermediate `S1_hw` buffer and the scalar BF16 decode overhead. But actually the bigger win is: the softmax `iexp`/`ilog2` loop iterates over `ATT_S²` elements multiple times — once for max-finding, once for exp, once for scale-finding, once for encoding. This is **4 passes** over `ATT_S²` data. We can fuse them to **2 passes** (max-finding + exp/sum combined with encoding), reducing memory traffic and scalar work.
+
+## Plan: Strategy 1 — Reduce Total Work by Fusing Softmax Passes
+
+**Current structure (4 passes over ATT_S² data per batch of 4 rows):**
+1. Pass 1: Unpack `S1_hw` → `q[4][ATT_S]`, find `mq[r]`
+2. Pass 2: Compute `p[r][j] = mx_iexp(q[r][j] - mq[r])`, accumulate `sm[r]`
+3. Pass 3 (per group g): Find `gmax` over `p[r][jstart..jend]`
+4. Pass 4 (per group g): Encode `p[r][j]` → `P_q[row][j]`, set `P_scales[g][row]`
+
+**Reduction:** Fuse passes 3 and 4 — eliminate the intermediate `p[4][ATT_S]` array (which is `4 × ATT_S × 8 bytes` on the stack) by computing `gmax` and encoding in a single pass. Also fuse passes 1 and 2 into a single unpack+exp loop. This reduces:
+- Stack allocation: eliminate `int64_t p[4][ATT_S]` (large stack array, expensive to write and re-read)
+- Memory passes: from 4 to 2 passes over the data
+- The `q[4][ATT_S]` array can also be eliminated by computing `mx_iexp` immediately during unpack (if we do a two-pass approach: first pass for max, second for exp+encode)
+
+**Concrete changes:**
+
+1. **Eliminate `int64_t q[4][ATT_S]`**: Instead, do two passes over `S1_hw`:
+   - Pass 1: Unpack and find `mq[r]` (no storage needed)
+   - Pass 2: Unpack again, compute `mx_iexp(val - mq[r])`, accumulate `sm[r]`, AND simultaneously track per-group max `gmax[4][GROUPS_S]`
+   - Pass 3: For each group/row, compute scale and encode (but now we need exp values — so store only exp values, not raw q values)
+
+2. **Replace `int64_t q[4][ATT_S]` with `int64_t p[4][ATT_S]`** (same size) but compute exp values directly in pass 2, then do a single pass 3 that combines gmax-finding and encoding. This reduces the number of passes from 4 to 3, and eliminates the `q` array reread.
+
+3. More aggressively: **precompute per-group maxima during the exp pass** by tracking `gmax[4][GROUPS_S]` inline. Then the final encoding pass only needs one read of `p[r][j]` with the scale already known — eliminating the separate gmax scan (pass 3). This fuses passes 3 and 4 into one, reducing total passes from 4 to 2 (unpack+max, then exp+gmax+encode).
+
+**Specifically:**
+
+- Pass 1 (fused unpack + row-max): Read `S1_hw[i+r][j/4]`, unpack, track `mq[r]`. No storage.
+- Pass 2 (fused exp + store + group-max): Read `S1_hw[i+r][j/4]` again, compute `mx_iexp(val - mq[r])`, store into `p[r][j]`, update `gmax[r][g]`, accumulate `sm[r]`.
+- Pass 3 (fused log2/recip + encode): For each row `r`, compute `ls[r]`, `inv_sm[r]`. For each group `g`, compute scale from `gmax[r][g]`, then encode each `p[r][j]` → `P_q`.
+
+This reduces from **4 passes** to **3 passes** over the `ATT_S²` data, eliminating the separate `q[4][ATT_S]` array entirely (saving `4 × ATT_S × 8` bytes of stack reads/writes) and eliminating the separate group-max scan pass. The per-group max is now tracked for free during the exp computation, saving `4 × GROUPS_S × ATT_S` comparisons as a separate loop.

@@ -1,0 +1,105 @@
+Looking at the error output and the code, I can see several issues that need to be fixed:
+
+1. The scratchpad size calculations and memory layout are incorrect
+2. The B matrix placement logic has errors
+3. The loop bounds and tile calculations don't match the stated dimensions
+4. The spad_end calculation is wrong
+5. Memory addressing for B tiles is incorrect
+
+Let me fix these issues:
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+#include "include/matmul_fp8_64x64.h"
+
+#define DIM 16
+#define ADDR_LEN 32
+#define BF16_PER_WORD 4
+#define OUT_COLS (MATMUL_N / BF16_PER_WORD)
+
+typedef uint8_t  elem_t;   // fp8:e4m3 input elements
+typedef uint8_t  welem_t;  // fp8:e4m3 weight elements
+typedef uint64_t out_t;    // 4x bf16 packed per word
+
+// Optimized MX matmul kernel (32x256x256, fp8:e4m3).
+void solution(void) {
+  const int tiles_I = 2;
+  const int tiles_J = 16;
+  const int tiles_K = 16;
+
+  // Split scratchpad into two double-buffering partitions
+  const int a_base_0 = 0;
+  // B base for first buffer: place at top of scratchpad
+  const int b_base_0 = BANK_NUM * BANK_ROWS - tiles_K * 8 * DIM; // 8192 - 16 * 8 * 16 = 8192 - 2048 = 6144
+  // B base for second buffer: place below first B buffer
+  const int b_base_1 = b_base_0 - tiles_K * 8 * DIM; // 6144 - 2048 = 4096
+
+  // 1. Configure execution
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  
+  // 2. Load scale factors
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // 3. Load A0 once into Buffer 0 (A is reused across both blocks)
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *dram_ptr = ((elem_t *)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base_0 + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void *)dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  // 4. Load B0 into Buffer 0 (first 8 J tiles)
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int j = 0; j < 8; j++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *dram_ptr = ((elem_t *)B_in) + k * DIM * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base_0 + (j * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void *)dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  // Loop over the 2 blocks of J
+  for (int bj = 0; bj < 2; bj++) {
+    // Overlap: While bj = 0 compute runs, stream B1 into Buffer 1
+    if (bj == 0) {
+      for (int j = 8; j < 16; j++) {
+        for (int k = 0; k < tiles_K; k++) {
+          elem_t *dram_ptr = ((elem_t *)B_in) + k * DIM * MATMUL_N + j * DIM;
+          uint32_t sp_addr = b_base_1 + ((j - 8) * tiles_K + k) * DIM;
+          gemmini_extended_mvin((void *)dram_ptr, sp_addr, DIM, DIM);
+        }
+      }
+    }
+
+    // 5. Configure the requantized mvout
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, 8, tiles_K, 0, 0, 1);
+    
+    // 6. Run weight-stationary compute loop
+    uint32_t b_base_curr = (bj == 0) ? b_base_0 : b_base_1;
+    uint32_t spad_end = (bj == 0) ? (b_base_0 + tiles_K * 8 * DIM) : (b_base_1 + tiles_K * 8 * DIM);
+    uint32_t spad_dest_curr = (bj == 0) ? 128 : 384;
+    
+    gemmini_loop_ws_spad(tiles_I, 8, tiles_K, 0, 0, 0,
+                         a_base_0, 
+                         spad_end, 
+                         0, spad_dest_curr,
+                         false, false, false, false, false, NO_ACTIVATION, 1, 1, false, 0x38);
+                         
+    // 7. Drain output row by row to reconstruct non-contiguous DRAM blocks
+    for (int i = 0; i < MATMUL_M; i++) {
+      gemmini_mx_read_smem(&C_hw[i][bj * 8 * DIM], 
+                           spad_dest_curr * 16 + i * 8 * DIM, 
+                           8 * DIM);
+    }
+  }
+
+  // 8. Synchronize all operations
+  gemmini_fence();
+}
+```

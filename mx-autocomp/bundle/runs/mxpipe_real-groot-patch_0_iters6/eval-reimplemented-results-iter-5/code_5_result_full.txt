@@ -1,0 +1,439 @@
+{'correct': False}
+Prev latency: 17428
+New latency: N/A
+Plan: ## Analysis of the Current Code
+
+The current code processes each `(i0, j0)` block independently with a full `gemmini_flush` and complete pipeline sequence per block. The key inefficiency I'll address is:
+
+**The K dimension is fully handled in a single `gemmini_loop_ws_spad` call per `(i0,j0)` block.** For the problem size `MATMUL_M=41, MATMUL_N=512, MATMUL_K=512`, with `BLK` tiles, all K tiles are loaded and computed at once. There's no partial-K accumulation.
+
+Looking at strategy 4: **accumulate across K-chunks by splitting the K loop with `ex_accumulate=true`**.
+
+## Plan: Strategy 4 — Partial-K Tiling with ex_accumulate
+
+### Problem
+
+Currently, for each `(i0, j0)` block, `tiles_K = MATMUL_K/DIM = 32` K-tiles are loaded. With `tiles = BLK/DIM` I-tiles and J-tiles, the scratchpad must hold all A and B tiles simultaneously:
+- A tiles: `tiles * tiles_K * DIM` rows
+- B tiles: `tiles * tiles_K * DIM` rows
+- Total: `2 * tiles * tiles_K * DIM` rows
+
+This grows large for large K. Splitting K into chunks reduces scratchpad pressure and enables larger `tiles` (I/J tile sizes), improving reuse.
+
+### Change
+
+Split `tiles_K` into outer K-chunks of size `K_CHUNK` tiles each:
+
+1. **Outer loop over K-chunks**: iterate `kc` from 0 to `tiles_K` in steps of `K_CHUNK`.
+2. **For each K-chunk**:
+   - Set `cur_tiles_K = min(K_CHUNK, tiles_K - kc)` for this chunk.
+   - Load only the A and B scale factors for this K-chunk (sliced from the per-group arrays, offset by `kc`).
+   - Mvin only the A tiles for rows `[i0*BLK, ...]` and K columns `[kc*DIM, (kc+cur_tiles_K)*DIM)`.
+   - Mvin only the B tiles for K rows `[kc*DIM, ...]` and columns `[j0*BLK, ...]`.
+   - Issue `gemmini_loop_ws_spad` with `ex_accumulate=true` for all chunks except the last (or first non-accumulate / rest accumulate — use `ex_accumulate=false` for the first chunk, `true` for subsequent to accumulate into smem).
+
+   Actually, per the hardware model, `ex_accumulate` controls whether results are *added* to existing accumulator contents. Since we're writing to `mx_smem` (not the accumulator), we need to think carefully. Looking at the reference: the MX path writes BF16 to `mx_smem` directly from `gemmini_loop_ws_spad`. For partial-K accumulation, the first K-chunk writes fresh results; subsequent chunks accumulate. This requires `ex_accumulate=true` for K-chunks after the first.
+
+3. **Scale factor loading per K-chunk**: Load only the scale rows corresponding to the current K-chunk. Since scales are grouped along K (`A_scales_row[g][m]` where `g` indexes K-groups), for K-chunk starting at tile `kc`, load `cur_tiles_K` groups of scales. Use a temporary scale buffer `A_s` and `B_s` populated with the relevant slice.
+
+4. **Configure `gemmini_mxquant_config_mvout`** with `k_bound=cur_tiles_K` for each chunk (matching the actual K tiles in that chunk).
+
+5. **b_base** is recomputed per K-chunk: `b_base = BANK_NUM*BANK_ROWS - tiles * cur_tiles_K * DIM` since only `cur_tiles_K` K-tiles of B are loaded.
+
+6. **After all K-chunks**, issue `gemmini_mx_read_smem` and `gemmini_fence()` once — the accumulated BF16 result in `mx_smem` at `SPAD_DEST` is complete.
+
+### Concrete K_CHUNK Selection
+
+With `tiles_K=32` and `tiles=BLK/DIM`, choosing `K_CHUNK=8`:
+- Per chunk: A rows = `tiles * 8 * DIM`, B rows = `tiles * 8 * DIM`
+- Scratchpad: `2 * tiles * 8 * DIM ≤ 8192` → `tiles ≤ 32` (easily satisfied)
+- Scale bytes per chunk: `cur_tiles_K * tiles` bytes (much smaller, fits in `A_s`/`B_s`)
+- 4 K-chunks of 8 tiles each cover `tiles_K=32`
+
+This allows `tiles = BLK/DIM` to be larger (if BLK is increased) while keeping scratchpad within bounds — directly enabling larger I/J tile sizes for better reuse amortization of the config overhead.
+
+### Key Code Changes
+
+```c
+#define K_CHUNK 8  // K-tiles per partial-K pass
+
+void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      int tiles   = BLK / DIM;
+      int tiles_K = MATMUL_K / DIM;  // total K-tiles = 32
+      int pad_i   = BLK - mrows, pad_j = BLK - ncols;
+      int SPAD_DEST = 128;
+      uint32_t a_base = 0;
+
+      gemmini_flush(0);
+
+      bool first_chunk = true;
+      for (int kc = 0; kc < tiles_K; kc += K_CHUNK) {
+        int cur_tiles_K = tiles_K - kc;
+        if (cur_tiles_K > K_CHUNK) cur_tiles_K = K_CHUNK;
+        bool last_chunk = (kc + cur_tiles_K >= tiles_K);
+
+        // Stage scale factors for this K-chunk only
+        for (int g = 0; g < cur_tiles_K; g++) {
+          memcpy(&A_s[g][0], &A_scales_row[kc + g][i0 * BLK], BLK);
+          memcpy(&B_s[g][0], &B_scales_col[kc + g][j0 * BLK], BLK);
+        }
+
+        uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * cur_tiles_K * DIM;
+
+        // Config must be issued before each load/compute sequence
+        gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                    1, 1, 0, 0, false, 0, 0, 3, 0);
+        gemmini_mx_load_scales((uint64_t)A_s, cur_tiles_K * BLK, 0);
+        gemmini_mx_load_scales((uint64_t)B_s, cur_tiles_K * BLK, 1);
+
+        // Mvin A tiles for this K-chunk
+        gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+        for (int i = 0; i < tiles; i++)
+          for (int k = 0; k < cur_tiles_K; k++)
+            gemmini_extended_mvin(
+              (void*)(((elem_t*)A_in) + (i0*BLK + i*DIM)*MATMUL_K + (kc+k)*DIM),
+              a_base + (i * cur_tiles_K + k) * DIM, DIM, DIM);
+
+        // Mvin B tiles for this K-chunk
+        gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+        for (int j = 0; j < tiles; j++)
+          for (int k = 0; k < cur_tiles_K; k++)
+            gemmini_extended_mvin(
+              (void*)(((elem_t*)B_in) + ((kc+k)*DIM)*MATMUL_N + (j0*BLK + j*DIM)),
+              b_base + (k * tiles + j) * DIM, DIM, DIM);
+
+        gemmini_config_st(BLK_OUTC * sizeof(out_t));
+        gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                     tiles, tiles, cur_tiles_K, 0, 0, 1);
+
+        // First chunk: no accumulate; subsequent chunks: accumulate into smem
+        gemmini_loop_ws_spad(
+          tiles, tiles, cur_tiles_K, pad_i, pad_j, 0,
+          a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+          false, false, false, false,
+          /*ex_accumulate=*/!first_chunk,   // accumulate after first chunk
+          NO_ACTIVATION, 0, 0, false, 0x38);
+
+        first_chunk = false;
+      }
+
+      // Read accumulated result once after all K-chunks
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0*BLK + r][(j0*BLK)/BF16_PER_WORD],
+                             SPAD_DEST*16 + r*BLK, ncols);
+      gemmini_fence();
+    }
+  }
+}
+```
+
+### Why This Improves Performance
+
+1. **Reduced scratchpad pressure per invocation**: Each `gemmini_loop_ws_spad` processes only `K_CHUNK=8` K-tiles instead of 32, reducing A+B scratchpad footprint by 4×. This enables increasing `BLK` (and thus `tiles`) in future passes without scratchpad overflow.
+
+2. **Amortized config overhead**: The `gemmini_extended3_config_ex` and scale loads are now issued 4× (once per K-chunk) instead of once per `(i0,j0)` block — but critically, the K-chunk loop stays *inside* the `(i0,j0)` block, so config is still amortized over the full I×J output.
+
+3. **Correct partial-K accumulation**: Setting `ex_accumulate=false` for the first K-chunk writes fresh BF16 results to `mx_smem`; setting `ex_accumulate=true` for subsequent chunks accumulates into the existing `mx_smem` contents. A single `gemmini_mx_read_smem` at the end drains the fully-accumulated result.
+
+4. **Scale factors match K-chunk**: `gemmini_mxquant_config_mvout` receives `k_bound=cur_tiles_K`, correctly bounding the requantizer to the actual K-tile count in each chunk, maintaining bit-exact BF16 output.
+
+CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED outer-tiled MX matmul baseline (41x512x512).
+void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+   for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Partial last M/N block: compute only the real rows/cols, pad the rest.
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+      // PROF cpu_stage
+      // Stage only the tiny per-32-group scales; A/B data is mvin\'d DIRECTLY
+      // from DRAM (no host-side block memcpy — that was 98% of the cycles).
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+      // PROF accel
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K (full block-aligned tiles)
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+      for (int j = 0; j < tiles; j++)                    // B[k][j0*BLK+j] -> slot (k*tiles + j)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      // Accelerator-centric readout: per-row hardware DMA from smem straight into the
+      // bf16-packed row-major output (block-internal smem row stride is BLK).
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+}
+''',
+score=17428,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'CPU/host data staging detected (2 memcpy, ~0 scalar copy loops). Host staging is typically the dominant cost on this accelerator and autocomp cannot speed it up directly: mvin tiles STRIDED straight from the source DRAM arrays instead of copying through a host buffer, and keep partial sums in shared memory (bf16 accumulate) rather than accumulating on the CPU.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''## Analysis of the Current Code
+
+The current code processes each `(i0, j0)` block independently with a full `gemmini_flush` and complete pipeline sequence per block. The key inefficiency I\'ll address is:
+
+**The K dimension is fully handled in a single `gemmini_loop_ws_spad` call per `(i0,j0)` block.** For the problem size `MATMUL_M=41, MATMUL_N=512, MATMUL_K=512`, with `BLK` tiles, all K tiles are loaded and computed at once. There\'s no partial-K accumulation.
+
+Looking at strategy 4: **accumulate across K-chunks by splitting the K loop with `ex_accumulate=true`**.
+
+## Plan: Strategy 4 — Partial-K Tiling with ex_accumulate
+
+### Problem
+
+Currently, for each `(i0, j0)` block, `tiles_K = MATMUL_K/DIM = 32` K-tiles are loaded. With `tiles = BLK/DIM` I-tiles and J-tiles, the scratchpad must hold all A and B tiles simultaneously:
+- A tiles: `tiles * tiles_K * DIM` rows
+- B tiles: `tiles * tiles_K * DIM` rows
+- Total: `2 * tiles * tiles_K * DIM` rows
+
+This grows large for large K. Splitting K into chunks reduces scratchpad pressure and enables larger `tiles` (I/J tile sizes), improving reuse.
+
+### Change
+
+Split `tiles_K` into outer K-chunks of size `K_CHUNK` tiles each:
+
+1. **Outer loop over K-chunks**: iterate `kc` from 0 to `tiles_K` in steps of `K_CHUNK`.
+2. **For each K-chunk**:
+   - Set `cur_tiles_K = min(K_CHUNK, tiles_K - kc)` for this chunk.
+   - Load only the A and B scale factors for this K-chunk (sliced from the per-group arrays, offset by `kc`).
+   - Mvin only the A tiles for rows `[i0*BLK, ...]` and K columns `[kc*DIM, (kc+cur_tiles_K)*DIM)`.
+   - Mvin only the B tiles for K rows `[kc*DIM, ...]` and columns `[j0*BLK, ...]`.
+   - Issue `gemmini_loop_ws_spad` with `ex_accumulate=true` for all chunks except the last (or first non-accumulate / rest accumulate — use `ex_accumulate=false` for the first chunk, `true` for subsequent to accumulate into smem).
+
+   Actually, per the hardware model, `ex_accumulate` controls whether results are *added* to existing accumulator contents. Since we\'re writing to `mx_smem` (not the accumulator), we need to think carefully. Looking at the reference: the MX path writes BF16 to `mx_smem` directly from `gemmini_loop_ws_spad`. For partial-K accumulation, the first K-chunk writes fresh results; subsequent chunks accumulate. This requires `ex_accumulate=true` for K-chunks after the first.
+
+3. **Scale factor loading per K-chunk**: Load only the scale rows corresponding to the current K-chunk. Since scales are grouped along K (`A_scales_row[g][m]` where `g` indexes K-groups), for K-chunk starting at tile `kc`, load `cur_tiles_K` groups of scales. Use a temporary scale buffer `A_s` and `B_s` populated with the relevant slice.
+
+4. **Configure `gemmini_mxquant_config_mvout`** with `k_bound=cur_tiles_K` for each chunk (matching the actual K tiles in that chunk).
+
+5. **b_base** is recomputed per K-chunk: `b_base = BANK_NUM*BANK_ROWS - tiles * cur_tiles_K * DIM` since only `cur_tiles_K` K-tiles of B are loaded.
+
+6. **After all K-chunks**, issue `gemmini_mx_read_smem` and `gemmini_fence()` once — the accumulated BF16 result in `mx_smem` at `SPAD_DEST` is complete.
+
+### Concrete K_CHUNK Selection
+
+With `tiles_K=32` and `tiles=BLK/DIM`, choosing `K_CHUNK=8`:
+- Per chunk: A rows = `tiles * 8 * DIM`, B rows = `tiles * 8 * DIM`
+- Scratchpad: `2 * tiles * 8 * DIM ≤ 8192` → `tiles ≤ 32` (easily satisfied)
+- Scale bytes per chunk: `cur_tiles_K * tiles` bytes (much smaller, fits in `A_s`/`B_s`)
+- 4 K-chunks of 8 tiles each cover `tiles_K=32`
+
+This allows `tiles = BLK/DIM` to be larger (if BLK is increased) while keeping scratchpad within bounds — directly enabling larger I/J tile sizes for better reuse amortization of the config overhead.
+
+### Key Code Changes
+
+```c
+#define K_CHUNK 8  // K-tiles per partial-K pass
+
+void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      int tiles   = BLK / DIM;
+      int tiles_K = MATMUL_K / DIM;  // total K-tiles = 32
+      int pad_i   = BLK - mrows, pad_j = BLK - ncols;
+      int SPAD_DEST = 128;
+      uint32_t a_base = 0;
+
+      gemmini_flush(0);
+
+      bool first_chunk = true;
+      for (int kc = 0; kc < tiles_K; kc += K_CHUNK) {
+        int cur_tiles_K = tiles_K - kc;
+        if (cur_tiles_K > K_CHUNK) cur_tiles_K = K_CHUNK;
+        bool last_chunk = (kc + cur_tiles_K >= tiles_K);
+
+        // Stage scale factors for this K-chunk only
+        for (int g = 0; g < cur_tiles_K; g++) {
+          memcpy(&A_s[g][0], &A_scales_row[kc + g][i0 * BLK], BLK);
+          memcpy(&B_s[g][0], &B_scales_col[kc + g][j0 * BLK], BLK);
+        }
+
+        uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * cur_tiles_K * DIM;
+
+        // Config must be issued before each load/compute sequence
+        gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                    1, 1, 0, 0, false, 0, 0, 3, 0);
+        gemmini_mx_load_scales((uint64_t)A_s, cur_tiles_K * BLK, 0);
+        gemmini_mx_load_scales((uint64_t)B_s, cur_tiles_K * BLK, 1);
+
+        // Mvin A tiles for this K-chunk
+        gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+        for (int i = 0; i < tiles; i++)
+          for (int k = 0; k < cur_tiles_K; k++)
+            gemmini_extended_mvin(
+              (void*)(((elem_t*)A_in) + (i0*BLK + i*DIM)*MATMUL_K + (kc+k)*DIM),
+              a_base + (i * cur_tiles_K + k) * DIM, DIM, DIM);
+
+        // Mvin B tiles for this K-chunk
+        gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+        for (int j = 0; j < tiles; j++)
+          for (int k = 0; k < cur_tiles_K; k++)
+            gemmini_extended_mvin(
+              (void*)(((elem_t*)B_in) + ((kc+k)*DIM)*MATMUL_N + (j0*BLK + j*DIM)),
+              b_base + (k * tiles + j) * DIM, DIM, DIM);
+
+        gemmini_config_st(BLK_OUTC * sizeof(out_t));
+        gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                     tiles, tiles, cur_tiles_K, 0, 0, 1);
+
+        // First chunk: no accumulate; subsequent chunks: accumulate into smem
+        gemmini_loop_ws_spad(
+          tiles, tiles, cur_tiles_K, pad_i, pad_j, 0,
+          a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+          false, false, false, false,
+          /*ex_accumulate=*/!first_chunk,   // accumulate after first chunk
+          NO_ACTIVATION, 0, 0, false, 0x38);
+
+        first_chunk = false;
+      }
+
+      // Read accumulated result once after all K-chunks
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0*BLK + r][(j0*BLK)/BF16_PER_WORD],
+                             SPAD_DEST*16 + r*BLK, ncols);
+      gemmini_fence();
+    }
+  }
+}
+```
+
+### Why This Improves Performance
+
+1. **Reduced scratchpad pressure per invocation**: Each `gemmini_loop_ws_spad` processes only `K_CHUNK=8` K-tiles instead of 32, reducing A+B scratchpad footprint by 4×. This enables increasing `BLK` (and thus `tiles`) in future passes without scratchpad overflow.
+
+2. **Amortized config overhead**: The `gemmini_extended3_config_ex` and scale loads are now issued 4× (once per K-chunk) instead of once per `(i0,j0)` block — but critically, the K-chunk loop stays *inside* the `(i0,j0)` block, so config is still amortized over the full I×J output.
+
+3. **Correct partial-K accumulation**: Setting `ex_accumulate=false` for the first K-chunk writes fresh BF16 results to `mx_smem`; setting `ex_accumulate=true` for subsequent chunks accumulates into the existing `mx_smem` contents. A single `gemmini_mx_read_smem` at the end drains the fully-accumulated result.
+
+4. **Scale factors match K-chunk**: `gemmini_mxquant_config_mvout` receives `k_bound=cur_tiles_K`, correctly bounding the requantizer to the actual K-tile count in each chunk, maintaining bit-exact BF16 output.''',
+code='''void solution(void) {
+  const int K_CHUNK = 8;
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK;
+      if (ncols > BLK) ncols = BLK;
+      if (ncols <= 0) continue;
+
+      int tiles   = BLK / DIM;
+      int tiles_K = MATMUL_K / DIM;  // = 32
+      int pad_i   = BLK - mrows;
+      int pad_j   = BLK - ncols;
+      int SPAD_DEST = 128;
+      uint32_t a_base = 0;
+
+      gemmini_flush(0);
+
+      bool first_chunk = true;
+      for (int kc = 0; kc < tiles_K; kc += K_CHUNK) {
+        int cur_tiles_K = tiles_K - kc;
+        if (cur_tiles_K > K_CHUNK) cur_tiles_K = K_CHUNK;
+
+        // Stage scale factors for this K-chunk only
+        for (int g = 0; g < cur_tiles_K; g++) {
+          memcpy(&A_s[g][0], &A_scales_row[kc + g][i0 * BLK], BLK);
+          memcpy(&B_s[g][0], &B_scales_col[kc + g][j0 * BLK], BLK);
+        }
+
+        uint32_t b_base = BANK_NUM * BANK_ROWS - (uint32_t)(tiles * cur_tiles_K * DIM);
+
+        // Step 1: Configure execution (must precede scale loads)
+        gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                    1, 1, 0, 0, false, 0, 0, 3, 0);
+
+        // Step 2: Load scale factors for this K-chunk
+        // sel=0 => A (activation) scales, sel=1 => B (weight) scales
+        gemmini_mx_load_scales((uint64_t)A_s, (uint64_t)(cur_tiles_K * BLK), 0);
+        gemmini_mx_load_scales((uint64_t)B_s, (uint64_t)(cur_tiles_K * BLK), 1);
+
+        // Step 3: Mvin A tiles for this K-chunk (stride = full K width)
+        gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+        for (int i = 0; i < tiles; i++)
+          for (int k = 0; k < cur_tiles_K; k++)
+            gemmini_extended_mvin(
+              (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + (kc + k) * DIM),
+              a_base + (uint32_t)((i * cur_tiles_K + k) * DIM),
+              DIM, DIM);
+
+        // Step 4: Mvin B tiles for this K-chunk (stride = full N width)
+        gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+        for (int j = 0; j < tiles; j++)
+          for (int k = 0; k < cur_tiles_K; k++)
+            gemmini_extended_mvin2(
+              (void*)(((elem_t*)B_in) + ((kc + k) * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+              b_base + (uint32_t)((k * tiles + j) * DIM),
+              DIM, DIM);
+
+        // Step 5: Configure requantized mvout with cur_tiles_K as k_bound
+        gemmini_config_st(BLK_OUTC * sizeof(out_t));
+        gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                     tiles, tiles, cur_tiles_K,
+                                     0, 0, 1);
+
+        // Step 6: Compute — accumulate into smem after first chunk
+        gemmini_loop_ws_spad(
+          tiles, tiles, cur_tiles_K,
+          pad_i, pad_j, 0,
+          a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+          false, false,
+          false, false,
+          /*ex_accumulate=*/(!first_chunk),
+          NO_ACTIVATION, 0, 0, false, 0x38);
+
+        first_chunk = false;
+      }
+
+      // Step 7: Drain fully-accumulated BF16 result from smem to DRAM
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(
+          &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+          SPAD_DEST * 16 + r * BLK,
+          ncols);
+
+      gemmini_fence();
+    }
+  }
+}
+''',
+score=inf,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='global.anthropic.claude-sonnet-4-6',
+code_gen_model='global.anthropic.claude-sonnet-4-6',
+stdout="/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/auto_comp_test.c:94:44: error: 'K_CHUNK' undeclared (first use in this function)\nmake[1]: *** [/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/Makefile:145: auto_comp_test-baremetal] Error 1\nmake: *** [Makefile:20: bareMetalC] Error 2\n94 |       for (int kc = 0; kc < tiles_K; kc += K_CHUNK) {\n|                                            ^~~~~~~\n/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/auto_comp_test.c:94:44: note: each undeclared identifier is reported only once for each function it appears in\n/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/auto_comp_test.c:166:44: warning: passing argument 2 of 'full_is_equal' from incompatible pointer type [-Wincompatible-pointer-types]\n166 |     if (!full_is_equal(OUTPUT_MATRIX_NAME, gold)) {\n|                                            ^~~~\n|                                            |\n|                                            out_t (*)[1] {aka long unsigned int (*)[1]}\n/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/auto_comp_test.c:53:60: note: expected 'const out_t (*)[128]' {aka 'const long unsigned int (*)[128]'} but argument is of type 'out_t (*)[1]' {aka 'long unsigned int (*)[1]'}\n53 | int full_is_equal(out_t x[MATMUL_M][OUT_COLS], const out_t y[MATMUL_M][OUT_COLS]) {\n|                                                ~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~\nmake[1]: Leaving directory '/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/bareMetalC'",
+stderr=None)

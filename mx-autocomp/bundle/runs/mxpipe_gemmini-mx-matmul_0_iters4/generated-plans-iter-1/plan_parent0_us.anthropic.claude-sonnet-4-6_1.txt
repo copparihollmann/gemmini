@@ -1,0 +1,54 @@
+## Analysis of the Original Code
+
+The original code loads all A tiles sequentially, then all B tiles sequentially, in two separate nested loops:
+
+```c
+// All A tiles first
+for (int i = 0; i < tiles_I; i++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(...A tile..., mvin port 0);
+
+// Then all B tiles
+for (int j = 0; j < tiles_J; j++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(...B tile..., mvin port 0);
+```
+
+Both A and B are loaded through the same `mvin` port sequentially, leaving the second DMA port (`mvin2`) completely idle. This means A and B loads are fully serialized — B loading cannot begin until all A loading completes.
+
+## Selected Strategy: #11 — Interleave A-tile and B-tile mvin calls within a single combined loop to expose both DMA ports simultaneously
+
+## Plan
+
+The hardware provides three independent mvin ports: `gemmini_extended_mvin` (port 0, for A), `gemmini_extended_mvin2` (port 1, for B), and `gemmini_extended_mvin3` (port 2, for D/bias). Ports 0 and 1 can operate concurrently, meaning A and B DMA transfers can overlap in flight.
+
+**Concrete changes:**
+
+1. **Use `gemmini_extended_mvin2` for B tiles** instead of `gemmini_extended_mvin`. This routes B through port 1 while A uses port 0.
+
+2. **Set the load stride for B via `gemmini_extended3_config_ld` with `id=1`** (or equivalently `gemmini_extended4_config_ld` / the id-parameterized variant) so port 1 has the correct DRAM row stride for B (`MATMUL_K * sizeof(elem_t)`). Since B has the same stride as A in this problem (both are `MATMUL_K` bytes wide), both ports share the same stride value — configure port 1 with a separate `gemmini_extended3_config_ld(..., id=1)` call.
+
+3. **Merge the two separate loop nests into one combined `(k)` loop** (or a combined `(i,j,k)` loop) that issues an A-tile mvin on port 0 and a B-tile mvin on port 1 within the same loop iteration. This exposes both DMA ports simultaneously to the hardware scheduler, allowing A and B transfers to overlap:
+
+```c
+// Configure both mvin ports with correct strides
+gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0); // port 0 for A
+gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1); // port 1 for B
+
+// Interleaved A and B loads: for each (i,k) issue A on port 0,
+// and for each (j,k) issue B on port 1, within the same loop body
+for (int k = 0; k < tiles_K; k++) {
+    for (int i = 0; i < tiles_I; i++) {
+        elem_t *a_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+        gemmini_extended_mvin((void*)a_ptr, a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    }
+    for (int j = 0; j < tiles_J; j++) {
+        elem_t *b_ptr = ((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM;
+        gemmini_extended_mvin2((void*)b_ptr, b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+    }
+}
+```
+
+By iterating over `k` in the outer loop and issuing A loads (port 0) and B loads (port 1) for each `k` slice together, the hardware can pipeline A-bank DMA and B-bank DMA concurrently rather than serializing them. All scratchpad addresses and DRAM pointer arithmetic remain identical to the original — only the port assignment and loop structure change.
+
+4. **Remove the now-redundant separate `gemmini_config_ld` call** that was shared between A and B loads, replacing it with the two per-port configurations above. Everything else (config_ex, load_scales, config_st, mxquant_config_mvout, loop_ws_spad, mx_read_smem, fence) remains unchanged.

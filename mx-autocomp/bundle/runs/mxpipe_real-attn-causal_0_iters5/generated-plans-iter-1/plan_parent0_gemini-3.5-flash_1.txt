@@ -1,0 +1,42 @@
+### Phase 1 Optimization Plan: Double-Buffered Host-Accelerator Pipelining with CPU Unpacking Vectorization
+
+#### 1. Core Inefficiencies in the Baseline
+* **Serialized Execution (Host vs. Accelerator):** The baseline executes the entire $128 \times 128$ $Q \times K^T$ matrix multiplication on Gemmini in a single block, reads the entire output to DRAM, blocks on a `gemmini_fence()`, and only then begins the CPU-side integer softmax. After the CPU finishes, it launches the entire $P \times V$ matmul. This results in zero overlap between the host CPU and the Gemmini accelerator.
+* **Underutilized Scratchpad & Accumulator:** The total capacity of the scratchpad is 256KB (8192 rows) and the accumulator is 64KB (256 rows). For $128 \times 128$ dimensions, loading all elements at once uses only a fraction of this memory, leaving plenty of space for active double-buffering.
+* **CPU Shifting/Unpacking Overhead:** The CPU unpacks 64-bit words containing four 16-bit BF16 values using an inner loop with variable shifts: `(w >> (l * 16)) & 0xFFFF`. On a resource-constrained RISC-V host, this loop control and shifting logic creates massive instruction overhead.
+
+---
+
+#### 2. Proposed Strategy: Host-Accelerator Interleaved Pipelining
+We will structure the execution into an **interleaved pipeline** at the granularity of a single row-tile ($16$ rows, representing $\text{tiles\_I} = 1$). While the Gemmini hardware is busy computing the current row-tile $i$ of the attention matrix $S1$, the host CPU will simultaneously perform the integer softmax and FP8 requantization on the *previously* computed row-tile $i-1$. 
+
+##### Pipeline Execution Flow (for $i = 0$ to $\text{tiles\_I}$):
+1. **Gemmini (Non-blocking):** Launch the computation of $S1[i, :]$ on Gemmini. 
+   * $K^T$ is loaded once into the top of the scratchpad (`b_base`) and remains stationary.
+   * Row-tile $i$ of $Q$ is loaded into scratchpad buffer `a_base_0` or `a_base_1` (double-buffering $Q$).
+   * Run `gemmini_loop_ws_spad` for $\text{tiles\_I} = 1$ to compute the $16 \times 128$ slice of $S1$.
+2. **CPU Softmax & Requant (Parallel):** While Gemmini executes, the CPU processes $S1[i-1, :]$, which was written back to DRAM in the previous step.
+3. **Synchronization & Readback:** Issue `gemmini_mx_read_smem` to drain the newly computed $S1[i, :]$ slice to DRAM, followed by `gemmini_fence()` to ensure completion before the next CPU iteration.
+
+##### Host CPU Unpacking Vectorization:
+We will eliminate the loop over the four 16-bit channels of each 64-bit word of $S1[i-1, :]$. Since the layout is known, we can unpack all four channels in parallel using fixed register masks and shifts, then process them with manual loop unrolling:
+```c
+uint64_t w = S1_hw[i][j_div_4];
+uint16_t ch0 = (uint16_t)(w & 0xFFFF);
+uint16_t ch1 = (uint16_t)((w >> 16) & 0xFFFF);
+uint16_t ch2 = (uint16_t)((w >> 32) & 0xFFFF);
+uint16_t ch3 = (uint16_t)(w >> 48);
+```
+This reduces the instruction count of the softmax loop by more than $3\times$.
+
+---
+
+#### 3. Memory Layout & Constraints Verification
+* **Scratchpad Allocation:** 
+  * Stationary $K^T$: $\text{tiles\_K} \times \text{tiles\_J} \times \text{DIM} = 4 \times 8 \times 16 = 512$ rows. Placed at `b_base = 8192 - 512 = 7680`.
+  * Double-buffered $Q$: Requires two buffers of size $\text{tiles\_K} \times \text{DIM} = 4 \times 16 = 64$ rows.
+    * `a_base_0 = 0` (rows 0–63)
+    * `a_base_1 = 64` (rows 64–127)
+  * Total scratchpad usage: $512 + 128 = 640$ rows ($\approx 10\text{KB}$ out of $256\text{KB}$). Safe from bank collisions and overlap.
+* **Accumulator Allocation:** 
+  * Matmul output size per pipeline step: $\text{tiles\_I} \times \text{tiles\_J} \times \text{DIM} = 1 \times 8 \times 16 = 128$ rows. This fits comfortably within the $256$-row accumulator limit.

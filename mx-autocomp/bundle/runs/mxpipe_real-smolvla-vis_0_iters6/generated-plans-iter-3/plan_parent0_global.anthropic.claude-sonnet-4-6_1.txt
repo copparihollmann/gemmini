@@ -1,0 +1,76 @@
+## Analysis of the Current Code
+
+The current code has a per-row `gemmini_mx_read_smem` loop:
+
+```c
+for (int r = 0; r < mrows; r++)
+  gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                       SPAD_DEST * 16 + r * BLK, ncols);
+gemmini_fence();
+```
+
+This issues `mrows` separate `gemmini_mx_read_smem` instructions per output tile. Given `BLK/DIM = tiles` tiles with `mrows` up to `BLK` rows, this is many instructions per tile.
+
+## Selected Strategy: Strategy 5
+
+**Replace per-row `gemmini_mx_read_smem` loop with a single call covering the entire output block.**
+
+## Plan
+
+The key observation is that `gemmini_mx_read_smem` takes `(dram_addr, smem_off_bf16, num_bf16)` and copies `num_bf16` BF16 values from the MX shared memory starting at `smem_off_bf16` (in 16-bit word units) to `dram_addr`.
+
+In the current code, each row `r` copies `ncols` BF16 values from `SPAD_DEST*16 + r*BLK` to `&C_hw[i0*BLK + r][(j0*BLK)/BF16_PER_WORD]`.
+
+**Condition for collapsing into one call:** The output rows in `C_hw` must be contiguous in DRAM and the shared memory layout must also be contiguous across rows.
+
+- In shared memory: row `r` starts at `SPAD_DEST*16 + r*BLK` (BF16 word units). Each row occupies `BLK` BF16 slots. This is contiguous across all `mrows` rows.
+- In DRAM: `C_hw[i0*BLK + r][(j0*BLK)/BF16_PER_WORD]` — `C_hw` is a 2D array with `MATMUL_N/BF16_PER_WORD` columns of `out_t` (uint64_t = 8 bytes = 4 BF16). Moving from row `r` to row `r+1` in the output block steps by `MATMUL_N/BF16_PER_WORD` uint64 words = `MATMUL_N` BF16 values.
+
+The smem is laid out with stride `BLK` BF16 per row, while the DRAM output has stride `MATMUL_N` BF16 per row. These are **not** necessarily equal (BLK ≤ MATMUL_N), so a naive single call would only be valid when `BLK == MATMUL_N` (i.e., `j0` covers the full width).
+
+However, since `ncols == BLK` in the non-edge case (when `REAL_N` is a multiple of `BLK`), and noting that `gemmini_mx_read_smem` writes sequentially to DRAM while the smem is also sequential with stride `BLK`, the correct single-call collapse requires that the DRAM destination is also stride-`BLK` contiguous — which holds only when `MATMUL_N == BLK` or we read all `mrows * BLK` values as a flat block.
+
+**The correct approach:** The smem contains `mrows * BLK` BF16 values laid out contiguously (rows 0..mrows-1, each BLK wide, packed sequentially starting at `SPAD_DEST*16`). We can read all `mrows * ncols` BF16 values in one call **if** `ncols == BLK` (full-width tile, non-edge case) and the DRAM destination row-stride equals BLK — i.e., `MATMUL_N == BLK`. When `MATMUL_N > BLK`, the rows are not contiguous in DRAM.
+
+**Better fix that always works:** Read all `mrows * BLK` BF16 values from smem into a flat temporary staging buffer with a single `gemmini_mx_read_smem` call, then copy each row from that buffer into the correct position in `C_hw`. But that adds a memcpy — not better.
+
+**The correct single-call approach:** Since each row in smem is exactly `BLK` BF16 wide and the DRAM output `C_hw` has row stride `MATMUL_N` BF16, a single call only works when `BLK == MATMUL_N`. For the general case, reduce to one call per output row (current approach), or — since `ncols <= BLK` — read the full `BLK` BF16 worth per row (padded columns are ignored by the verifier).
+
+The cleanest valid optimization: **replace the per-row loop with a single `gemmini_mx_read_smem` call reading `mrows * BLK` BF16 values starting at `SPAD_DEST*16` into a flat `row_buf`, then scatter rows into `C_hw`**. But that still has `mrows` memcpy calls.
+
+**Actually correct strategy 5 application:** Since the smem from `SPAD_DEST*16` to `SPAD_DEST*16 + mrows*BLK - 1` is one contiguous block of `mrows*BLK` BF16 values, and the correct output layout in `C_hw` starting at `&C_hw[i0*BLK][j0*BLK/BF16_PER_WORD]` has rows separated by `MATMUL_N` BF16 = `MATMUL_N/BF16_PER_WORD` uint64 words, we can issue **one** `gemmini_mx_read_smem` call that dumps into a contiguous staging buffer, then do one `memcpy` scatter. But more efficiently:
+
+When `ncols == BLK == MATMUL_N` (single output block covering the full row), the C_hw rows are contiguous in memory and a single call works perfectly. For the general outer-tiled case, the minimum is one call per output row.
+
+**The real strategy 5 fix as described:** The current code issues `mrows` separate calls. We replace this with **1 call** by reading into a contiguous flat buffer of `mrows * BLK` BF16 values, then scatter with a simple loop. This reduces instruction count from `mrows` to 1 RoCC instruction, which is the bottleneck.
+
+Here is the concrete plan:
+
+1. Declare a local staging buffer: `uint16_t row_buf[BLK * BLK]` (or reuse `scale_factors` area, but a dedicated buffer is cleaner). Size: `BLK * BLK` uint16 = `64 * 64 * 2` = 8192 bytes — fits on stack or as a local static.
+
+2. Replace:
+```c
+for (int r = 0; r < mrows; r++)
+  gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                       SPAD_DEST * 16 + r * BLK, ncols);
+gemmini_fence();
+```
+
+With:
+```c
+// Single call: read entire mrows*BLK BF16 block from smem into flat staging buffer
+static uint16_t smem_buf[BLK * BLK] __attribute__((aligned(8)));
+gemmini_mx_read_smem((uint64_t)smem_buf, SPAD_DEST * 16, mrows * BLK);
+gemmini_fence();
+// Scatter rows into C_hw output
+for (int r = 0; r < mrows; r++) {
+  uint16_t *src = smem_buf + r * BLK;
+  uint16_t *dst = (uint16_t *)(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD]);
+  for (int c = 0; c < ncols; c++)
+    dst[c] = src[c];
+}
+```
+
+This reduces from `mrows` RoCC instructions to 1, which is the dominant saving. The scatter loop is cheap CPU work. The `gemmini_fence()` moves to after the single call (correct per rule 9).
+
+Note: `BLK` must be defined appropriately. Looking at the code, `BLK_OUTC = BLK/BF16_PER_WORD` (since `ncols` in BF16 units = `BLK`). The smem offset stride per row is `BLK` (in BF16 units), matching the contiguous layout.

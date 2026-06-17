@@ -1,0 +1,50 @@
+## Analysis of the Original Code
+
+Looking at the original code, I need to identify which strategy applies best.
+
+The original code has two separate mvin loops:
+1. **A tiles loop**: i-outer, k-inner → uses `gemmini_extended_mvin` (port 0)
+2. **B tiles loop**: j-outer, k-inner → uses `gemmini_extended_mvin2` (port 1)
+
+These loops are **sequential** — all A tiles are loaded first, then all B tiles. However, the hardware has **three independent mvin ports** (mvin, mvin2, mvin3). Strategy 5 says: "use `mvin2`/`mvin3` ports to parallelize A and B tile loads into scratchpad simultaneously."
+
+The original code already uses mvin (port 0) for A and mvin2 (port 1) for B, but it does them in **separate, sequential loops** — not interleaved. By **interleaving** A and B tile loads (issuing mvin for an A tile immediately followed by mvin2 for a B tile within the same loop iteration), we expose more instruction-level parallelism and allow the hardware DMA engines to overlap A and B transfers concurrently.
+
+## Plan: Interleave A and B Tile Loads Using mvin and mvin2 Simultaneously (Strategy 5)
+
+**Key insight**: The A tiles loop iterates over `(i, k)` pairs and the B tiles loop iterates over `(j, k)` pairs. We can restructure so that within a single combined loop, we issue an `mvin` (A tile) and an `mvin2` (B tile) back-to-back, allowing the two DMA engines to run in parallel.
+
+**Specific changes**:
+
+1. Compute the total number of A tile loads: `tiles_I * tiles_K` pairs, and total B tile loads: `tiles_J * tiles_K` pairs. These may differ, so we interleave up to `min(total_A, total_B)` pairs together, then drain the remainder.
+
+2. For the interleaved portion: in a single loop iteration, issue one batched `gemmini_extended_mvin` for an A tile group (up to MAX_BLOCK_LEN=4 k-tiles) and one batched `gemmini_extended_mvin2` for a B tile group (up to MAX_BLOCK_LEN=4 k-tiles) back-to-back.
+
+3. For MATMUL_M=MATMUL_N=MATMUL_K=64: `tiles_I=4, tiles_J=4, tiles_K=4`, all equal. Each i or j has one batch covering all 4 k-tiles (since MAX_BLOCK_LEN=4). So there are exactly 4 A-batches and 4 B-batches. We can interleave them in a single loop of 4 iterations, issuing one mvin + one mvin2 per iteration.
+
+**Resulting structure**:
+```c
+// Single interleaved loop: issue mvin (A) and mvin2 (B) back-to-back each iteration
+int total_A_groups = tiles_I; // one batch per i (all k fits in MAX_BLOCK_LEN)
+int total_B_groups = tiles_J; // one batch per j
+int total_groups = (total_A_groups > total_B_groups) ? total_A_groups : total_B_groups;
+
+for (int idx = 0; idx < total_groups; idx++) {
+    if (idx < total_A_groups) {
+        // issue mvin for all k tiles of row i=idx
+        elem_t *dram_ptr_a = ((elem_t*)A_in) + idx * DIM * MATMUL_K;
+        uint32_t sp_addr_a = a_base + idx * tiles_K * DIM;
+        gemmini_extended_mvin((void*)dram_ptr_a, sp_addr_a, tiles_K * DIM, DIM);
+    }
+    if (idx < total_B_groups) {
+        // issue mvin2 for all k tiles of col j=idx
+        elem_t *dram_ptr_b = ((elem_t*)B_in) + idx * DIM * MATMUL_K;
+        uint32_t sp_addr_b = b_base + idx * tiles_K * DIM;
+        gemmini_extended_mvin2((void*)dram_ptr_b, sp_addr_b, tiles_K * DIM, DIM);
+    }
+}
+```
+
+Since `tiles_K=4 ≤ MAX_BLOCK_LEN=4`, each A row and each B column fits in a single mvin call (no inner while-loop needed), and `tiles_I == tiles_J == 4`, so the loop runs exactly 4 iterations, each issuing one mvin + one mvin2 simultaneously. This eliminates the sequential separation of A and B loading and lets both DMA engines work concurrently, reducing total load latency.
+
+The rest of the kernel (config, scale loads, mxquant config, loop_ws_spad, read_smem, fence) remains unchanged.

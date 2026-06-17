@@ -1,0 +1,139 @@
+Looking at the plan, I need to pipeline B-tile mvin for `j0+1` with the output drain of `j0`, overlapping DMA loads with `gemmini_mx_read_smem` calls.
+
+Key insight: After `gemmini_loop_ws_spad` completes for the last `i0` of a given `j0`, I can immediately issue B mvin commands for `j0+1` before doing `gemmini_mx_read_smem`. The B DMA and the smem→DRAM drain will overlap in hardware, hiding B-load latency.
+
+The structure becomes:
+- Pre-load B for `j0=0` before the loop
+- In each `j0` iteration: process all `i0` blocks using the pre-loaded B
+- After the last `i0`'s `gemmini_loop_ws_spad`, pre-issue B mvin for `j0+1`
+- Then do `gemmini_mx_read_smem` + `gemmini_fence()` for the last `i0`
+
+Wait — each `i0` overwrites `mx_smem`, so we must drain each `i0`'s results before the next `i0`'s compute. The only place to pipeline B-next with output drain is after the last `i0`'s `gemmini_loop_ws_spad`.
+
+```c
+void solution(void) {
+  int tiles   = BLK / DIM;
+  int tiles_K = MATMUL_K / DIM;
+  int GK      = MATMUL_K / 32;
+
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+  uint32_t a_base = 0;
+  int SPAD_DEST = 128;
+
+  static uint8_t A_scales_T[BLOCKS_M][A_S_BYTES];
+  static uint8_t B_scales_T[BLOCKS_N][B_S_BYTES];
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int g = 0; g < GK; g++) {
+      memcpy(&A_scales_T[i0][g * BLK],
+             &A_scales_row[g][i0 * BLK],
+             BLK);
+    }
+  }
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    for (int g = 0; g < GK; g++) {
+      memcpy(&B_scales_T[j0][g * BLK],
+             &B_scales_col[g][j0 * BLK],
+             BLK);
+    }
+  }
+
+  // Helper: issue B mvin for a given j0 block into the scratchpad top.
+  // Assumes gemmini_config_ld(MATMUL_N * sizeof(elem_t)) has been set.
+#define ISSUE_B_MVIN(j0_val) \
+  do { \
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t)); \
+    for (int _j = 0; _j < tiles; _j++) \
+      for (int _k = 0; _k < tiles_K; _k++) \
+        gemmini_extended_mvin2( \
+          (void*)(((elem_t*)B_in) + (_k * DIM) * MATMUL_N + ((j0_val) * BLK + _j * DIM)), \
+          b_base + (_k * tiles + _j) * DIM, DIM, DIM); \
+  } while(0)
+
+  // Pre-load B tiles for j0=0 before the main loop.
+  {
+    int j0 = 0;
+    if (j0 < BLOCKS_N) {
+      int ncols = REAL_N - j0 * BLK;
+      if (ncols > BLK) ncols = BLK;
+      if (ncols > 0) {
+        ISSUE_B_MVIN(j0);
+      }
+    }
+  }
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    int ncols = REAL_N - j0 * BLK;
+    if (ncols > BLK) ncols = BLK;
+    if (ncols <= 0) continue;
+
+    // B tiles for this j0 are already in the scratchpad (pre-loaded from
+    // previous iteration's end or the pre-loop block above).
+
+    for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+      int is_last_i0 = (i0 == BLOCKS_M - 1) ||
+                       (REAL_M - (i0 + 1) * BLK <= 0);
+
+      // PROF accel
+      gemmini_flush(0);
+
+      // Step 1: Configure execution.
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                  1, 1, 0, 0, false, 0, 0, 3, 0);
+
+      // Step 2: Load A and B scales.
+      gemmini_mx_load_scales((uint64_t)A_scales_T[i0], A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_scales_T[j0], B_S_BYTES, 1);
+
+      // Step 3: Mvin A tiles for this i0 row-block.
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+      // Step 4: Configure requantized mvout.
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                   tiles, tiles, tiles_K, 0, 0, 1);
+
+      // Step 5: Execute fused hardware matmul.
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0,
+                           a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                           false, false, false, false, false,
+                           NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // After the last i0's compute for this j0, pre-issue B tiles for j0+1
+      // so that B DMA overlaps with the output drain below.
+      if (is_last_i0) {
+        int next_j0 = j0 + 1;
+        if (next_j0 < BLOCKS_N) {
+          int next_ncols = REAL_N - next_j0 * BLK;
+          if (next_ncols > BLK) next_ncols = BLK;
+          if (next_ncols > 0) {
+            ISSUE_B_MVIN(next_j0);
+          }
+        }
+      }
+
+      // Step 6: Drain BF16 results from mx_smem to DRAM, row by row.
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(
+          &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+          SPAD_DEST * 16 + r * BLK, ncols);
+
+      // Step 7: Fence.
+      gemmini_fence();
+    }
+  }
+
+#undef ISSUE_B_MVIN
+}
+```

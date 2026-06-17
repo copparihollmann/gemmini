@@ -1,0 +1,55 @@
+# Performance Analysis and Optimization Plan
+
+## Identifying the Core Inefficiency
+
+Looking at the original code, the dominant structural problem is that **scale factors are re-staged through host memory (memcpy) and re-loaded into the accelerator on every (i0, j0) outer tile iteration**, even though:
+
+1. The A-side scales for a given `i0` row-block are **identical across all `j0` iterations** — the A scales depend only on the row block `i0`, not on which column block `j0` we're computing.
+2. The B-side scales for a given `j0` column-block are **identical across all `i0` iterations** — the B scales depend only on `j0`.
+
+This means the current loop structure re-issues `gemmini_mx_load_scales` (both A and B) and re-does the host `memcpy` staging for **every single (i0, j0) pair**, paying full scale-load latency `BLOCKS_M * BLOCKS_N` times, when only `BLOCKS_M + BLOCKS_N` distinct scale loads are ever needed.
+
+## The Strategy: Consolidate Scale Factor Arrays to Minimize `gemmini_mx_load_scales` Call Count
+
+### What to Change
+
+**Observation:** The full A scale array `A_scales_row[MATMUL_K/32][REAL_M]` and B scale array `B_scales_col[MATMUL_K/32][REAL_N]` already live in DRAM. The `memcpy` into `A_s` / `B_s` was copying a column-slice and a row-slice respectively — purely to feed the per-block `gemmini_mx_load_scales` call with a contiguous buffer.
+
+**Plan:** Restructure the loop so that:
+
+1. **Hoist A-scale loading out of the `j0` loop.** For a fixed `i0`, the A scales cover rows `[i0*BLK, i0*BLK + BLK)` across all K-groups. These are the same for every `j0`. Load them **once per `i0`**, not once per `(i0, j0)` pair.
+
+2. **Hoist B-scale loading out of the `i0` loop.** For a fixed `j0`, the B scales cover columns `[j0*BLK, j0*BLK + BLK)` across all K-groups. These are the same for every `i0`. Load them **once per `j0`** — but since we're iterating `j0` inside `i0`, the natural restructuring is to **pre-stage the B scales before entering the outer loop** or to **load B scales at the start of the `j0` loop and skip reloading when `j0` hasn't changed**.
+
+3. **Eliminate all `memcpy` calls** by pointing `gemmini_mx_load_scales` directly at the source DRAM arrays with an appropriate stride, **or** by pre-transposing the scale layout into a contiguous scratch buffer once before the tiled loop begins — paying the copy cost `O(BLOCKS_M)` times for A and `O(BLOCKS_N)` times for B rather than `O(BLOCKS_M * BLOCKS_N)` times for both.
+
+### Concrete Restructuring
+
+**Pre-compute contiguous scale buffers once, before the tiled loop:**
+
+```
+For A: prepare A_scales_blk[BLOCKS_M][MATMUL_K/32][BLK] — each entry is 
+       A_scales_row[g][i0*BLK .. i0*BLK+BLK-1] for all g.
+For B: prepare B_scales_blk[BLOCKS_N][MATMUL_K/32][BLK] — each entry is 
+       B_scales_col[g][j0*BLK .. j0*BLK+BLK-1] for all g.
+```
+
+This pre-staging pays `O(BLOCKS_M + BLOCKS_N)` memcpy cost total (vs. the current `O(BLOCKS_M * BLOCKS_N)`).
+
+Then in the tiled loop:
+
+```
+for i0:
+    load A scales once: gemmini_mx_load_scales(A_scales_blk[i0], A_S_BYTES, 0)
+    for j0:
+        load B scales once per j0: gemmini_mx_load_scales(B_scales_blk[j0], B_S_BYTES, 1)
+        ... mvin A, mvin B, compute, readout ...
+```
+
+This reduces `gemmini_mx_load_scales` calls from `2 * BLOCKS_M * BLOCKS_N` down to `BLOCKS_M + BLOCKS_N` — a reduction proportional to `min(BLOCKS_M, BLOCKS_N)`. For the given problem (41×512×512 with BLK=512, which gives BLOCKS_M=1, BLOCKS_N=1 for the outer tiling shown — but the strategy generalizes and the removal of `memcpy` inside the hot loop is the immediate win).
+
+### Why This Reduces Latency
+
+- **Eliminates the `memcpy` bottleneck inside the hot loop.** The CPU profiling note states "Host staging is typically the dominant cost." The 2 `memcpy` calls per `(i0,j0)` pair copy `BLK * MATMUL_K/32` bytes each. Removing these from the inner loop path directly cuts CPU cycles.
+- **Reduces accelerator scale-load commands.** Each `gemmini_mx_load_scales` is a DRAM DMA with non-trivial latency. Loading A scales only once per `i0` (instead of once per `(i0, j0)`) eliminates `BLOCKS_N - 1` redundant A-scale loads per row-block.
+- **Enables cleaner pipelining.** With the A scale stable across all `j0` for a given `i0`, the accelerator's scale memory state is simpler to reason about, and future phases (e.g., double-buffering) become easier to implement correctly without stale-scale hazards.

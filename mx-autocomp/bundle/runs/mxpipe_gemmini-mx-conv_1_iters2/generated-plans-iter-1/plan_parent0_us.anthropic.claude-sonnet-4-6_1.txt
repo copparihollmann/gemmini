@@ -1,0 +1,50 @@
+## Analysis of the Current Code
+
+The current code has a clear inefficiency: it performs an **explicit im2col scatter loop** that writes the entire `A_buf` intermediate buffer to memory, then reads it back during `gemmini_extended_mvin`. This is strategy **#11**.
+
+Specifically, the code:
+1. Writes `A_buf[M][K]` = 64×32 = 2048 bytes via the im2col loop (5 nested loops)
+2. Then reads `A_buf` back during the MVIN loop to load tiles into the scratchpad
+
+For this problem (M=64, N=32, K=32, C=2, kernel_size=4), the im2col matrix maps:
+- Row index: `pi * PATCHES_X + pj` (patch row/col)
+- Column index: `c * CONV_KSZ * CONV_KSZ + dy * CONV_KSZ + dx` (channel + spatial offset)
+
+The source of each im2col element is `X_in[c][pi*CONV_KSZ + dy][pj*CONV_KSZ + dx]`.
+
+## Plan: Apply Strategy #11 — Eliminate A_buf by Computing DRAM Source Addresses On-The-Fly
+
+### Key Insight
+
+The MVIN loop currently reads from `A_buf` in row-major tile order. Each tile `(i, k)` reads a DIM×DIM block starting at row `i*DIM`, column `k*DIM` of the im2col matrix. Instead of materializing `A_buf`, we can issue `gemmini_extended_mvin` directly from `X_in` by computing the corresponding source address in `X_in`.
+
+### Mapping im2col tile coordinates back to X_in
+
+For tile `(i, k)`:
+- The im2col row range is `[i*DIM, i*DIM + DIM)`, corresponding to patches `(pi, pj)` where `pi = row / PATCHES_X`, `pj = row % PATCHES_X`
+- The im2col column range is `[k*DIM, k*DIM + DIM)`, corresponding to `(c, dy, dx)` via `col = c*CONV_KSZ*CONV_KSZ + dy*CONV_KSZ + dx`
+
+### Feasibility Check
+
+Since DIM=16 and the im2col columns are laid out as `c * k * k + dy * k + dx`, a single DIM-wide column range `[k*DIM, k*DIM+16)` may span multiple `(c, dy, dx)` combinations. **However**, the key observation is that within a DIM-wide column slice, consecutive elements are consecutive in the `c * CONV_KSZ * CONV_KSZ + dy * CONV_KSZ + dx` index — i.e., the im2col column axis iterates `dx` fastest, then `dy`, then `c`. The original `A_buf` is stored in row-major order with stride `MATMUL_K = K = 32`, so `gemmini_extended_mvin` uses stride `MATMUL_K * sizeof(elem_t)` to step between rows of the same tile.
+
+The im2col column axis has stride 1 in the original `A_buf`. In `X_in[c][h][w]`, consecutive `dx` values are also contiguous (stride 1 in the innermost dimension), but `dy` steps by `CONV_W` (the width of `X_in`), and `c` steps by `CONV_H * CONV_W`. So consecutive im2col columns within one `(c, dy)` row span contiguous `X_in` addresses — but a DIM=16 column tile may cross `dy` or `c` boundaries, breaking contiguity.
+
+Given CONV_KSZ=4, C=2: the total column count K=32 = C*KSZ*KSZ = 2*16 = 32. A DIM=16 column tile either covers `c=0` fully (columns 0–15: all c=0, all (dy,dx) combinations) or `c=1` fully (columns 16–31). Within each 16-column tile, the layout is `dy * CONV_KSZ + dx` for fixed `c`, and `dx` varies fastest. For a fixed tile-K=0 (c=0): element at column offset `j` = `X_in[0][pi*CONV_KSZ + j/CONV_KSZ][pj*CONV_KSZ + j%CONV_KSZ]`. These are **not** contiguous in `X_in` because `j/CONV_KSZ` (i.e., `dy`) steps change the row index.
+
+Since the spatial layout in `X_in` is `[c][h][w]` and `dx` is contiguous (stride 1 in `w`) but `dy` is not (stride `CONV_W` in `h`), a DIM-column tile spanning all `(dy, dx)` for fixed `c` is not contiguous. Therefore **direct strided mvin from `X_in` with a single stride cannot reproduce the im2col gather pattern** in general.
+
+### Revised Plan: Use A_buf with `__attribute__((aligned(64)))` + Prefetch (Strategy #12 hybrid with #11)
+
+Since full elimination of `A_buf` isn't cleanly achievable with a single stride, we apply the **practical part of strategy #11**: keep `A_buf` but make the im2col fill and the MVIN issue use a **single fused loop** that computes the DRAM source address element-by-element — except we note that the MVIN must point to contiguous DIM×DIM blocks. 
+
+### Correct and Achievable Plan
+
+**Strategy #11 as applied here:** Instead of the two-phase approach (fill all of `A_buf`, then issue all MVINs), we **fuse the im2col fill with the per-tile MVIN issue**: for each tile `(i, k)`, fill only the DIM×DIM block of `A_buf` needed for that tile, then immediately issue `gemmini_extended_mvin` for it. This eliminates the full `A_buf` pre-fill working set from cache and pipelines the fill with the mvin DMA. The total bytes written to `A_buf` is the same, but we only need DIM×DIM = 256 bytes live at once (fits in L1), and each tile's DMA issues as soon as its block is ready.
+
+**Changes to the code:**
+1. Remove the outer 5-loop im2col scatter into `A_buf`
+2. In the A-tile MVIN loop over `(i, k)`, add an inner fill of `A_buf[i*DIM .. (i+1)*DIM-1][k*DIM .. (k+1)*DIM-1]` immediately before issuing `gemmini_extended_mvin` for that tile
+3. The B-tile mvin loop and all gemmini configuration calls remain identical
+
+This converts the two-pass (write-all, read-all) pattern into a single-pass (write-tile, issue-DMA, next-tile) pattern, reducing the peak memory footprint of `A_buf` in cache and eliminating the latency of the full im2col pre-pass before any DMA can begin.

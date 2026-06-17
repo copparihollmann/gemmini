@@ -1,0 +1,339 @@
+{'correct': False}
+Prev latency: 10305
+New latency: N/A
+Plan: ## Analysis of the Current Code
+
+The current code has two `memcpy` calls inside the outer `(i0, j0)` loop to stage scale factors into local buffers `A_s` and `B_s` before passing them to `gemmini_mx_load_scales`. These copies run on the CPU host and add latency that partially serializes with the accelerator's scale-loading DMA.
+
+Strategy 4 — **pipeline scale loading for block (i0+1, j0+1) while block (i0, j0) mvin instructions are in-flight** — directly targets this: issue the `gemmini_mx_load_scales` for the *next* block's scales (including its `memcpy` staging) while the current block's `gemmini_extended_mvin` instructions are queued in the accelerator's command FIFO, overlapping the host-side memcpy + scale-DMA latency with the data-movement phase.
+
+## Plan
+
+### What to change
+
+**Prefetch the next block's scale factors while the current block's mvin instructions are executing.**
+
+Concretely:
+
+1. **Before the main loop begins**, perform the `memcpy` staging and `gemmini_mx_load_scales` for block `(i0=0, j0=0)` into a pair of "current" scale buffers (`A_s_cur`, `B_s_cur`). This is the prolog.
+
+2. **Inside the `(i0, j0)` loop**, after issuing the current block's `gemmini_mx_load_scales` calls (using the pre-staged `A_s_cur`/`B_s_cur`), immediately compute the *next* block's `(i0_next, j0_next)` index and run the `memcpy` to populate a second pair of "next" scale buffers (`A_s_nxt`, `B_s_nxt`). This CPU-side memcpy happens while the accelerator is processing the current block's `gemmini_extended_mvin` queue, hiding the staging latency.
+
+3. **At the start of each loop iteration**, swap `cur` ↔ `nxt` pointers (or indices into a double buffer), so the freshly staged next-block scales become the current-block scales for the following iteration without any extra copy.
+
+4. The `gemmini_mx_load_scales` calls themselves remain in the same position relative to `gemmini_extended3_config_ex` and before `gemmini_extended_mvin`, preserving the required programming-model order.
+
+### Detailed structure
+
+```
+// Double buffers for scale staging
+static uint8_t A_s[2][GK][BLK], B_s[2][GK][BLK];
+int cur = 0, nxt = 1;
+
+// --- PROLOG: stage scales for first block (i0=0, j0=0) ---
+for (int g = 0; g < MATMUL_K/32; g++) {
+    memcpy(A_s[cur][g], A_scales_row[g] + 0*BLK, BLK);
+    memcpy(B_s[cur][g], B_scales_col[g] + 0*BLK, BLK);
+}
+
+for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    // ... (mrows/ncols bounds, flush, config_ex) ...
+
+    // Issue scale loads for CURRENT block (already staged in A_s[cur], B_s[cur])
+    gemmini_mx_load_scales((uint64_t)A_s[cur], A_S_BYTES, 0);
+    gemmini_mx_load_scales((uint64_t)B_s[cur], B_S_BYTES, 1);
+
+    // --- Compute NEXT block index ---
+    int j0_next = j0 + 1, i0_next = i0;
+    if (j0_next >= BLOCKS_N) { j0_next = 0; i0_next = i0 + 1; }
+
+    // --- Prefetch: stage NEXT block's scales into nxt buffer
+    //     while accelerator processes mvin commands below ---
+    if (i0_next < BLOCKS_M) {
+        for (int g = 0; g < MATMUL_K/32; g++) {
+            memcpy(A_s[nxt][g], A_scales_row[g] + i0_next*BLK, BLK);
+            memcpy(B_s[nxt][g], B_scales_col[g] + j0_next*BLK, BLK);
+        }
+    }
+
+    // ... gemmini_config_ld, mvin A tiles, mvin B tiles ...
+    // ... gemmini_config_st, gemmini_mxquant_config_mvout ...
+    // ... gemmini_loop_ws_spad, gemmini_mx_read_smem, gemmini_fence ...
+
+    // Swap cur/nxt for the next iteration
+    int tmp = cur; cur = nxt; nxt = tmp;
+  }
+}
+```
+
+### Why this works
+
+- The `memcpy` for `(i0_next, j0_next)` executes on the CPU immediately after `gemmini_mx_load_scales` for the current block is enqueued. At this point, the accelerator's command queue begins processing the scale DMA *and* will then process the upcoming mvin commands. The CPU's memcpy work (which populates `A_s[nxt]`/`B_s[nxt]`) runs in parallel with all of that accelerator activity.
+- By the time the next loop iteration begins and calls `gemmini_mx_load_scales(A_s[cur], ...)` (where `cur` is the swapped `nxt`), the staging is already complete — eliminating the blocking memcpy from the critical path.
+- The programming model order (`config_ex` → `load_scales` → `mvin` → `mxquant_config_mvout` → `loop_ws_spad` → `read_smem` → `fence`) is fully preserved within each iteration, since the prefetch memcpy only writes to the *next* buffer and does not issue any accelerator instructions.
+- Double-buffering requires 2× the scale buffer memory, but scale buffers are tiny (`BLK × GK` bytes each), so this is negligible.
+
+CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED outer-tiled MX matmul baseline (50x256x512).
+void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+   for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Partial last M/N block: compute only the real rows/cols, pad the rest.
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+      // PROF cpu_stage
+      // Stage only the tiny per-32-group scales; A/B data is mvin\'d DIRECTLY
+      // from DRAM (no host-side block memcpy — that was 98% of the cycles).
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+      // PROF accel
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K (full block-aligned tiles)
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+      for (int j = 0; j < tiles; j++)                    // B[k][j0*BLK+j] -> slot (k*tiles + j)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      // Accelerator-centric readout: per-row hardware DMA from smem straight into the
+      // bf16-packed row-major output (block-internal smem row stride is BLK).
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+}
+''',
+score=10305,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'CPU/host data staging detected (2 memcpy, ~0 scalar copy loops). Host staging is typically the dominant cost on this accelerator and autocomp cannot speed it up directly: mvin tiles STRIDED straight from the source DRAM arrays instead of copying through a host buffer, and keep partial sums in shared memory (bf16 accumulate) rather than accumulating on the CPU.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''## Analysis of the Current Code
+
+The current code has two `memcpy` calls inside the outer `(i0, j0)` loop to stage scale factors into local buffers `A_s` and `B_s` before passing them to `gemmini_mx_load_scales`. These copies run on the CPU host and add latency that partially serializes with the accelerator\'s scale-loading DMA.
+
+Strategy 4 — **pipeline scale loading for block (i0+1, j0+1) while block (i0, j0) mvin instructions are in-flight** — directly targets this: issue the `gemmini_mx_load_scales` for the *next* block\'s scales (including its `memcpy` staging) while the current block\'s `gemmini_extended_mvin` instructions are queued in the accelerator\'s command FIFO, overlapping the host-side memcpy + scale-DMA latency with the data-movement phase.
+
+## Plan
+
+### What to change
+
+**Prefetch the next block\'s scale factors while the current block\'s mvin instructions are executing.**
+
+Concretely:
+
+1. **Before the main loop begins**, perform the `memcpy` staging and `gemmini_mx_load_scales` for block `(i0=0, j0=0)` into a pair of "current" scale buffers (`A_s_cur`, `B_s_cur`). This is the prolog.
+
+2. **Inside the `(i0, j0)` loop**, after issuing the current block\'s `gemmini_mx_load_scales` calls (using the pre-staged `A_s_cur`/`B_s_cur`), immediately compute the *next* block\'s `(i0_next, j0_next)` index and run the `memcpy` to populate a second pair of "next" scale buffers (`A_s_nxt`, `B_s_nxt`). This CPU-side memcpy happens while the accelerator is processing the current block\'s `gemmini_extended_mvin` queue, hiding the staging latency.
+
+3. **At the start of each loop iteration**, swap `cur` ↔ `nxt` pointers (or indices into a double buffer), so the freshly staged next-block scales become the current-block scales for the following iteration without any extra copy.
+
+4. The `gemmini_mx_load_scales` calls themselves remain in the same position relative to `gemmini_extended3_config_ex` and before `gemmini_extended_mvin`, preserving the required programming-model order.
+
+### Detailed structure
+
+```
+// Double buffers for scale staging
+static uint8_t A_s[2][GK][BLK], B_s[2][GK][BLK];
+int cur = 0, nxt = 1;
+
+// --- PROLOG: stage scales for first block (i0=0, j0=0) ---
+for (int g = 0; g < MATMUL_K/32; g++) {
+    memcpy(A_s[cur][g], A_scales_row[g] + 0*BLK, BLK);
+    memcpy(B_s[cur][g], B_scales_col[g] + 0*BLK, BLK);
+}
+
+for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    // ... (mrows/ncols bounds, flush, config_ex) ...
+
+    // Issue scale loads for CURRENT block (already staged in A_s[cur], B_s[cur])
+    gemmini_mx_load_scales((uint64_t)A_s[cur], A_S_BYTES, 0);
+    gemmini_mx_load_scales((uint64_t)B_s[cur], B_S_BYTES, 1);
+
+    // --- Compute NEXT block index ---
+    int j0_next = j0 + 1, i0_next = i0;
+    if (j0_next >= BLOCKS_N) { j0_next = 0; i0_next = i0 + 1; }
+
+    // --- Prefetch: stage NEXT block\'s scales into nxt buffer
+    //     while accelerator processes mvin commands below ---
+    if (i0_next < BLOCKS_M) {
+        for (int g = 0; g < MATMUL_K/32; g++) {
+            memcpy(A_s[nxt][g], A_scales_row[g] + i0_next*BLK, BLK);
+            memcpy(B_s[nxt][g], B_scales_col[g] + j0_next*BLK, BLK);
+        }
+    }
+
+    // ... gemmini_config_ld, mvin A tiles, mvin B tiles ...
+    // ... gemmini_config_st, gemmini_mxquant_config_mvout ...
+    // ... gemmini_loop_ws_spad, gemmini_mx_read_smem, gemmini_fence ...
+
+    // Swap cur/nxt for the next iteration
+    int tmp = cur; cur = nxt; nxt = tmp;
+  }
+}
+```
+
+### Why this works
+
+- The `memcpy` for `(i0_next, j0_next)` executes on the CPU immediately after `gemmini_mx_load_scales` for the current block is enqueued. At this point, the accelerator\'s command queue begins processing the scale DMA *and* will then process the upcoming mvin commands. The CPU\'s memcpy work (which populates `A_s[nxt]`/`B_s[nxt]`) runs in parallel with all of that accelerator activity.
+- By the time the next loop iteration begins and calls `gemmini_mx_load_scales(A_s[cur], ...)` (where `cur` is the swapped `nxt`), the staging is already complete — eliminating the blocking memcpy from the critical path.
+- The programming model order (`config_ex` → `load_scales` → `mvin` → `mxquant_config_mvout` → `loop_ws_spad` → `read_smem` → `fence`) is fully preserved within each iteration, since the prefetch memcpy only writes to the *next* buffer and does not issue any accelerator instructions.
+- Double-buffering requires 2× the scale buffer memory, but scale buffers are tiny (`BLK × GK` bytes each), so this is negligible.''',
+code='''// AUTO-GENERATED outer-tiled MX matmul baseline (50x256x512).
+// Optimization: double-buffered scale staging to overlap host memcpy with accelerator mvin.
+void solution(void) {
+  // Double buffers for scale staging (indexed by cur/nxt)
+  // Each buffer holds GK groups of BLK scale bytes for A and B.
+  static uint8_t A_s_buf[2][MATMUL_K / 32][BLK];
+  static uint8_t B_s_buf[2][MATMUL_K / 32][BLK];
+
+  int cur = 0, nxt = 1;
+
+  // --- PROLOG: stage scales for the very first block (i0=0, j0=0) ---
+  // Only do this if there is at least one valid block to process.
+  if (BLOCKS_M > 0 && BLOCKS_N > 0) {
+    for (int g = 0; g < MATMUL_K / 32; g++) {
+      memcpy(A_s_buf[cur][g], &A_scales_row[g][0 * BLK], BLK);
+      memcpy(B_s_buf[cur][g], &B_scales_col[g][0 * BLK], BLK);
+    }
+  }
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Partial last M/N block: compute only the real rows/cols, pad the rest.
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK;
+      if (ncols > BLK) ncols = BLK;
+      if (ncols <= 0) continue;
+
+      int tiles   = BLK / DIM;
+      int tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST   = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      // PROF accel
+      gemmini_flush(0);
+
+      // Step 1: Configure execution (must precede scale loads).
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                  1, 1, 0, 0, false,
+                                  /*act_mx_fmt*/0, /*wgt_mx_fmt*/0,
+                                  /*out_mx_fmt*/3, /*uselut*/0);
+
+      // Step 2: Load scale factors for CURRENT block (already staged in cur buffer).
+      gemmini_mx_load_scales((uint64_t)A_s_buf[cur], A_S_BYTES, 0); // sel=0 → A scales
+      gemmini_mx_load_scales((uint64_t)B_s_buf[cur], B_S_BYTES, 1); // sel=1 → B scales
+
+      // --- Prefetch: compute NEXT block index and stage its scales into nxt buffer.
+      //     This CPU-side memcpy runs while the accelerator processes the mvin
+      //     commands issued below, hiding the staging latency. ---
+      int j0_next = j0 + 1, i0_next = i0;
+      if (j0_next >= BLOCKS_N) {
+        j0_next = 0;
+        i0_next = i0 + 1;
+      }
+      if (i0_next < BLOCKS_M) {
+        // Clamp j0_next to a valid column block for the purposes of staging.
+        int j0_nxt_clamped = (j0_next < BLOCKS_N) ? j0_next : 0;
+        for (int g = 0; g < MATMUL_K / 32; g++) {
+          memcpy(A_s_buf[nxt][g], &A_scales_row[g][i0_next * BLK], BLK);
+          memcpy(B_s_buf[nxt][g], &B_scales_col[g][j0_nxt_clamped * BLK], BLK);
+        }
+      }
+
+      // Step 3 (no LUT needed for fp8, uselut=0): skip gemmini_mx_load_lut.
+
+      // Step 4: MVIN tiles of A into the scratchpad using port 0.
+      // A rows: stride = MATMUL_K bytes (one full row of A).
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin(
+              (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+              a_base + (i * tiles_K + k) * DIM,
+              DIM, DIM);
+
+      // MVIN tiles of B into the scratchpad using port 0 (NOT mvin2/mvin3).
+      // MX loop_ws_spad requires all operands loaded via port-0 scratchpad.
+      // B rows: stride = MATMUL_N bytes (one full row of B).
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int j = 0; j < tiles; j++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin(
+              (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+              b_base + (k * tiles + j) * DIM,
+              DIM, DIM);
+
+      // Step 5: Configure requantized mvout.
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                   /*i_bound*/tiles, /*j_bound*/tiles,
+                                   /*k_bound*/tiles_K,
+                                   /*scale_act_sel*/0, /*scale_w_sel*/0,
+                                   /*lut_update_granularity*/1);
+
+      // Step 6: Compute the weight-stationary tiled matmul.
+      // gemmini_loop_ws_spad internally issues funct 24 (LOOP_WS_CONFIG_SPAD_AB)
+      // before funct 8 (LOOP_WS), satisfying the one-shot marker requirement.
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K,
+                           pad_i, pad_j, 0,
+                           a_base, BANK_NUM * BANK_ROWS,
+                           0, SPAD_DEST,
+                           false, false,
+                           false, false, false,
+                           NO_ACTIVATION, 0, 0,
+                           false, 0x38);
+
+      // Step 7: Drain BF16-packed results from mx_smem to DRAM, row by row.
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(
+            &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+            SPAD_DEST * 16 + r * BLK,
+            ncols);
+
+      // Full memory barrier: must complete before host reads output.
+      gemmini_fence();
+
+      // Swap cur <-> nxt for the next iteration so the prefetched
+      // scales become the "current" scales without any extra copy.
+      int tmp = cur;
+      cur = nxt;
+      nxt = tmp;
+    }
+  }
+}
+''',
+score=inf,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='global.anthropic.claude-sonnet-4-6',
+code_gen_model='global.anthropic.claude-sonnet-4-6',
+stdout='Kernel produced an INCORRECT/illegal result on spike. Diagnostic (fix this before optimizing):\nGEMMINI LOOP_WS ILLEGAL: a loop_ws input was loaded via mvin2/mvin3 (port != 0); the MX loop_ws_spad reads A/B from the port-0 scratchpad region on RTL, so this is spike-correct but RTL-WRONG (the fp8-128 dual-port-B winner). Use single-port gemmini_extended_mvin for loop_ws inputs. -- spike<->RTL dual-port divergence (task #38)\nGemmini extension configured with:\ndim = 16',
+stderr=None)

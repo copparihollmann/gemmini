@@ -1,0 +1,113 @@
+## Strategy: Batched MVIN with MAX_BLOCK_LEN Block Transfers
+
+### Analysis of Current Code
+
+The current code issues one `gemmini_extended_mvin` / `gemmini_extended_mvin2` call per DIM×DIM tile:
+
+```c
+for (int i = 0; i < tiles_I; i++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(..., a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+```
+
+Each call transfers exactly one 16×16 tile. However, the hardware supports `MAX_BLOCK_LEN=4` — up to 4 consecutive DIM-row tiles in a single mvin command by setting `cols = len*DIM` and `rows = DIM`. This means we can batch up to 4 contiguous tiles per instruction, reducing the total number of RoCC instructions issued by up to 4×.
+
+### Why This Helps
+
+- **Instruction dispatch overhead**: Each RoCC instruction has non-trivial issue overhead on Spike (and on real hardware). Reducing 4 individual mvins to 1 `gemmini_block_mvin`-style call cuts instruction count by ~75% for the mvin phase.
+- **Tiles along K are laid out contiguously in the scratchpad**: A tiles for a fixed `i` are at `a_base + (i*tiles_K + k)*DIM` for k=0,1,...,tiles_K-1 — these are consecutive rows. Similarly B tiles for fixed `j` are at `b_base + (j*tiles_K + k)*DIM`. These are exactly the contiguous-row layout that block mvin requires.
+- **DRAM addresses are also strided**: With `gemmini_extended3_config_ld` stride set to `MATMUL_K * sizeof(elem_t)` (for A) and `MATMUL_N * sizeof(elem_t)` (for B), consecutive K-tiles within a fixed `i` (or `j`) row of A (or B) are contiguous in DRAM too. So we can transfer multiple K-tiles in one shot.
+
+### Concrete Change
+
+Replace the per-tile mvin loops with block-mvin loops that transfer `min(tiles_K, MAX_BLOCK_LEN)` tiles per instruction, iterating in strides of `MAX_BLOCK_LEN` along K:
+
+```c
+// A: batch up to MAX_BLOCK_LEN k-tiles per mvin
+for (int i = 0; i < tiles_I; i++) {
+  for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+    int blk = (k + MAX_BLOCK_LEN <= tiles_K) ? MAX_BLOCK_LEN : (tiles_K - k);
+    gemmini_extended_mvin(
+      (void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+      a_base + (i * tiles_K + k) * DIM,
+      blk * DIM, DIM);  // cols = blk*DIM, rows = DIM
+  }
+}
+
+// B: batch up to MAX_BLOCK_LEN k-tiles per mvin2
+for (int j = 0; j < tiles_J; j++) {
+  for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+    int blk = (k + MAX_BLOCK_LEN <= tiles_K) ? MAX_BLOCK_LEN : (tiles_K - k);
+    gemmini_extended_mvin2(
+      (void*)(((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM),
+      b_base + (j * tiles_K + k) * DIM,
+      blk * DIM, DIM);
+    // Note: b_base uses (j*tiles_K + k) to match the canonical layout
+  }
+}
+```
+
+Wait — I need to verify the B spad indexing. The canonical layout from the spec is `b_base + (j*tiles_K + k)*DIM`. The original code uses `b_base + (k*tiles_J + j)*DIM`. Let me re-examine: the original loop is `j` outer, `k` inner, and uses `b_base + (k * tiles_J + j) * DIM`. But the spec says `b_base + (j*tiles_K + k)*DIM`. These are different layouts — the original code uses column-major (k-major) indexing. For block mvin to work (contiguous spad rows), tiles must be consecutive in spad. With the original `(k*tiles_J + j)` indexing, consecutive k tiles for fixed j are NOT contiguous (they are spaced tiles_J apart). So the key fix is to **reorder to j-major B layout** (`(j*tiles_K + k)*DIM`) so that k-tiles for a fixed j are contiguous, enabling block mvin.
+
+This reorder also fixes the B spad layout to match the spec's canonical form.
+
+### Full Rewritten Solution
+
+```c
+void solution(void) {
+  // Step 1: Configure execution (FP8, BF16 output)
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // Step 2: Load scale factors
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Step 3: Configure mvin ports (hoisted outside loops)
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0); // port 0: A
+  gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1); // port 1: B
+
+  // Step 4a: MVIN A tiles in blocks of up to MAX_BLOCK_LEN along K
+  // A tiles at a_base + (i*tiles_K + k)*DIM — k-consecutive tiles are contiguous
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+      int blk = (k + MAX_BLOCK_LEN <= tiles_K) ? MAX_BLOCK_LEN : (tiles_K - k);
+      gemmini_extended_mvin(
+          (void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+          a_base + (i * tiles_K + k) * DIM,
+          blk * DIM, DIM);
+    }
+  }
+
+  // Step 4b: MVIN B tiles in blocks of up to MAX_BLOCK_LEN along K
+  // B tiles at b_base + (j*tiles_K + k)*DIM — k-consecutive tiles are contiguous
+  for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+      int blk = (k + MAX_BLOCK_LEN <= tiles_K) ? MAX_BLOCK_LEN : (tiles_K - k);
+      gemmini_extended_mvin2(
+          (void*)(((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM),
+          b_base + (j * tiles_K + k) * DIM,
+          blk * DIM, DIM);
+    }
+  }
+
+  // Step 5: Configure output and requantizer
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+      tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // Step 6: Fused hardware matmul
+  // B end address is BANK_NUM*BANK_ROWS (top of scratchpad)
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+      a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+      false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // Step 7: Drain results to DRAM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+### Summary
+
+The B spad index was changed from `(k*tiles_J + j)` to `(j*tiles_K + k)` (matching the spec canonical layout), making k-consecutive B tiles contiguous in the scratchpad. Both A and B mvin loops now batch up to `MAX_BLOCK_LEN=4` tiles per instruction by setting `cols = blk*DIM`. This reduces total mvin instruction count by up to 4×, cutting RoCC dispatch overhead and improving DMA efficiency, which is the dominant cost in the mvin phase.

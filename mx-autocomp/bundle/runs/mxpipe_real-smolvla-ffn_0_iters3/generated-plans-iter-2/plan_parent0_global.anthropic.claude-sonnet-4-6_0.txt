@@ -1,0 +1,72 @@
+## Analysis of the Current Code
+
+The current code has two `memcpy` calls inside the outer `(i0, j0)` loop to stage scale factors into local buffers `A_s` and `B_s` before passing them to `gemmini_mx_load_scales`. These copies run on the CPU host and add latency that partially serializes with the accelerator's scale-loading DMA.
+
+Strategy 4 — **pipeline scale loading for block (i0+1, j0+1) while block (i0, j0) mvin instructions are in-flight** — directly targets this: issue the `gemmini_mx_load_scales` for the *next* block's scales (including its `memcpy` staging) while the current block's `gemmini_extended_mvin` instructions are queued in the accelerator's command FIFO, overlapping the host-side memcpy + scale-DMA latency with the data-movement phase.
+
+## Plan
+
+### What to change
+
+**Prefetch the next block's scale factors while the current block's mvin instructions are executing.**
+
+Concretely:
+
+1. **Before the main loop begins**, perform the `memcpy` staging and `gemmini_mx_load_scales` for block `(i0=0, j0=0)` into a pair of "current" scale buffers (`A_s_cur`, `B_s_cur`). This is the prolog.
+
+2. **Inside the `(i0, j0)` loop**, after issuing the current block's `gemmini_mx_load_scales` calls (using the pre-staged `A_s_cur`/`B_s_cur`), immediately compute the *next* block's `(i0_next, j0_next)` index and run the `memcpy` to populate a second pair of "next" scale buffers (`A_s_nxt`, `B_s_nxt`). This CPU-side memcpy happens while the accelerator is processing the current block's `gemmini_extended_mvin` queue, hiding the staging latency.
+
+3. **At the start of each loop iteration**, swap `cur` ↔ `nxt` pointers (or indices into a double buffer), so the freshly staged next-block scales become the current-block scales for the following iteration without any extra copy.
+
+4. The `gemmini_mx_load_scales` calls themselves remain in the same position relative to `gemmini_extended3_config_ex` and before `gemmini_extended_mvin`, preserving the required programming-model order.
+
+### Detailed structure
+
+```
+// Double buffers for scale staging
+static uint8_t A_s[2][GK][BLK], B_s[2][GK][BLK];
+int cur = 0, nxt = 1;
+
+// --- PROLOG: stage scales for first block (i0=0, j0=0) ---
+for (int g = 0; g < MATMUL_K/32; g++) {
+    memcpy(A_s[cur][g], A_scales_row[g] + 0*BLK, BLK);
+    memcpy(B_s[cur][g], B_scales_col[g] + 0*BLK, BLK);
+}
+
+for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    // ... (mrows/ncols bounds, flush, config_ex) ...
+
+    // Issue scale loads for CURRENT block (already staged in A_s[cur], B_s[cur])
+    gemmini_mx_load_scales((uint64_t)A_s[cur], A_S_BYTES, 0);
+    gemmini_mx_load_scales((uint64_t)B_s[cur], B_S_BYTES, 1);
+
+    // --- Compute NEXT block index ---
+    int j0_next = j0 + 1, i0_next = i0;
+    if (j0_next >= BLOCKS_N) { j0_next = 0; i0_next = i0 + 1; }
+
+    // --- Prefetch: stage NEXT block's scales into nxt buffer
+    //     while accelerator processes mvin commands below ---
+    if (i0_next < BLOCKS_M) {
+        for (int g = 0; g < MATMUL_K/32; g++) {
+            memcpy(A_s[nxt][g], A_scales_row[g] + i0_next*BLK, BLK);
+            memcpy(B_s[nxt][g], B_scales_col[g] + j0_next*BLK, BLK);
+        }
+    }
+
+    // ... gemmini_config_ld, mvin A tiles, mvin B tiles ...
+    // ... gemmini_config_st, gemmini_mxquant_config_mvout ...
+    // ... gemmini_loop_ws_spad, gemmini_mx_read_smem, gemmini_fence ...
+
+    // Swap cur/nxt for the next iteration
+    int tmp = cur; cur = nxt; nxt = tmp;
+  }
+}
+```
+
+### Why this works
+
+- The `memcpy` for `(i0_next, j0_next)` executes on the CPU immediately after `gemmini_mx_load_scales` for the current block is enqueued. At this point, the accelerator's command queue begins processing the scale DMA *and* will then process the upcoming mvin commands. The CPU's memcpy work (which populates `A_s[nxt]`/`B_s[nxt]`) runs in parallel with all of that accelerator activity.
+- By the time the next loop iteration begins and calls `gemmini_mx_load_scales(A_s[cur], ...)` (where `cur` is the swapped `nxt`), the staging is already complete — eliminating the blocking memcpy from the critical path.
+- The programming model order (`config_ex` → `load_scales` → `mvin` → `mxquant_config_mvout` → `loop_ws_spad` → `read_smem` → `fence`) is fully preserved within each iteration, since the prefetch memcpy only writes to the *next* buffer and does not issue any accelerator instructions.
+- Double-buffering requires 2× the scale buffer memory, but scale buffers are tiny (`BLK × GK` bytes each), so this is negligible.

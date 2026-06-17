@@ -1,0 +1,460 @@
+{'correct': True, 'test_results': {0: True}, 'compiled': True, 'latency': 95}
+Prev latency: 92
+New latency: 95
+Plan: ## Analysis of the Original Code
+
+Looking at the original code, I can identify a key inefficiency:
+
+```c
+gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+for (int i = 0; i < tiles_I; i++)
+    gemmini_block_mvin((void*)(((elem_t*)A_in) + i * DIM * MATMUL_K),
+                       a_base + i * tiles_K * DIM, tiles_K);
+for (int j = 0; j < tiles_J; j++)
+    gemmini_block_mvin((void*)(((elem_t*)B_in) + j * DIM * MATMUL_K),
+                       b_base + j * tiles_K * DIM, tiles_K);
+```
+
+**Problem:** A tiles are loaded via `mvin` (port 0) and B tiles are loaded sequentially after — both using the same `gemmini_config_ld` stride. This is purely sequential: B loading doesn't begin until all A loading finishes. Moreover, `gemmini_block_mvin` issues one command per `tiles_K` rows, but when `tiles_K > MAX_BLOCK_LEN=4`, it silently loads too many rows in one command (hardware DMA block-length violation).
+
+## Strategy: Use `mvin2` Port to Parallelize A and B Loads + Split Oversized Blocks
+
+**Selected Strategy: Use `mvin2`/`mvin3` ports to parallelize A and B tile loads simultaneously (strategy 5), combined with splitting oversized `gemmini_block_mvin` calls into chunks of ≤ MAX_BLOCK_LEN=4 tiles (strategy 7).**
+
+### How This Improves Performance
+
+For this problem, `MATMUL_K` determines `tiles_K`. The A matrix has row stride `MATMUL_K * sizeof(elem_t)` and the B matrix also has row stride `MATMUL_K * sizeof(elem_t)`. They share the same stride, but `mvin` and `mvin2` have **independent configuration registers** — each port maintains its own stride setting via separate `CONFIG_LD` commands (id=0 for mvin, id=1 for mvin2).
+
+By interleaving `mvin` (A tiles) and `mvin2` (B tiles) commands:
+1. The hardware can pipeline/overlap DMA transfers for A and B simultaneously, since they use different scratchpad regions and different DMA ports.
+2. We eliminate the sequential dependency between A-load completion and B-load start.
+3. We correctly split any block larger than `MAX_BLOCK_LEN=4` into chunks to avoid DMA corruption.
+
+The key insight: A tiles go to the **bottom** of the scratchpad (`a_base`), B tiles go to the **top** (`b_base`). These are non-overlapping regions, so concurrent DMA into both is safe.
+
+### Implementation Plan
+
+1. Configure port 0 (`mvin`, id=0) with A's stride using `gemmini_extended3_config_ld(stride, MVIN_SCALE_IDENTITY, false, 0)`.
+2. Configure port 1 (`mvin2`, id=1) with B's stride using `gemmini_extended3_config_ld(stride, MVIN_SCALE_IDENTITY, false, 1)`.
+3. Interleave `gemmini_extended_mvin` and `gemmini_extended_mvin2` calls per tile, chunked at MAX_BLOCK_LEN=4.
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Configure both mvin ports with the same stride (MATMUL_K bytes per row)
+  // Port 0 (mvin)  → A tiles
+  // Port 1 (mvin2) → B tiles
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+  // Interleave A and B tile loads across ports 0 and 1 simultaneously.
+  // Both loops emit commands without waiting; the hardware DMA engine
+  // processes mvin and mvin2 queues in parallel.
+  // Chunk size is capped at MAX_BLOCK_LEN=4 to avoid DMA block-length violations.
+
+  const int CHUNK = MAX_BLOCK_LEN; // 4
+
+  // Emit all A tile mvins (port 0) and B tile mvins (port 1) interleaved.
+  // We iterate over the larger of tiles_I / tiles_J and issue both when available.
+  int max_tiles = (tiles_I > tiles_J) ? tiles_I : tiles_J;
+
+  for (int idx = 0; idx < max_tiles; idx++) {
+    // Issue A mvin for tile row `idx` if still in range
+    if (idx < tiles_I) {
+      elem_t *a_dram = (elem_t*)A_in + idx * DIM * MATMUL_K;
+      uint32_t a_sp  = a_base + idx * tiles_K * DIM;
+      // Split into chunks of at most CHUNK tiles along K
+      for (int k = 0; k < tiles_K; k += CHUNK) {
+        int blk = (tiles_K - k < CHUNK) ? (tiles_K - k) : CHUNK;
+        gemmini_extended_mvin(
+            (void*)(a_dram + k * DIM),
+            a_sp + k * DIM,
+            blk * DIM, DIM);
+      }
+    }
+    // Issue B mvin2 for tile col `idx` if still in range
+    if (idx < tiles_J) {
+      elem_t *b_dram = (elem_t*)B_in + idx * DIM * MATMUL_K;
+      uint32_t b_sp  = b_base + idx * tiles_K * DIM;
+      for (int k = 0; k < tiles_K; k += CHUNK) {
+        int blk = (tiles_K - k < CHUNK) ? (tiles_K - k) : CHUNK;
+        gemmini_extended_mvin2(
+            (void*)(b_dram + k * DIM),
+            b_sp + k * DIM,
+            blk * DIM, DIM);
+      }
+    }
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+      tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+      a_base, BANK_NUM * BANK_ROWS, 0,
+      0, false, false, false, false, false,
+      NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], 0, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+### Why This Is Better
+
+- **Parallelism:** By interleaving `mvin` and `mvin2` commands in a single loop, we keep both DMA ports busy simultaneously. The A scratchpad region (rows 0…`a_base+tiles_I*tiles_K*DIM-1`) and B scratchpad region (rows `b_base`…8191) are completely disjoint, so there is no bank conflict between the two streams.
+- **Correctness of block sizes:** Each `gemmini_extended_mvin/mvin2` call now moves at most `CHUNK * DIM = 4 * 16 = 64` columns worth of data — exactly `MAX_BLOCK_LEN * DIM` — which respects the hardware's `MAX_BLOCK_LEN=4` DMA limit. The original `gemmini_block_mvin(ptr, sp, tiles_K)` would issue a single command for all `tiles_K` rows, which silently corrupts data when `tiles_K > 4`.
+- **No extra fences added:** We rely on the hardware command queue to serialize loads before the `gemmini_loop_ws_spad` compute command naturally, since all commands go through the same in-order issue queue. The single fence at the end (after `gemmini_mx_read_smem`) is preserved as required.
+
+CodeCandidate(parent=CodeCandidate(parent=CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED baseline MX matmul kernel (64x64x64, fp8:e4m3).
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+  for (int j = 0; j < tiles_J; j++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+                            b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+''',
+score=294,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''## Analysis of the Baseline Code
+
+Looking at the baseline code, the B matrix is loaded with nested loops:
+
+```c
+for (int j = 0; j < tiles_J; j++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(..., b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+```
+
+For a 64×64×64 matrix with DIM=16: `tiles_I=4`, `tiles_J=4`, `tiles_K=4`. Each mvin issues a single 16-row DMA command. For B, that\'s 4×4=16 mvin commands, each loading DIM=16 consecutive rows — but each issued as a separate command.
+
+## Selected Strategy: Strategy 12 — Use `gemmini_block_mvin` to coalesce multiple contiguous row tiles
+
+## Plan
+
+**Observation:** When loading B tiles, the inner loop iterates over `k` from 0 to `tiles_K-1`. For a fixed `j`, the B tiles at `b_base + (j*tiles_K + 0)*DIM`, `b_base + (j*tiles_K + 1)*DIM`, ..., `b_base + (j*tiles_K + (tiles_K-1))*DIM` are **contiguous in scratchpad** (consecutive DIM-row blocks). Similarly, their DRAM sources `B_in + j*DIM*MATMUL_K + k*DIM` are contiguous along the K dimension.
+
+**Constraint check:** `MAX_BLOCK_LEN=4` allows up to 4 consecutive DIM-row tiles per single mvin command. Since `tiles_K=4`, all K-tiles for a fixed `j` can be coalesced into a single `gemmini_block_mvin` call with `len=tiles_K=4`.
+
+**Change for B loading:**  
+Replace the inner-k loop over individual `gemmini_extended_mvin` calls with a single `gemmini_block_mvin(dram_ptr, spad_addr, tiles_K)` per `j`. This issues one mvin command per `j` row instead of `tiles_K` commands, reducing B mvin command count from `tiles_J * tiles_K = 16` down to `tiles_J = 4`.
+
+**Change for A loading:**  
+Similarly, for a fixed `i`, the A tiles at `a_base + (i*tiles_K + k)*DIM` for k=0..tiles_K-1 are contiguous in scratchpad, and the DRAM sources `A_in + i*DIM*MATMUL_K + k*DIM` are also contiguous along K. Replace the inner-k loop with `gemmini_block_mvin(dram_ptr, spad_addr, tiles_K)` per `i`, reducing A mvin commands from `tiles_I * tiles_K = 16` to `tiles_I = 4`.
+
+**Stride check:** `gemmini_config_ld(MATMUL_K * sizeof(elem_t))` sets the DRAM row stride to `MATMUL_K` bytes. For A: the matrix is row-major with `MATMUL_K` columns, so consecutive DIM rows of one tile column are separated by `MATMUL_K` bytes — correct. For B: the matrix is stored with `MATMUL_K` columns and the k-tiles are adjacent in memory along a row — correct.
+
+**`gemmini_block_mvin` definition:** `gemmini_block_mvin(dram_addr, spad_addr, len)` expands to `gemmini_extended_mvin(dram_addr, spad_addr, (len)*DIM, DIM)`, which sets cols=`len*DIM` and rows=`DIM`, transferring `len` contiguous DIM-wide tiles in one command.
+
+**Result:** Total mvin commands drop from 32 to 8, directly reducing instruction-issue overhead and potentially allowing better overlap with compute in the hardware pipeline.''',
+code='''void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++)
+    gemmini_block_mvin((void*)(((elem_t*)A_in) + i * DIM * MATMUL_K),
+                       a_base + i * tiles_K * DIM, tiles_K);
+  for (int j = 0; j < tiles_J; j++)
+    gemmini_block_mvin((void*)(((elem_t*)B_in) + j * DIM * MATMUL_K),
+                       b_base + j * tiles_K * DIM, tiles_K);
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+''',
+score=96,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='us.anthropic.claude-sonnet-4-6',
+code_gen_model='us.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None),
+plan='''## Analysis of the Original Code
+
+The original code uses `SPAD_DEST = 128` and reads smem with offset `SPAD_DEST * 16 = 2048`. Looking at the code:
+
+```c
+int SPAD_DEST = 128;
+// ...
+gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+```
+
+## Applying Strategy 7: Set `SPAD_DEST = 0`
+
+**Strategy:** Set `SPAD_DEST = 0` and reduce the smem word offset to `0` in `gemmini_mx_read_smem` when no scratchpad/accumulator aliasing conflict exists.
+
+**Analysis of aliasing conflicts:**
+
+- A tiles occupy: `a_base + (i*tiles_K + k)*DIM` starting at 0, up to `tiles_I * tiles_K * DIM` rows
+- B tiles occupy: top of scratchpad at `b_base = BANK_NUM*BANK_ROWS - tiles_K*tiles_J*DIM`
+- `SPAD_DEST` is the C output destination address in smem — it is in `mx_smem`, **not** in the scratchpad address space
+
+The `SPAD_DEST` parameter in `gemmini_loop_ws_spad` specifies where in `mx_smem` the BF16 results are written. It is not a scratchpad address — it is an offset into the separate `mx_smem` memory. Therefore, there is **no aliasing conflict** between `SPAD_DEST = 0` and the A/B tiles in the scratchpad.
+
+**Plan:**
+
+1. Change `SPAD_DEST` from `128` to `0`
+2. Change the `gemmini_mx_read_smem` call to use `SPAD_DEST * 16 = 0` as the smem word offset
+
+This eliminates the address offset arithmetic overhead (`SPAD_DEST * 16 = 2048` word offset) and allows the hardware to write results starting at smem word 0 rather than word 2048, reducing the read-back address computation and potentially improving smem access locality for the drain operation.
+
+The `smem_start_addr` computation in the reference pattern (`((uint64_t *)SMEM) + SPAD_DEST * 2`) also becomes simpler, though in the Spike path this is handled by `gemmini_mx_read_smem` directly.
+
+## Rewritten Code
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++)
+    gemmini_block_mvin((void*)(((elem_t*)A_in) + i * DIM * MATMUL_K),
+                       a_base + i * tiles_K * DIM, tiles_K);
+  for (int j = 0; j < tiles_J; j++)
+    gemmini_block_mvin((void*)(((elem_t*)B_in) + j * DIM * MATMUL_K),
+                       b_base + j * tiles_K * DIM, tiles_K);
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       0, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], 0, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+**Change summary:** `SPAD_DEST` changed from `128` to `0` in `gemmini_loop_ws_spad` (4th argument from end before the transpose flags), and the smem word offset in `gemmini_mx_read_smem` changed from `SPAD_DEST * 16 = 2048` to `0`. All other logic is identical.''',
+code='''void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++)
+    gemmini_block_mvin((void*)(((elem_t*)A_in) + i * DIM * MATMUL_K),
+                       a_base + i * tiles_K * DIM, tiles_K);
+  for (int j = 0; j < tiles_J; j++)
+    gemmini_block_mvin((void*)(((elem_t*)B_in) + j * DIM * MATMUL_K),
+                       b_base + j * tiles_K * DIM, tiles_K);
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       0, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], 0, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+''',
+score=92,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='us.anthropic.claude-sonnet-4-6',
+code_gen_model='us.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None),
+plan='''## Analysis of the Original Code
+
+Looking at the original code, I can identify a key inefficiency:
+
+```c
+gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+for (int i = 0; i < tiles_I; i++)
+    gemmini_block_mvin((void*)(((elem_t*)A_in) + i * DIM * MATMUL_K),
+                       a_base + i * tiles_K * DIM, tiles_K);
+for (int j = 0; j < tiles_J; j++)
+    gemmini_block_mvin((void*)(((elem_t*)B_in) + j * DIM * MATMUL_K),
+                       b_base + j * tiles_K * DIM, tiles_K);
+```
+
+**Problem:** A tiles are loaded via `mvin` (port 0) and B tiles are loaded sequentially after — both using the same `gemmini_config_ld` stride. This is purely sequential: B loading doesn\'t begin until all A loading finishes. Moreover, `gemmini_block_mvin` issues one command per `tiles_K` rows, but when `tiles_K > MAX_BLOCK_LEN=4`, it silently loads too many rows in one command (hardware DMA block-length violation).
+
+## Strategy: Use `mvin2` Port to Parallelize A and B Loads + Split Oversized Blocks
+
+**Selected Strategy: Use `mvin2`/`mvin3` ports to parallelize A and B tile loads simultaneously (strategy 5), combined with splitting oversized `gemmini_block_mvin` calls into chunks of ≤ MAX_BLOCK_LEN=4 tiles (strategy 7).**
+
+### How This Improves Performance
+
+For this problem, `MATMUL_K` determines `tiles_K`. The A matrix has row stride `MATMUL_K * sizeof(elem_t)` and the B matrix also has row stride `MATMUL_K * sizeof(elem_t)`. They share the same stride, but `mvin` and `mvin2` have **independent configuration registers** — each port maintains its own stride setting via separate `CONFIG_LD` commands (id=0 for mvin, id=1 for mvin2).
+
+By interleaving `mvin` (A tiles) and `mvin2` (B tiles) commands:
+1. The hardware can pipeline/overlap DMA transfers for A and B simultaneously, since they use different scratchpad regions and different DMA ports.
+2. We eliminate the sequential dependency between A-load completion and B-load start.
+3. We correctly split any block larger than `MAX_BLOCK_LEN=4` into chunks to avoid DMA corruption.
+
+The key insight: A tiles go to the **bottom** of the scratchpad (`a_base`), B tiles go to the **top** (`b_base`). These are non-overlapping regions, so concurrent DMA into both is safe.
+
+### Implementation Plan
+
+1. Configure port 0 (`mvin`, id=0) with A\'s stride using `gemmini_extended3_config_ld(stride, MVIN_SCALE_IDENTITY, false, 0)`.
+2. Configure port 1 (`mvin2`, id=1) with B\'s stride using `gemmini_extended3_config_ld(stride, MVIN_SCALE_IDENTITY, false, 1)`.
+3. Interleave `gemmini_extended_mvin` and `gemmini_extended_mvin2` calls per tile, chunked at MAX_BLOCK_LEN=4.
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Configure both mvin ports with the same stride (MATMUL_K bytes per row)
+  // Port 0 (mvin)  → A tiles
+  // Port 1 (mvin2) → B tiles
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+  // Interleave A and B tile loads across ports 0 and 1 simultaneously.
+  // Both loops emit commands without waiting; the hardware DMA engine
+  // processes mvin and mvin2 queues in parallel.
+  // Chunk size is capped at MAX_BLOCK_LEN=4 to avoid DMA block-length violations.
+
+  const int CHUNK = MAX_BLOCK_LEN; // 4
+
+  // Emit all A tile mvins (port 0) and B tile mvins (port 1) interleaved.
+  // We iterate over the larger of tiles_I / tiles_J and issue both when available.
+  int max_tiles = (tiles_I > tiles_J) ? tiles_I : tiles_J;
+
+  for (int idx = 0; idx < max_tiles; idx++) {
+    // Issue A mvin for tile row `idx` if still in range
+    if (idx < tiles_I) {
+      elem_t *a_dram = (elem_t*)A_in + idx * DIM * MATMUL_K;
+      uint32_t a_sp  = a_base + idx * tiles_K * DIM;
+      // Split into chunks of at most CHUNK tiles along K
+      for (int k = 0; k < tiles_K; k += CHUNK) {
+        int blk = (tiles_K - k < CHUNK) ? (tiles_K - k) : CHUNK;
+        gemmini_extended_mvin(
+            (void*)(a_dram + k * DIM),
+            a_sp + k * DIM,
+            blk * DIM, DIM);
+      }
+    }
+    // Issue B mvin2 for tile col `idx` if still in range
+    if (idx < tiles_J) {
+      elem_t *b_dram = (elem_t*)B_in + idx * DIM * MATMUL_K;
+      uint32_t b_sp  = b_base + idx * tiles_K * DIM;
+      for (int k = 0; k < tiles_K; k += CHUNK) {
+        int blk = (tiles_K - k < CHUNK) ? (tiles_K - k) : CHUNK;
+        gemmini_extended_mvin2(
+            (void*)(b_dram + k * DIM),
+            b_sp + k * DIM,
+            blk * DIM, DIM);
+      }
+    }
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+      tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+      a_base, BANK_NUM * BANK_ROWS, 0,
+      0, false, false, false, false, false,
+      NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], 0, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+### Why This Is Better
+
+- **Parallelism:** By interleaving `mvin` and `mvin2` commands in a single loop, we keep both DMA ports busy simultaneously. The A scratchpad region (rows 0…`a_base+tiles_I*tiles_K*DIM-1`) and B scratchpad region (rows `b_base`…8191) are completely disjoint, so there is no bank conflict between the two streams.
+- **Correctness of block sizes:** Each `gemmini_extended_mvin/mvin2` call now moves at most `CHUNK * DIM = 4 * 16 = 64` columns worth of data — exactly `MAX_BLOCK_LEN * DIM` — which respects the hardware\'s `MAX_BLOCK_LEN=4` DMA limit. The original `gemmini_block_mvin(ptr, sp, tiles_K)` would issue a single command for all `tiles_K` rows, which silently corrupts data when `tiles_K > 4`.
+- **No extra fences added:** We rely on the hardware command queue to serialize loads before the `gemmini_loop_ws_spad` compute command naturally, since all commands go through the same in-order issue queue. The single fence at the end (after `gemmini_mx_read_smem`) is preserved as required.''',
+code='''void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Configure port 0 (mvin)  for A tiles
+  // Configure port 1 (mvin2) for B tiles
+  // Both share the same DRAM row stride: MATMUL_K bytes per row
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+  // Interleave A (port 0) and B (port 1) tile loads.
+  // Each block is capped at MAX_BLOCK_LEN=4 tiles to respect the DMA limit.
+  // A tiles occupy scratchpad rows [a_base .. a_base + tiles_I*tiles_K*DIM - 1].
+  // B tiles occupy scratchpad rows [b_base .. BANK_NUM*BANK_ROWS - 1], growing downward.
+  // These regions are disjoint, so both ports can be in flight simultaneously.
+
+  const int CHUNK = MAX_BLOCK_LEN; // 4
+
+  int max_tiles = (tiles_I > tiles_J) ? tiles_I : tiles_J;
+
+  for (int idx = 0; idx < max_tiles; idx++) {
+    // Issue A mvin commands for row tile `idx` (port 0)
+    if (idx < tiles_I) {
+      elem_t *a_dram = (elem_t*)A_in + idx * DIM * MATMUL_K;
+      uint32_t a_sp  = a_base + idx * tiles_K * DIM;
+      for (int k = 0; k < tiles_K; k += CHUNK) {
+        int blk = ((tiles_K - k) < CHUNK) ? (tiles_K - k) : CHUNK;
+        gemmini_extended_mvin(
+            (void*)(a_dram + k * DIM),
+            a_sp + k * DIM,
+            blk * DIM, DIM);
+      }
+    }
+    // Issue B mvin2 commands for col tile `idx` (port 1)
+    if (idx < tiles_J) {
+      elem_t *b_dram = (elem_t*)B_in + idx * DIM * MATMUL_K;
+      uint32_t b_sp  = b_base + idx * tiles_K * DIM;
+      for (int k = 0; k < tiles_K; k += CHUNK) {
+        int blk = ((tiles_K - k) < CHUNK) ? (tiles_K - k) : CHUNK;
+        gemmini_extended_mvin2(
+            (void*)(b_dram + k * DIM),
+            b_sp + k * DIM,
+            blk * DIM, DIM);
+      }
+    }
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+      tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+      a_base, BANK_NUM * BANK_ROWS, 0,
+      0, false, false, false, false, false,
+      NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], 0, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+''',
+score=None,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='us.anthropic.claude-sonnet-4-6',
+code_gen_model='us.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None)

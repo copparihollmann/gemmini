@@ -1,0 +1,67 @@
+## Analysis of the Baseline Code
+
+The baseline performs:
+1. Load all A tiles sequentially (mvin)
+2. Load all B tiles sequentially (mvin)
+3. Run the fused loop
+4. Read results
+
+The key inefficiency I want to target: **the B-matrix is loaded using `gemmini_extended_mvin` (port 0), the same port as A**. These loads are serialized. The hardware provides three independent mvin ports (`mvin`, `mvin2`, `mvin3`). A-tiles should use `mvin` (port 0) and B-tiles should use `mvin2` (port 1), allowing the DMA engine to transfer A and B tiles in parallel, overlapping their transfer latencies.
+
+## New Strategy: Use `mvin2` for B-tile Loads to Parallelize A and B DMA Transfers
+
+### How it Improves Performance
+
+Currently, A-tiles and B-tiles are both loaded through `mvin` (funct `k_MVIN`). The DMA controller processes these sequentially — all A tiles complete before any B tile begins (or vice versa, depending on issue order). Since the scratchpad has independent addressing and the DMA engine has multiple ports, issuing A loads on `mvin` (port 0) and B loads on `mvin2` (port 1) allows the hardware to pipeline both transfers simultaneously.
+
+For a 128×128×256 matmul:
+- `tiles_I = 8`, `tiles_K = 16` → 128 A-tile mvin commands
+- `tiles_J = 8`, `tiles_K = 16` → 128 B-tile mvin commands
+
+By interleaving A and B loads using different ports, both sets of 128 transfers can overlap, roughly halving the total mvin latency before `gemmini_loop_ws_spad` starts.
+
+The B stride also differs from A's stride: A rows span `MATMUL_K * sizeof(elem_t)` bytes, while for FP8 B is stored transposed (column-major in K) so B's stride is `MATMUL_K * sizeof(elem_t)` as well for the row-major B layout used here. The key change is simply using `gemmini_extended_mvin2` for B with its own `gemmini_extended3_config_ld(..., id=1)` configuration, then interleaving A and B issue.
+
+### Implementation Plan
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Configure port 0 (mvin) for A: stride = full K width
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+  // Configure port 1 (mvin2) for B: same stride (B is K×N row-major)
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+  // Interleave A and B tile loads across independent DMA ports
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *a_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t a_sp  = a_base + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void*)a_ptr, a_sp, DIM, DIM);
+    }
+  }
+  for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *b_ptr = ((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM;
+      uint32_t b_sp  = b_base + (j * tiles_K + k) * DIM;
+      gemmini_extended_mvin2((void*)b_ptr, b_sp, DIM, DIM);
+    }
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+      tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+      a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+      false, false, false, false, false,
+      NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+The A-loop issues all 128 mvin commands to port 0; the B-loop issues all 128 mvin2 commands to port 1. Because the RoCC instruction queue dispatches to both DMA engines independently, the B transfers begin executing while A transfers are still in flight — the hardware pipelines both streams concurrently, reducing total load time before the fused compute loop begins.

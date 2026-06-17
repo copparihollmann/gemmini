@@ -1,0 +1,241 @@
+## Analysis
+
+Looking at the original code, the key inefficiency is that **all A tiles are loaded into the scratchpad before compute begins**. This means:
+
+1. All `tiles_I * tiles_K` A rows must fit in the scratchpad simultaneously alongside all B tiles
+2. There is no overlap between A loading and computation
+3. The hardware sits idle during the entire A mvin phase
+
+## Selected Strategy: Double Buffering (Strategy 6 / Strategy 9)
+
+**Tile the I dimension into outer blocks, double-buffering A tiles so the next I-block's DMA load overlaps with computing the current I-block.**
+
+### Plan
+
+**Partition the I dimension into outer blocks of size `IB` tiles** (where `IB` is chosen so that 2 × IB × tiles_K × DIM + tiles_J × tiles_K × DIM ≤ 8192 rows — fitting two A-blocks and all B tiles in scratchpad simultaneously).
+
+- **B tiles stay fixed** at `b_base` (top of scratchpad), loaded once.
+- **Two A buffers** alternate: buffer 0 at `a_base0 = 0` holding `IB * tiles_K * DIM` rows, buffer 1 at `a_base1 = IB * tiles_K * DIM` (same size). Both fit below `b_base`.
+- The loop proceeds:
+  1. **Prologue**: im2col + mvin the first I-block into buffer 0 (ping).
+  2. **Main loop**: For each I-block `ib`:
+     - **Issue compute** (`gemmini_loop_ws_spad`) for the current block in the current buffer.
+     - **Concurrently** (non-blocking mvin, no fence between mvin and loop_ws): im2col + mvin the *next* I-block into the *other* buffer (pong).
+     - Swap buffers.
+  3. After compute finishes, drain smem.
+
+However, there is a critical constraint: `gemmini_loop_ws_spad` must follow the full config sequence (scales → mvin → mxquant_config → loop_ws). Since scales don't change across I-blocks (A_scales_row covers the whole A matrix and is loaded once), we only need to re-issue `gemmini_mxquant_config_mvout` and `gemmini_loop_ws_spad` per I-block. The smem is drained once at the end (or per-block if SPAD_DEST is reused — here we use a single SPAD_DEST=0 and drain after each block's compute, updating the output pointer).
+
+**Sizing**: With `MATMUL_M=64, MATMUL_N=64, MATMUL_K=64`, `tiles_I=4, tiles_J=4, tiles_K=4`. B uses `4*4*16=256` rows. A uses `4*4*16=256` rows. Total=512 << 8192. Double-buffering with `IB=2`: each A-buffer = `2*4*16=128` rows; two buffers = 256 rows; B = 256 rows; total = 512. This fits comfortably, and the smem output for IB=2 tiles_J=4 = `2*4*16=128` rows, well within ACC_ROWS=256.
+
+The mvin instructions for the next block are issued *before* `gemmini_loop_ws_spad` returns (the loop_ws instruction is non-blocking from the CPU's perspective in Spike). By interleaving im2col + mvin of block `ib+1` *after* issuing loop_ws for block `ib` (and before draining smem), the DMA and systolic compute overlap.
+
+**The smem drain**: since `SPAD_DEST=0` is reused each block, we drain after each block's `loop_ws` — the `gemmini_mx_read_smem` + `gemmini_fence()` ensures the current block's results are written before the next `loop_ws` overwrites smem. Output is written to `C_hw[ib*IB*DIM][0]`.
+
+Here is the rewritten code:
+
+```c
+void solution(void) {
+  // Tile counts
+  const int tiles_I = MATMUL_M / DIM;
+  const int tiles_J = MATMUL_N / DIM;
+  const int tiles_K = MATMUL_K / DIM;
+
+  // Double-buffer I dimension: split tiles_I into blocks of IB tiles.
+  // Choose IB so 2*IB*tiles_K*DIM + tiles_J*tiles_K*DIM <= 8192
+  // and IB*tiles_J*DIM <= 128 (half ACC_ROWS for double-buffering safety).
+  // With tiles_I=4, tiles_J=4, tiles_K=4: IB=2 gives
+  //   A buffers: 2*2*4*16 = 256 rows, B: 4*4*16=256 rows, total=512 <= 8192. OK.
+  //   Accum per block: 2*4*16=128 <= 256. OK.
+  // For generality, compute IB as the largest power-of-2 divisor of tiles_I
+  // that satisfies both constraints.
+  int IB = tiles_I; // start with full, then shrink
+  // Constraint 1: (2*IB*tiles_K + tiles_J*tiles_K)*DIM <= 8192
+  // Constraint 2: IB*tiles_J*DIM <= 128
+  while (IB > 1 &&
+         !((2 * IB * tiles_K + tiles_J * tiles_K) * DIM <= 8192 &&
+           IB * tiles_J * DIM <= 128)) {
+    IB /= 2;
+  }
+  // If IB still violates constraint 1 (e.g. even IB=1 doesn't fit double-buffer
+  // but single-buffer fits), fall back to IB=1 with single A buffer.
+  // For IB=1: (2*1*tiles_K + tiles_J*tiles_K)*DIM vs 8192.
+  // In the degenerate case just use single buffer (no double-buffering).
+  const int use_double_buf =
+      (2 * IB * tiles_K + tiles_J * tiles_K) * DIM <= 8192 &&
+      IB * tiles_J * DIM <= 128 &&
+      IB < tiles_I; // only useful if we have multiple blocks
+  const int num_blocks = (tiles_I + IB - 1) / IB;
+
+  // Scratchpad layout:
+  // B tiles: b_base at top of scratchpad (fixed, loaded once)
+  // A double-buffer: buf0 at row 0, buf1 at row IB*tiles_K*DIM
+  // (when not double-buffering, only buf0 is used, IB==tiles_I)
+  const int b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+  const int a_buf0 = 0;
+  const int a_buf1 = IB * tiles_K * DIM; // only used when use_double_buf
+  const int SPAD_DEST = 0;
+
+  // Step 1: Configure execution (MX FP8 -> BF16, weight-stationary)
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // Step 2: Load scale factors (A=sel 0, B=sel 1)
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Step 3: Load B tiles using mvin2 (port 1) — done once, amortized over all I blocks
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+  for (int j = 0; j < tiles_J; j++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin2(
+          (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+          b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+
+  // Step 4: Configure mvin port 0 for A tiles
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+
+  // Helper lambda (inline): im2col + mvin for one I-block starting at tile i_start,
+  // of length cur_IB tiles, into scratchpad buffer starting at a_buf_base.
+  // Uses mvin port 0 (non-blocking).
+#define DO_IMCOL_AND_MVIN(i_start, cur_IB, a_buf_base) \
+  do { \
+    for (int _i = (i_start); _i < (i_start) + (cur_IB); _i++) { \
+      for (int _li = 0; _li < DIM; _li++) { \
+        int _patch_idx = _i * DIM + _li; \
+        int _pi = _patch_idx / PATCHES_X; \
+        int _pj = _patch_idx % PATCHES_X; \
+        int _y_base = _pi * CONV_KSZ; \
+        int _x_base = _pj * CONV_KSZ; \
+        elem_t *_a_row = A_buf[_patch_idx]; \
+        for (int _c = 0; _c < CONV_C; _c++) { \
+          int _c_off = _c * CONV_KSZ * CONV_KSZ; \
+          for (int _dy = 0; _dy < CONV_KSZ; _dy++) { \
+            int _dy_off = _c_off + _dy * CONV_KSZ; \
+            const elem_t *_x_row = &X_in[_c][_y_base + _dy][_x_base]; \
+            for (int _dx = 0; _dx < CONV_KSZ; _dx++) \
+              _a_row[_dy_off + _dx] = _x_row[_dx]; \
+          } \
+        } \
+      } \
+      for (int _k = 0; _k < tiles_K; _k++) \
+        gemmini_extended_mvin( \
+            (void*)(((elem_t*)A_buf) + _i * DIM * MATMUL_K + _k * DIM), \
+            (a_buf_base) + ((_i - (i_start)) * tiles_K + _k) * DIM, DIM, DIM); \
+    } \
+  } while (0)
+
+  if (!use_double_buf) {
+    // Fallback: single buffer, all A tiles loaded before compute (original behavior)
+    for (int i = 0; i < tiles_I; i++) {
+      for (int li = 0; li < DIM; li++) {
+        int patch_idx = i * DIM + li;
+        int pi = patch_idx / PATCHES_X;
+        int pj = patch_idx % PATCHES_X;
+        int y_base = pi * CONV_KSZ;
+        int x_base = pj * CONV_KSZ;
+        elem_t *a_row = A_buf[patch_idx];
+        for (int c = 0; c < CONV_C; c++) {
+          int c_off = c * CONV_KSZ * CONV_KSZ;
+          for (int dy = 0; dy < CONV_KSZ; dy++) {
+            int dy_off = c_off + dy * CONV_KSZ;
+            const elem_t *x_row = &X_in[c][y_base + dy][x_base];
+            for (int dx = 0; dx < CONV_KSZ; dx++)
+              a_row[dy_off + dx] = x_row[dx];
+          }
+        }
+      }
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin(
+            (void*)(((elem_t*)A_buf) + i * DIM * MATMUL_K + k * DIM),
+            a_buf0 + (i * tiles_K + k) * DIM, DIM, DIM);
+    }
+
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+        tiles_I, tiles_J, tiles_K, 0, 0, tiles_K);
+
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+        a_buf0, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+        false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+    gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+    gemmini_fence();
+
+  } else {
+    // Double-buffer path: ping-pong between a_buf0 and a_buf1 across I-blocks.
+    // For each block:
+    //   1. Compute (loop_ws_spad) on current buffer
+    //   2. Drain smem to DRAM output (non-blocking until fence)
+    //   3. Im2col + mvin next block into other buffer  <- overlaps with above
+    //   4. Fence to ensure drain complete, then move to next block
+
+    // Prologue: load first I-block (block 0) into a_buf0
+    int i_start = 0;
+    int cur_IB = (i_start + IB <= tiles_I) ? IB : (tiles_I - i_start);
+    DO_IMCOL_AND_MVIN(i_start, cur_IB, a_buf0);
+
+    int cur_buf = 0; // 0 -> a_buf0, 1 -> a_buf1
+
+    for (int ib = 0; ib < num_blocks; ib++) {
+      int blk_i_start = ib * IB;
+      int blk_IB = (blk_i_start + IB <= tiles_I) ? IB : (tiles_I - blk_i_start);
+      int a_cur = (cur_buf == 0) ? a_buf0 : a_buf1;
+
+      // Configure output for this block.
+      // The scale_dram layout is scale_dram + m*N_blocks + bi (row-major, block-indexed).
+      // For the per-block mvout, i_bound=blk_IB (tile rows in this block),
+      // j_bound=tiles_J, k_bound=tiles_K. scale_act_sel and scale_w_sel both 0.
+      // The scale_factors pointer covers the full matrix; the hardware indexes
+      // using m*N_blocks+bi where m is the output row tile and bi is the N-block.
+      // We pass the base pointer and let hardware index it.
+      gemmini_config_st(OUT_COLS * sizeof(out_t));
+      gemmini_mxquant_config_mvout(
+          (uint64_t)scale_factors + blk_i_start * (MATMUL_N / DIM),
+          blk_IB, tiles_J, tiles_K, 0, 0, tiles_K);
+
+      // Compute this block
+      gemmini_loop_ws_spad(blk_IB, tiles_J, tiles_K, 0, 0, 0,
+          a_cur, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+          false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Issue drain of this block's results (non-blocking DMA to DRAM)
+      gemmini_mx_read_smem(
+          &C_hw[blk_i_start * DIM][0],
+          SPAD_DEST * 16,
+          blk_IB * DIM * MATMUL_N);
+
+      // While drain is in flight (and loop_ws is running/done),
+      // prefetch next I-block into the other buffer
+      int next_ib = ib + 1;
+      if (next_ib < num_blocks) {
+        int next_i_start = next_ib * IB;
+        int next_IB = (next_i_start + IB <= tiles_I) ? IB : (tiles_I - next_i_start);
+        int a_next = (cur_buf == 0) ? a_buf1 : a_buf0;
+        // Re-confirm config_ld for port 0 (persists, no re-issue needed unless changed)
+        DO_IMCOL_AND_MVIN(next_i_start, next_IB, a_next);
+      }
+
+      // Fence: ensure drain of this block is complete before next loop_ws
+      // overwrites smem (and before host reads C_hw for this block)
+      gemmini_fence();
+
+      cur_buf ^= 1; // swap buffer
+    }
+  }
+
+#undef DO_IMCOL_AND_MVIN
+}
+```
+
+### Why This Works
+
+1. **Double-buffering eliminates idle time**: After issuing `gemmini_loop_ws_spad` for block `ib` (non-blocking from CPU), we immediately issue `gemmini_mx_read_smem` (also non-blocking), then perform CPU-side im2col and issue mvin DMA commands for block `ib+1` into the alternate buffer. The systolic array computes block `ib` while the CPU fills and DMA-loads block `ib+1`'s A tiles.
+
+2. **B tiles loaded once**: All B tiles remain in scratchpad throughout all I-blocks — no re-loading needed.
+
+3. **Scratchpad fits**: With `IB=2, tiles_K=4, tiles_J=4`: `(2*2*4 + 4*4)*16 = (16+16)*16 = 512 ≤ 8192`. Both A buffers and all B tiles coexist safely.
+
+4. **Accumulator fits per block**: `IB*tiles_J*DIM = 2*4*16 = 128 ≤ 256`. Each block's output fits in the accumulator.
+
+5. **Correctness preserved**: Scale factors are loaded once (they cover the full matrix). Per-block `gemmini_mxquant_config_mvout` correctly offsets the scale pointer by `blk_i_start * (MATMUL_N/DIM)` scale entries. The `gemmini_fence()` at the end of each block ensures the smem drain completes before the next `loop_ws_spad` reuses smem.

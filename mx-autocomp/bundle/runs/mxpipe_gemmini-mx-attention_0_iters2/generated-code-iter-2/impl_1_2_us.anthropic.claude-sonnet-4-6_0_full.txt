@@ -1,0 +1,133 @@
+Looking at the optimization plan, I need to:
+
+1. Keep the Gemmini matmul steps (1 and 3) identical/correct
+2. Optimize the scalar softmax (step 2) by:
+   - Using `int32_t q[]` instead of `int64_t q[]` (halves footprint)
+   - Eliminating `int64_t p[]` entirely
+   - Fusing the group-max scan into pass 1 (alongside global max)
+   - Reducing from 3 passes to 2 passes over ATT_S elements
+
+The key insight: during pass 1, we compute both global `mq` AND per-group `gmax[GROUPS_S]` simultaneously. During pass 2, we compute `p[j] = mx_iexp(q[j] - mq)`, accumulate `sm`, and immediately encode fp8 using the already-known `gmax[g]` — no need to store `p[]` at all.
+
+```c
+void solution(void) {
+  // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&Q_scales_row, sizeof(Q_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&KT_scales_col, sizeof(KT_scales_col), 1);
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) {
+        int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+      }
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) {
+        int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin2((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                               b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+      }
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+    gemmini_fence();
+  }
+
+  // ---- 2) FLOAT-FREE integer softmax + fp8 requant (optimized: 2-pass, no p[] array) ----
+  for (int i = 0; i < ATT_S; i++) {
+    // Use int32_t instead of int64_t for q[] — halves cache footprint (512B vs 1024B)
+    int32_t q[ATT_S];
+    int32_t mq = INT32_MIN;
+    // Per-group max tracked during same pass as global max
+    int64_t gmax[GROUPS_S];
+    for (int g = 0; g < GROUPS_S; g++) gmax[g] = 0;
+
+    // Pass 1: unpack all 128 BF16 values, find global max AND per-group raw max simultaneously
+    // Note: gmax[g] tracks max of raw q[j] values within the group (before subtracting mq),
+    // so we need a second pass anyway to compute p[j]=mx_iexp(q[j]-mq). But we can find
+    // the per-group max of p values = mx_iexp(q[j]-mq) = mx_iexp(q[j]-mq), so:
+    // gmax[g] = max_j_in_group(q[j]) and after global mq known: p_gmax[g] = mx_iexp(gmax[g]-mq)
+    for (int j = 0; j < ATT_S; j += 4) {
+      uint64_t w = S1_hw[i][j / 4];
+      for (int l = 0; l < 4; l++) {
+        int32_t qq = (int32_t)mx_ibf16_to_q((uint16_t)((w >> (l * 16)) & 0xFFFF));
+        q[j + l] = qq;
+        if (qq > mq) mq = qq;
+        int g = (j + l) / 32;
+        if ((int64_t)qq > gmax[g]) gmax[g] = (int64_t)qq;
+      }
+    }
+
+    // Pass 2: compute p[j] = mx_iexp(q[j] - mq), accumulate sm, directly encode fp8
+    // Per-group max of p is mx_iexp(gmax[g] - mq) since mx_iexp is monotone increasing
+    int64_t sm = 0;
+    int64_t p_gmax[GROUPS_S];
+    for (int g = 0; g < GROUPS_S; g++) {
+      p_gmax[g] = (gmax[g] == INT32_MIN) ? 0 : mx_iexp((int64_t)gmax[g] - (int64_t)mq);
+    }
+
+    // Accumulate sm across all groups
+    for (int j = 0; j < ATT_S; j++) {
+      sm += mx_iexp((int64_t)q[j] - (int64_t)mq);
+    }
+
+    int ls = mx_ilog2((uint64_t)sm);
+    uint64_t inv_sm = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;
+
+    // Encode fp8: use p_gmax[g] as the group max (no need for p[] array)
+    for (int g = 0; g < GROUPS_S; g++) {
+      if (p_gmax[g] == 0) {
+        P_scales[g][i] = 0;
+        for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = 0;
+        continue;
+      }
+      int e = mx_ilog2((uint64_t)p_gmax[g]) - ls - MX_P_TARGET_LOG2;
+      P_scales[g][i] = (uint8_t)(e + 127);
+      for (int j = g * 32; j < (g + 1) * 32; j++) {
+        int64_t pv = mx_iexp((int64_t)q[j] - (int64_t)mq);
+        P_q[i][j] = mx_ienc_fp8(pv, inv_sm, ls, e);
+      }
+    }
+  }
+
+  // ---- 3) O = P @ V on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+    gemmini_mx_load_scales((uint64_t)&V_scales_col, sizeof(V_scales_col), 1);
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) {
+        int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+      }
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) {
+        int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin2((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                               b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+      }
+    gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+    gemmini_fence();
+  }
+}
+```

@@ -1,0 +1,106 @@
+Looking at the code, I need to identify the bug. The key issue is in the `gemmini_mx_read_smem` call and the scale loading conventions.
+
+Let me trace through the issues:
+
+1. **Scale loading sel convention**: Rule 11 says sel=0 for A (activation) scales, sel=1 for B (weight) scales in `gemmini_mx_load_scales`. The code has this correct already.
+
+2. **`gemmini_mx_read_smem` offset calculation**: The `smem_off_bf16` is in 16-bit word units. For row `r`, the offset within the tile output should be `SPAD_DEST * 16 + r * BLK` where BLK is in BF16 units. But `num_bf16` should be `ncols`, not `BLK`. This looks correct.
+
+3. **The B matrix layout**: B is loaded with `b_base + (k * tiles + j) * DIM` but should be `b_base + (j * tiles_K + k) * DIM` based on the spec. This is a bug! The spec says B tile layout is `b_base + (j*tiles_K + k)*DIM`.
+
+4. **`gemmini_mxquant_config_mvout` scale_dram**: The `scale_factors` pointer - this needs to be the DRAM address of per-output-block scales, but looking at the hardware description, it seems this should point to scale factors for the output quantization. For BF16 output (`out_mx_fmt=3`), this may not be needed, but the call still needs valid addresses.
+
+5. **The `b_base` and B tile indexing**: The B DRAM pointer uses column-major indexing `(k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)` which looks correct for row-major B matrix.
+
+The critical bug: B spad layout uses `(k * tiles + j)` but should use `(j * tiles_K + k)` per the spec.
+
+```c
+void solution(void) {
+  int tiles   = BLK / DIM;
+  int tiles_K = MATMUL_K / DIM;
+  int GK      = MATMUL_K / 32;
+
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+  uint32_t a_base = 0;
+  int SPAD_DEST = 128;
+
+  static uint8_t A_scales_T[BLOCKS_M][A_S_BYTES];
+  static uint8_t B_scales_T[BLOCKS_N][B_S_BYTES];
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int g = 0; g < GK; g++) {
+      memcpy(&A_scales_T[i0][g * BLK],
+             &A_scales_row[g][i0 * BLK],
+             BLK);
+    }
+  }
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    for (int g = 0; g < GK; g++) {
+      memcpy(&B_scales_T[j0][g * BLK],
+             &B_scales_col[g][j0 * BLK],
+             BLK);
+    }
+  }
+
+  gemmini_flush(0);
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    int ncols = REAL_N - j0 * BLK;
+    if (ncols > BLK) ncols = BLK;
+    if (ncols <= 0) continue;
+
+    // Load B tiles: layout b_base + (j*tiles_K + k)*DIM per spec
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+    for (int j = 0; j < tiles; j++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin2(
+          (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+          b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+
+    for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      // Step 1: Configure execution.
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                  1, 1, 0, 0, false, 0, 0, 3, 0);
+
+      // Step 2: Load A and B scales (sel=0 for A activation, sel=1 for B weight).
+      gemmini_mx_load_scales((uint64_t)A_scales_T[i0], A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_scales_T[j0], B_S_BYTES, 1);
+
+      // Step 3: Mvin A tiles for this i0 row-block.
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+      // Step 4: Configure requantized mvout.
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                   tiles, tiles, tiles_K, 0, 0, 1);
+
+      // Step 5: Execute fused hardware matmul.
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0,
+                           a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                           false, false, false, false, false,
+                           NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Step 6: Drain BF16 results from mx_smem to DRAM, row by row.
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(
+          &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+          SPAD_DEST * 16 + r * BLK, ncols);
+
+      // Step 7: Fence.
+      gemmini_fence();
+    }
+  }
+}
+```

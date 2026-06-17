@@ -1,0 +1,62 @@
+## Analysis of the Baseline Code
+
+The baseline code for a 32×32×32 FP8 matmul has:
+- `tiles_I = 2, tiles_J = 2, tiles_K = 2`
+- A mvin loop: 2×2 = 4 tiles loaded via `gemmini_extended_mvin`
+- B mvin loop: 2×2 = 4 tiles loaded via `gemmini_extended_mvin` (same port as A)
+- The two loops are sequential: all A tiles are loaded first, then all B tiles
+
+The key inefficiency visible here is that **A tiles and B tiles are loaded sequentially through the same mvin port**, when in fact the hardware exposes two independent mvin ports:
+- `gemmini_extended_mvin` (k_MVIN) — intended for A tiles
+- `gemmini_extended_mvin2` (k_MVIN2) — intended for B tiles
+
+These two ports operate independently, meaning instructions issued to mvin2 do not have to wait for mvin to drain. By interleaving A and B tile loads across these two independent ports, we can overlap their DMA transfers at the instruction-issue level and reduce total load latency.
+
+## Selected Strategy: Strategy 11
+
+**Issue B-tile mvins using `gemmini_extended_mvin2` and A-tile mvins using `gemmini_extended_mvin` concurrently in an interleaved sequence to exploit the two independent mvin ports at the instruction-issue level.**
+
+## Plan
+
+### What to change
+
+1. **Use separate config_ld calls for each port.** The A tiles currently use `gemmini_config_ld(MATMUL_K * sizeof(elem_t))` (which configures port 0, k_MVIN). B tiles need `gemmini_extended3_config_ld` with `id=1` to configure port 1 (k_MVIN2) independently with stride `(MATMUL_N / VALUES_PER_BYTE) * sizeof(elem_t)` = `MATMUL_K / 2` bytes (since B is packed 2 values/byte in the original, but here since fp8 has 1 value/byte, the stride is `MATMUL_K * sizeof(elem_t)`).
+
+   Wait — for this 32×32×32 fp8 problem: A has shape [M][K] = [32][32], stride = `MATMUL_K = 32` bytes. B has shape [K][N] = [32][32] (column-major or row-major?). Looking at the baseline: B mvin uses stride `MATMUL_K * sizeof(elem_t) = 32` as well (same config_ld reused). Both A and B are packed with 1 byte per element for fp8, stride = 32.
+
+2. **Interleave the tile loads.** Instead of two separate sequential loops (all A then all B), merge them into a single loop nest that, for each `(i, k)` A-tile issues an `gemmini_extended_mvin` AND for each `(j, k)` B-tile issues an `gemmini_extended_mvin2`, interleaved within the same iteration so both ports receive instructions in close proximity.
+
+   Concretely:
+   - Issue `gemmini_extended3_config_ld` for port 0 (A, id=0) with stride `MATMUL_K`
+   - Issue `gemmini_extended3_config_ld` for port 1 (B, id=1) with stride `MATMUL_K`
+   - Then loop over the maximum of the two tile counts, alternating between issuing an A mvin (via `gemmini_extended_mvin`) and a B mvin2 (via `gemmini_extended_mvin2`) in each iteration
+
+3. **Concrete loop structure for tiles_I=tiles_J=tiles_K=2:**
+   ```
+   for each A tile (i,k): issue mvin  on port 0
+   for each B tile (j,k): issue mvin2 on port 1
+   ```
+   becomes:
+   ```
+   // Configure both ports upfront
+   gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);  // port 0 for A
+   gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);  // port 1 for B
+
+   // Interleaved: flatten both loops and zip them
+   int a_total = tiles_I * tiles_K;  // 4
+   int b_total = tiles_J * tiles_K;  // 4
+   int total = (a_total > b_total) ? a_total : b_total;
+   for (int t = 0; t < total; t++) {
+       if (t < a_total) {
+           int i = t / tiles_K, k = t % tiles_K;
+           gemmini_extended_mvin(A_ptr(i,k), a_base + t*DIM, DIM, DIM);
+       }
+       if (t < b_total) {
+           int j = t / tiles_K, k = t % tiles_K;
+           gemmini_extended_mvin2(B_ptr(j,k), b_base + t*DIM, DIM, DIM);
+       }
+   }
+   ```
+   This ensures each issued A-load is immediately followed by a B-load on the independent port, allowing the hardware to process both DMAs in parallel rather than serially.
+
+4. **No other changes needed.** The rest of the sequence (config_ex, load_scales, mxquant_config_mvout, loop_ws_spad, mx_read_smem, fence) remains identical. Scratchpad layout (a_base, b_base, SPAD_DEST) is unchanged. Correctness is preserved because both ports write to non-overlapping scratchpad regions.

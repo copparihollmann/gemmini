@@ -1,0 +1,98 @@
+## Analysis of the Current Code
+
+Looking at the current code, I need to identify the key inefficiency to target with exactly one strategy.
+
+**Current code issues:**
+1. The `gemmini_config_st` uses `DIM * sizeof(elem_t)` = 16 bytes as the output stride, but the output is packed BF16 words where each row has `MATMUL_N/4` uint64 values = `MATMUL_N * 2` bytes. This may or may not matter for the smem path.
+2. The `lut_update_granularity` is set to 1 — meaning the LUT refreshes on every tile. Since we're doing FP8 (no LUT needed), but this controls requantizer refresh frequency. Setting it to a larger value (e.g., `tiles_K`) reduces overhead.
+3. **Most impactful**: The `#ifdef SPIKE_SIM` branch for the output already uses `gemmini_mx_read_smem`, but the strategy explicitly calls out replacing the non-SPIKE path unconditionally. However, looking more carefully at strategy 4 "try new parameter values" — specifically `lut_update_granularity`.
+
+**Selected Strategy: Strategy 4 — try new parameter values**
+
+The `lut_update_granularity` (G) parameter in `gemmini_mxquant_config_mvout` controls how often the requantizer LUT refreshes. Currently set to 1 (refreshes every tile), it should be set to `tiles_K` since within each output tile (i,j), the K accumulation is complete before requantization. Setting G = `tiles_K` means the LUT refreshes only once per output tile rather than once per K-tile, reducing requantizer overhead.
+
+Also, the `gemmini_config_st` stride should match the actual output row width. The output `C_hw` has `MATMUL_N/4` uint64 words per row, so the stride in bytes should be `(MATMUL_N/4) * sizeof(uint64_t)` = `MATMUL_N * 2` bytes. Currently it's `DIM * sizeof(elem_t)` = 16 bytes, which is likely wrong. Looking at the reference: `autocomp_baseline_sol0.c` uses `OUT_COLS * sizeof(out_t)` = `(MATMUL_N/4) * 8` = `MATMUL_N * 2`.
+
+**Plan:**
+
+1. Fix `gemmini_config_st` stride from `DIM * sizeof(elem_t)` (= 16) to `(MATMUL_N / 4) * sizeof(out_t)` (= `MATMUL_N * 2`), matching the actual output row width in bytes as used in the reference solution.
+2. Increase `lut_update_granularity` from 1 to `tiles_K` in `gemmini_mxquant_config_mvout`, since the requantizer only needs to refresh once per output tile (i,j) — after all K tiles are accumulated — not on every K-tile step.
+3. Remove the `#ifdef SPIKE_SIM` on the output read and use `gemmini_mx_read_smem` unconditionally (strategy 6), while we're touching that section.
+
+Wait — I must limit to **exactly one** strategy. The most impactful single change is strategy **4 (new parameter values)**: fix the `lut_update_granularity` to `tiles_K` AND fix the `gemmini_config_st` stride to the correct value. Both are parameter value changes.
+
+```c
+void solution(void) {
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+#ifdef SPIKE_SIM
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+#else
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
+#endif
+
+  // ---- MVIN A: tile (i,k) -> a_base + (i*tiles_K + k)*DIM ----
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+
+  // ---- MVIN B: tile (k,j) -> b_base + (k*tiles_J + j)*DIM ----
+  // Batch up to MAX_BLOCK_LEN=4 consecutive j-tiles per k-row using gemmini_block_mvin
+  for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j += MAX_BLOCK_LEN) {
+      int batch = (tiles_J - j < MAX_BLOCK_LEN) ? (tiles_J - j) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+      gemmini_block_mvin((void*)dram_ptr, sp_addr, batch);
+    }
+  }
+
+  int SPAD_DEST = 0;
+
+  // OUT_COLS = MATMUL_N / 4, each out_t is uint64_t (8 bytes)
+  // stride = number of bytes per output row = (MATMUL_N / 4) * 8
+  gemmini_config_st((MATMUL_N / 4) * sizeof(out_t));
+  // lut_update_granularity = tiles_K: refresh requantizer LUT once per output tile (i,j)
+  // rather than once per K-tile, reducing requantizer overhead by tiles_K-fold
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, tiles_K);
+
+  // ---- Compute ----
+  gemmini_loop_ws_spad(
+      tiles_I, tiles_J, tiles_K,
+      0, 0, 0,
+      a_base,
+      BANK_NUM * BANK_ROWS,
+      0,
+      SPAD_DEST,
+      false, false,
+      false, false, false,
+      NO_ACTIVATION,
+      0, 0,
+      false,
+      0x38);
+
+  gemmini_fence();
+
+#ifdef SPIKE_SIM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+#else
+  printf("Moving out:\n");
+  for (int i = 0; i < tiles_J*tiles_I*2; i++) {
+      gemmini_mvout((void*)((uint64_t*) C_hw + i*2*DIM), SPAD_DEST + i*DIM);
+  }
+  gemmini_fence();
+#endif
+
+}
+```

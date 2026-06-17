@@ -1,0 +1,195 @@
+void solution(void) {
+  // Initialize accumulators
+  for(int i=0;i<ATT_S;i++){
+    Mr[i]=-1e30f;
+    Lr[i]=0.f;
+    for(int d=0;d<ATT_D;d++) O_acc[i][d]=0.f;
+  }
+
+  // Single flush at start
+  gemmini_flush(0);
+
+  for(int t=0;t<NT;t++){
+    // ---- Phase 1: S = Q * KT ----
+    {
+      const int ti = ATT_S/DIM/2;   // tiles_I for Q*KT: (128/16)/2 = 4
+      const int tj = BT/DIM/2;      // tiles_J for Q*KT: (BT/16)/2
+      const int tk = ATT_D/DIM;     // tiles_K for Q*KT: 64/16 = 4
+      const uint32_t ab = 0;
+      const uint32_t bb = BANK_NUM*BANK_ROWS - tk*tj*DIM;
+
+      // Prepare KT scale buffer (row-major repack)
+      for(int g=0;g<ATT_D/32;g++)
+        for(int n=0;n<BT;n++)
+          KTsc[g*BT+n] = KT_scales_col[g][t*BT+n];
+
+      // Step 1: Configure execution (FP6 E3M2 for act and wgt, BF16 output, uselut=1)
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY,0,0,ACC_SCALE_IDENTITY,
+          1,1,0,0,false,
+          1,1,3,1);
+
+      // Step 2: Load scale factors (A=Q scales sel=0, B=KT scales sel=1)
+      gemmini_mx_load_scales((uint64_t)&Q_scales_row, sizeof(Q_scales_row), 0);
+      gemmini_mx_load_scales((uint64_t)KTsc, (ATT_D/32)*BT, 1);
+
+      // Step 3: Load LUTs (B LUT sel=0 for KT, A LUT sel=1 for Q)
+      gemmini_mx_load_lut((uint64_t)KT_lp, 1, 0);
+      gemmini_mx_load_lut((uint64_t)Q_lp,  1, 1);
+
+      // Step 4: MVIN tiles of Q (A matrix) into scratchpad
+      gemmini_config_ld(ATT_D*sizeof(elem_t));
+      for(int i=0;i<ti;i++)
+        for(int k=0;k<tk;k++)
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)Q_hw) + i*DIM*ATT_D + k*DIM),
+            ab + (i*tk+k)*DIM,
+            DIM, DIM);
+
+      // MVIN tiles of KT (B matrix) into scratchpad
+      // KT is stored packed (FP6 dual = 2 elements per byte → stride is ATT_S/2 bytes per row)
+      gemmini_config_ld(ATT_S*sizeof(elem_t)/2);
+      for(int k=0;k<tk;k++)
+        for(int j=0;j<tj;j++)
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)KT_in) + k*DIM*(ATT_S/2) + (t*BT)/2 + j*DIM),
+            bb + (k*tj+j)*DIM,
+            DIM, DIM);
+
+      // Step 5: Configure output (stride in units of BF16-packed words)
+      gemmini_config_st((BT/BF16_PER_WORD)*sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+          ti, tj, tk,
+          0, 0, 8);
+
+      // Step 6: Compute Q*KT
+      gemmini_loop_ws_spad(ti,tj,tk,0,0,0,
+          ab, BANK_NUM*BANK_ROWS, 0, 128,
+          false,false, false,false,false,
+          NO_ACTIVATION, 0,0, false, 0x38);
+
+      // Step 7: Read results to DRAM
+      gemmini_mx_read_smem(&S1_hw[0][0], 128*16, ATT_S*BT);
+      gemmini_fence();
+    }
+
+    // ---- CPU: online softmax + quantize P ----
+    for(int i=0;i<ATT_S;i++){
+      float row[BT];
+      float mn = Mr[i];
+
+      // Find max in this row
+      for(int j=0;j<BT;j++){
+        uint16_t b = (uint16_t)((S1_hw[i][j/4] >> ((j%4)*16)) & 0xFFFF);
+        row[j] = bf16f(b);
+        if(row[j] > mn) mn = row[j];
+      }
+
+      // Rescale previous O_acc and Lr
+      float corr = expf2(Mr[i] - mn);
+      float ln   = Lr[i] * corr;
+
+      // Compute softmax numerators, update running sum
+      for(int j=0;j<BT;j++){
+        row[j] = expf2(row[j] - mn);
+        ln += row[j];
+      }
+
+      // Rescale accumulated output
+      for(int d=0;d<ATT_D;d++) O_acc[i][d] *= corr;
+
+      Mr[i] = mn;
+      Lr[i] = ln;
+
+      // Quantize row into FP6 (packed dual) for P matrix
+      for(int g=0;g<GBT;g++){
+        float gm = 0.f;
+        for(int j=g*32;j<g*32+32;j++){
+          float a = fabsf2(row[j]);
+          if(a > gm) gm = a;
+        }
+        int e = 0;
+        if(gm > 0.f) e = fexp2(gm/0.5f) + 1;
+        float isc = pow2i(-e);
+        P_scales[g][i] = (uint8_t)(e + 127);
+
+        for(int j=g*32;j<g*32+32;j++){
+          uint8_t idx = enc(row[j]*isc);
+          if((i&1)==0)
+            P_hw[i>>1][j] = (P_hw[i>>1][j] & 0xF0) | idx;
+          else
+            P_hw[i>>1][j] = (P_hw[i>>1][j] & 0x0F) | (idx<<4);
+        }
+      }
+    }
+
+    // ---- Phase 2: O += P * V ----
+    {
+      const int ti = ATT_S/DIM/2;   // tiles_I for P*V
+      const int tj = ATT_D/DIM/2;   // tiles_J for P*V
+      const int tk = BT/DIM;        // tiles_K for P*V
+      const uint32_t ab = 0;
+      const uint32_t bb = BANK_NUM*BANK_ROWS - tk*tj*DIM;
+
+      // Step 1: Configure execution (FP6 E3M2 for act and wgt, BF16 output, uselut=1)
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY,0,0,ACC_SCALE_IDENTITY,
+          1,1,0,0,false,
+          1,1,3,1);
+
+      // Step 2: Load scale factors (A=P scales sel=0, B=V scales sel=1)
+      gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+      gemmini_mx_load_scales((uint64_t)&V_scales_col[t*GBT][0], GBT*ATT_D, 1);
+
+      // Step 3: Load LUTs (B LUT sel=0 for V, A LUT sel=1 for P)
+      gemmini_mx_load_lut((uint64_t)V_lp, 1, 0);
+      gemmini_mx_load_lut((uint64_t)P_lp, 1, 1);
+
+      // Step 4: MVIN tiles of P (A matrix) into scratchpad
+      gemmini_config_ld(BT*sizeof(elem_t));
+      for(int i=0;i<ti;i++)
+        for(int k=0;k<tk;k++)
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)P_hw) + i*DIM*BT + k*DIM),
+            ab + (i*tk+k)*DIM,
+            DIM, DIM);
+
+      // MVIN tiles of V (B matrix) into scratchpad
+      // V is stored packed (FP6 dual → ATT_D/2 bytes per row)
+      gemmini_config_ld(ATT_D*sizeof(elem_t)/2);
+      for(int k=0;k<tk;k++)
+        for(int j=0;j<tj;j++)
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)V_in) + (t*BT + k*DIM)*(ATT_D/2) + j*DIM),
+            bb + (k*tj+j)*DIM,
+            DIM, DIM);
+
+      // Step 5: Configure output
+      gemmini_config_st((ATT_D/BF16_PER_WORD)*sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+          ti, tj, tk,
+          0, 0, 8);
+
+      // Step 6: Compute P*V
+      gemmini_loop_ws_spad(ti,tj,tk,0,0,0,
+          ab, BANK_NUM*BANK_ROWS, 0, 128,
+          false,false, false,false,false,
+          NO_ACTIVATION, 0,0, false, 0x38);
+
+      // Step 7: Read results to DRAM
+      gemmini_mx_read_smem(&O_hw[0][0], 128*16, ATT_S*ATT_D);
+      gemmini_fence();
+
+      // Accumulate BF16 hardware output into float O_acc
+      for(int i=0;i<ATT_S;i++)
+        for(int d=0;d<ATT_D;d++){
+          uint16_t b = (uint16_t)((O_hw[i][d/4] >> ((d%4)*16)) & 0xFFFF);
+          O_acc[i][d] += bf16f(b);
+        }
+    }
+  }
+
+  // Final normalization
+  for(int i=0;i<ATT_S;i++){
+    float il = 1.f / Lr[i];
+    for(int d=0;d<ATT_D;d++) O_acc[i][d] *= il;
+  }
+}

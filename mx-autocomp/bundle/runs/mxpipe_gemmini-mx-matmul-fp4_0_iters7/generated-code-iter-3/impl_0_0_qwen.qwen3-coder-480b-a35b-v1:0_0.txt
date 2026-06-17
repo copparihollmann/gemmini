@@ -1,0 +1,101 @@
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+
+#define DIM 16
+#define ADDR_LEN 32
+#define BF16_PER_WORD 4
+#define OUT_COLS (MATMUL_M / BF16_PER_WORD)
+
+typedef uint8_t  elem_t;   // fp4:e2m1 packed input elements
+typedef uint8_t  welem_t;  // fp4:e2m1 packed weight elements
+typedef uint64_t out_t;    // 4x bf16 packed per word
+
+extern elem_t A_in_hw[MATMUL_M][MATMUL_K];
+extern elem_t B_in[MATMUL_K][MATMUL_N/2];
+extern uint32_t scale_factors[512];
+extern uint8_t A_scales_row[MATMUL_GK][MATMUL_M];
+extern uint8_t B_scales_col[MATMUL_GK][MATMUL_N];
+extern out_t C_hw[MATMUL_M][OUT_COLS];
+
+void solution(void) {
+  int tiles_I = MATMUL_M / DIM;
+  int tiles_J = MATMUL_N / DIM;
+  int tiles_K = MATMUL_K / DIM;
+
+  // Active compute blocks: 2x8 tiles fits exactly 256 rows in the accumulator
+  int block_I = 2;
+  int block_J = 8;
+  int num_blocks_I = tiles_I / block_I;
+
+  // Persistent caching of B at the top of the scratchpad
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+  
+  // Double-buffering bases for A
+  uint32_t a_base[2] = { 0, block_I * tiles_K * DIM };
+  
+  // Double-buffering bases for output in shared memory
+  int sdst[2] = { 128, 384 };
+
+  // 1. Configure format and WS execution (FP4 format)
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 2, 2, 3, 0);
+
+  // 2. Load scale factors
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // 3. Load entire B matrix into scratchpad once
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2);
+  for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * (MATMUL_N/2) + j * DIM;
+      uint32_t sp_addr = b_base + (j * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void*)dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  // Preload first block of A into Buffer 0 using a batched load (len=4)
+  int active_buf = 0;
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < block_I; i++) {
+    for (int k = 0; k < tiles_K; k += 4) {
+      elem_t *dram_ptr = ((elem_t*)A_in_hw) + (0 * block_I + i) * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base[active_buf] + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void*)dram_ptr, sp_addr, 4 * DIM, DIM);
+    }
+  }
+
+  // Pipelined double-buffering computation loop
+  for (int bi = 0; bi < num_blocks_I; bi++) {
+    // Configure store parameters and requantizer
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, block_I, block_J, tiles_K, 0, 0, 1);
+
+    // Compute weight-stationary loop on the current block
+    gemmini_loop_ws_spad(block_I, block_J, tiles_K, 0, 0, 0,
+                         a_base[active_buf], b_base, 0, sdst[active_buf],
+                         false, false, false, false, false,
+                         NO_ACTIVATION, 0, 0, false, 0x38);
+
+    // Overlap: load the next block of A into the alternate buffer while the hardware computes
+    int next_buf = 1 - active_buf;
+    if (bi + 1 < num_blocks_I) {
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < block_I; i++) {
+        for (int k = 0; k < tiles_K; k += 4) {
+          elem_t *dram_ptr = ((elem_t*)A_in_hw) + ((bi + 1) * block_I + i) * DIM * MATMUL_K + k * DIM;
+          uint32_t sp_addr = a_base[next_buf] + (i * tiles_K + k) * DIM;
+          gemmini_extended_mvin((void*)dram_ptr, sp_addr, 4 * DIM, DIM);
+        }
+      }
+    }
+
+    // Read computed output results from the current block to DRAM
+    gemmini_mx_read_smem(&C_hw[bi * block_I * DIM][0], sdst[active_buf] * 16, block_I * DIM * MATMUL_N);
+
+    active_buf = next_buf;
+  }
+
+  // Synchronize CPU and hardware
+  gemmini_fence();
+}

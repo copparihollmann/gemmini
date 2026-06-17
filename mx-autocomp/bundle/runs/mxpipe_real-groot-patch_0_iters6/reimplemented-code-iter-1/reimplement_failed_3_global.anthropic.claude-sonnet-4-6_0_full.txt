@@ -1,0 +1,95 @@
+Looking at the failing code, I need to identify the bugs:
+
+1. **B tile layout is wrong**: The B tile address formula uses `(k * tiles + j) * DIM` but the correct formula per the spec is `b_base + (j * tiles_K + k) * DIM`. The B tiles should be indexed as `j` (tile column index in J dimension) as the outer index and `k` (tile index in K dimension) as the inner index.
+
+2. **Scale loading sel convention**: According to rule 11, `sel=0` is for A (activation) scales and `sel=1` is for B (weight) scales. The code has these swapped - it loads A scales with sel=0 and B scales with sel=1, which is actually correct. Let me recheck...
+
+Actually sel=0 for A and sel=1 for B is correct per rule 11. The bug is in B tile indexing.
+
+3. **B spad end address**: `BANK_NUM * BANK_ROWS` is the end of scratchpad. The B base should be `BANK_NUM*BANK_ROWS - tiles_J*tiles_K*DIM` where `tiles_J = tiles` (BLK/DIM) and `tiles_K = MATMUL_K/DIM`.
+
+4. **mvin2 for B**: B tiles should be loaded via `gemmini_extended_mvin2` (separate port) to distinguish them.
+
+5. **B layout**: per spec, B tile at `(j, k)` goes to `b_base + (j*tiles_K + k)*DIM` - the code uses `(k * tiles + j)` which is wrong.
+
+```c
+void solution(void) {
+  gemmini_flush(0);
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                               1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  int tiles_I_blk = BLK / DIM;
+  int tiles_K = MATMUL_K / DIM;
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      // Copy per-block scales for this (i0, j0) tile block
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+
+      int tiles = tiles_I_blk;  // tiles_I == tiles_J == BLK/DIM for square blocks
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      uint32_t a_base = 0;
+      // B tiles: j is outer (N-dimension), k is inner (K-dimension)
+      // b_base = top of scratchpad - space for all B tiles
+      uint32_t b_base = BANK_NUM * BANK_ROWS - (uint32_t)(tiles * tiles_K * DIM);
+      int SPAD_DEST = 128;
+
+      // Step 2: Load scale factors (sel=0 for A activations, sel=1 for B weights)
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      // Step 4: MVIN tiles of A into scratchpad via mvin port
+      // A layout: a_base + (i * tiles_K + k) * DIM
+      gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+      for (int i = 0; i < tiles; i++) {
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM,
+            DIM, DIM);
+        }
+      }
+
+      // B layout per spec: b_base + (j * tiles_K + k) * DIM
+      // B in DRAM is row-major [K][N], so B[k*DIM row][j0*BLK + j*DIM col]
+      gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+      for (int j = 0; j < tiles; j++) {
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin2(
+            (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+            b_base + (j * tiles_K + k) * DIM,
+            DIM, DIM);
+        }
+      }
+
+      // Step 5: Configure the requantized mvout
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+          tiles, tiles, tiles_K,
+          0, 0, 1);
+
+      // Step 6: Compute the weight-stationary tiled matmul over the scratchpad
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0,
+                           a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                           false, false, false, false, false,
+                           NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Step 7: Read results out of shared memory (BF16, packed 4 per uint64 word)
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(
+          &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+          SPAD_DEST * 16 + r * BLK, ncols);
+
+      gemmini_fence();
+    }
+  }
+}
+```

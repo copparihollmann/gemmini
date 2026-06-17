@@ -1,0 +1,109 @@
+An elegant and highly effective optimization plan is to apply **Strategy 4: pack A and B tiles contiguously in scratchpad to maximize `gemmini_loop_ws_spad` fused loop coverage**.
+
+### Analysis of Inefficiencies in the Original Code
+1. **Incomplete Computation / Sub-optimal Tiling**: The original code sets `ti = 4` and `tj = 4` to avoid accumulator overflow (which has a hard limit of 256 rows). However, this only computes a 64x64 sub-matrix of the total 128x128 output, and it fails to execute the remaining quadrants of the full matrix multiplication.
+2. **Redundant DRAM Data Movement**: If we were to naively loop over all 4 quadrants of the 128x128 matrix, we would reload the overlapping tiles of $A$ and $B$ from DRAM multiple times, wasting significant memory bandwidth.
+
+### Optimization Plan
+We will pack the **entire** $A$ (128x256) and $B$ (256x128) matrices into the scratchpad at the very beginning of the function.
+1. **Scratchpad Layout Planning**:
+   * Total $A$ rows = $8 \text{ tiles} \times 16 \text{ rows/tile} \times 16 \text{ cols/tile} = 2048$ rows. We split this into $A_0$ (first 64 rows, `ab0 = 0`) and $A_1$ (last 64 rows, `ab1 = 1024`).
+   * Total $B$ rows = $16 \text{ tiles} \times 8 \text{ tiles} \times 16 \text{ rows/tile} = 2048$ rows. We split this into $B_1$ (cols 64-127, `bb1 = 6144`, ending at 7168) and $B_0$ (cols 0-63, `bb0 = 7168`, ending at 8192).
+   * Range overlap check: $A$ occupies `[0, 2048)` and $B$ occupies `[6144, 8192)`. There is zero overlap, completely fitting within the 256KB (8192 rows) scratchpad.
+2. **Eliminating DRAM Reloads**: We load $A_0, A_1, B_0, B_1$ exactly **once** at start-up.
+3. **Quadrant Multi-pass Execution**:
+   * We loop through the 4 quadrants of the output ($2 \times 2$ grid).
+   * For each quadrant `(i_q, j_q)`, we invoke `gemmini_loop_ws_spad(4, 4, 16, ...)` by passing the corresponding contiguous $A$ and $B$ base/end pointers in scratchpad.
+   * We stream each quadrant's result contiguously into a temporary DRAM buffer `temp_C[4][1024]` using `gemmini_mx_read_smem`.
+4. **Synchronization and CPU Copy-back**: After a single `gemmini_fence()`, the host CPU performs a non-strided `memcpy` to write the quadrants back to the correct non-contiguous positions in `C_hw` with minimal latency.
+
+---
+
+### Optimized C Source Code
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+
+// AUTO-GENERATED optimized MX matmul kernel (128x128x256, fp6:e3m2).
+void solution(void) {
+  {
+    int ti = 4, tj = 4, tk = 16;
+    uint32_t ab0 = 0;
+    uint32_t ab1 = 1024;
+    uint32_t bb1 = 6144;
+    uint32_t bb0 = 7168;
+    
+    // Contiguous intermediate DRAM buffer for output quadrants (32 KB total)
+    static out_t temp_C[4][1024];
+    
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 1, 1, 3, 1);
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+    gemmini_mx_load_lut((uint64_t)B_lut_p, 1, 0);
+    gemmini_mx_load_lut((uint64_t)A_lut_p, 1, 1);
+    
+    // Load A0 (first 64 rows of A)
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i = 0; i < 4; i++) {
+      for (int k = 0; k < 16; k += 4) {
+        gemmini_extended_mvin((void*)(((elem_t*)A_in_hw) + i*DIM*MATMUL_K + k*DIM), ab0 + (i*16 + k)*DIM, 4 * DIM, DIM);
+      }
+    }
+    
+    // Load A1 (last 64 rows of A)
+    for (int i = 0; i < 4; i++) {
+      for (int k = 0; k < 16; k += 4) {
+        gemmini_extended_mvin((void*)(((elem_t*)A_in_hw) + (i+4)*DIM*MATMUL_K + k*DIM), ab1 + (i*16 + k)*DIM, 4 * DIM, DIM);
+      }
+    }
+    
+    // Load B0 (cols 0-63 of B)
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2);
+    for (int k = 0; k < 16; k++) {
+      for (int j = 0; j < 4; j += 2) {
+        gemmini_extended_mvin((void*)(((elem_t*)B_in) + k*DIM*(MATMUL_N/2) + j*DIM), bb0 + (k*4 + j)*DIM, 2 * DIM, DIM);
+      }
+    }
+    
+    // Load B1 (cols 64-127 of B)
+    for (int k = 0; k < 16; k++) {
+      for (int j = 0; j < 4; j += 2) {
+        gemmini_extended_mvin((void*)(((elem_t*)B_in) + k*DIM*(MATMUL_N/2) + (j+4)*DIM), bb1 + (k*4 + j)*DIM, 2 * DIM, DIM);
+      }
+    }
+    
+    gemmini_config_st(16 * sizeof(out_t));
+    
+    // Process 4 quadrants of output C
+    for (int i_q = 0; i_q < 2; i_q++) {
+      for (int j_q = 0; j_q < 2; j_q++) {
+        uint32_t a_spad = (i_q == 0) ? ab0 : ab1;
+        uint32_t b_spad_end = (j_q == 0) ? 8192 : 7168;
+        int q = i_q * 2 + j_q;
+        int SDST = 128 + q * 256;
+        
+        // Output scales are indexed row-major: scale_dram + m*N_blocks + bi
+        uint64_t q_scale_factors = (uint64_t)scale_factors + (i_q * 64 * 8 + j_q * 4);
+        gemmini_mxquant_config_mvout(q_scale_factors, 4, 4, 16, 0, 0, 9);
+        
+        gemmini_loop_ws_spad(4, 4, 16, 0, 0, 0, a_spad, b_spad_end, 0, SDST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+        gemmini_mx_read_smem(&temp_C[q][0], SDST * 16, 64 * 64);
+      }
+    }
+    
+    gemmini_fence();
+    
+    // Host CPU copy-back to reconstruct non-contiguous C_hw structure in DRAM
+    for (int i_q = 0; i_q < 2; i_q++) {
+      for (int j_q = 0; j_q < 2; j_q++) {
+        int q = i_q * 2 + j_q;
+        for (int r = 0; r < 64; r++) {
+          memcpy(&C_hw[i_q * 64 + r][j_q * 16], &temp_C[q][r * 16], 16 * sizeof(out_t));
+        }
+      }
+    }
+  }
+}
+```

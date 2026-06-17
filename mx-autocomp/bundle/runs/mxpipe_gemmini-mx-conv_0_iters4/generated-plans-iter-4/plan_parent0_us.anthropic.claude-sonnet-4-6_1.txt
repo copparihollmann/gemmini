@@ -1,0 +1,100 @@
+## Analysis
+
+Looking at the original code, I need to identify the key inefficiency to address with exactly one strategy.
+
+**Current code structure:**
+1. Configure execution
+2. Load scale factors (A and B)
+3. Load all B tiles via `mvin2` (port 1)
+4. Configure `mvin` port 0 for A
+5. Loop over `i`: im2col for A rows, then `mvin` A tiles (port 0)
+6. Configure output + `mxquant_config_mvout`
+7. `gemmini_loop_ws_spad`
+8. `gemmini_mx_read_smem` + `gemmini_fence`
+
+**Key observation:** The current code uses `lut_update_granularity = tiles_K` in `gemmini_mxquant_config_mvout`. Looking at the hardware description, `lut_update_granularity` G controls how often the output LUT refreshes during quantization — **larger G = fewer refreshes = faster**. The current code already sets this to `tiles_K`.
+
+However, looking more carefully at the **parameter values**: `SPAD_DEST = 0`. The reference pattern uses `SPAD_DEST = 128`. This is the critical issue — with `SPAD_DEST = 0`, the output region in `mx_smem` overlaps with address 0, and `SPAD_DEST * 16 = 0` means the read offset is 0. While this may be technically correct for the MX smem, let me re-examine.
+
+**The real inefficiency**: Strategy **4 (try new parameter values)** — specifically `lut_update_granularity`. The current code sets it to `tiles_K`. The maximum useful value would be `tiles_I * tiles_J * tiles_K` (refresh only once for the entire matmul), which reduces overhead maximally.
+
+For `tiles_I * tiles_J * tiles_K` where (for a 64×64 matrix with DIM=16): `tiles_I=4, tiles_J=4, tiles_K=4 → 64`. Setting `lut_update_granularity = tiles_I * tiles_J * tiles_K` minimizes LUT refresh overhead across the entire fused loop.
+
+## Plan
+
+**Strategy 4: Try new parameter values** — specifically, maximize `lut_update_granularity` in `gemmini_mxquant_config_mvout`.
+
+**Change:** Set `lut_update_granularity` from `tiles_K` to `tiles_I * tiles_J * tiles_K`. This tells the requantizer to refresh the output LUT only once for the entire matmul rather than once per K-reduction group, minimizing refresh overhead while maintaining correctness (the scale factors don't change mid-computation since they're loaded once).
+
+```c
+void solution(void) {
+  const int tiles_I = MATMUL_M / DIM;
+  const int tiles_J = MATMUL_N / DIM;
+  const int tiles_K = MATMUL_K / DIM;
+
+  const int a_base = 0;
+  const int b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+  const int SPAD_DEST = 0;
+
+  // Step 1: Configure execution (MX FP8 -> BF16, weight-stationary)
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // Step 2: Load scale factors (A=sel 0, B=sel 1)
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Step 3: Load B tiles using mvin2 (port 1)
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+  for (int j = 0; j < tiles_J; j++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin2(
+          (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+          b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+
+  // Step 4: Configure mvin port 0 for A tiles
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+
+  // Step 5: im2col + mvin for A tiles
+  for (int i = 0; i < tiles_I; i++) {
+    for (int li = 0; li < DIM; li++) {
+      int patch_idx = i * DIM + li;
+      int pi = patch_idx / PATCHES_X;
+      int pj = patch_idx % PATCHES_X;
+      int y_base = pi * CONV_KSZ;
+      int x_base = pj * CONV_KSZ;
+      elem_t *a_row = A_buf[patch_idx];
+      for (int c = 0; c < CONV_C; c++) {
+        int c_off = c * CONV_KSZ * CONV_KSZ;
+        for (int dy = 0; dy < CONV_KSZ; dy++) {
+          int dy_off = c_off + dy * CONV_KSZ;
+          const elem_t *x_row = &X_in[c][y_base + dy][x_base];
+          for (int dx = 0; dx < CONV_KSZ; dx++)
+            a_row[dy_off + dx] = x_row[dx];
+        }
+      }
+    }
+
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin(
+          (void*)(((elem_t*)A_buf) + i * DIM * MATMUL_K + k * DIM),
+          a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+  }
+
+  // Step 6: Configure output stride and requantizer.
+  // Maximize lut_update_granularity to tiles_I*tiles_J*tiles_K to minimize
+  // LUT refresh overhead across the entire fused matmul loop.
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+      tiles_I, tiles_J, tiles_K, 0, 0, tiles_I * tiles_J * tiles_K);
+
+  // Step 7: Execute fused tiled weight-stationary matmul over scratchpad.
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+      a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+      false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // Step 8: Drain BF16 results from mx_smem to DRAM, then fence.
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```

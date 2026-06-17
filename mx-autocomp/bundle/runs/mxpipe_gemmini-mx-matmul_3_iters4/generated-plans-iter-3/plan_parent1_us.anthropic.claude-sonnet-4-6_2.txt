@@ -1,0 +1,66 @@
+## Analysis of the Original Code
+
+The original code loads A tiles using `gemmini_extended_mvin` and B tiles also using `gemmini_extended_mvin` — both through the **same mvin port**. This means A and B tile loads are serialized: the hardware must complete all A loads before starting B loads (or vice versa), creating unnecessary sequential bottlenecks.
+
+## Selected Strategy: Strategy 4 — Replace B mvin loop with `gemmini_extended_mvin2`
+
+### Why This Strategy Applies
+
+The original code:
+```c
+// A tiles — uses k_MVIN (port 0)
+gemmini_extended_mvin(..., a_base + ..., DIM, DIM);
+
+// B tiles — ALSO uses k_MVIN (port 0) — port contention!
+gemmini_extended_mvin(..., b_base + ..., DIM, DIM);
+```
+
+Both A and B tile streams compete for the same `k_MVIN` port. By switching the B tile loads to `gemmini_extended_mvin2` (`k_MVIN2`), they use a **dedicated second DMA port**. The hardware can then issue A and B loads concurrently without port contention, even when the two loops are not interleaved.
+
+### Specific Changes
+
+1. Keep all A tile loads using `gemmini_extended_mvin` (port 0 / `k_MVIN`).
+2. Change all B tile loads from `gemmini_extended_mvin` to `gemmini_extended_mvin2` (port 1 / `k_MVIN2`).
+3. The `gemmini_config_ld` configures port 0 (for A). A separate `gemmini_extended3_config_ld` with `id=1` must be issued to configure the stride for port 1 (for B), so that port 1 knows the correct DRAM row stride for B.
+4. All other code (config, scale loads, mxquant config, loop, smem read) remains identical.
+
+### Implementation Plan
+
+- Issue `gemmini_config_ld(MATMUL_K * sizeof(elem_t))` before the A loop (configures port 0 stride = `MATMUL_K` bytes).
+- Issue `gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), SCALE_IDENTITY, false, 1)` to configure port 1 with the same stride (B has the same row width in bytes as A in this layout).
+- Run the A mvin loop using `gemmini_extended_mvin` (port 0).
+- Run the B mvin loop using `gemmini_extended_mvin2` (port 1).
+- The two loops remain sequential in the instruction stream, but the hardware can pipeline their DMA requests across two independent channels.
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // Configure port 0 (A) stride
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  // Configure port 1 (B) stride — same row width
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+  // Load A tiles via port 0
+  for (int i = 0; i < tiles_I; i++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+  // Load B tiles via port 1 (dedicated B-port, no contention with A-port)
+  for (int j = 0; j < tiles_J; j++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin2((void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+                             b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```

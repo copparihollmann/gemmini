@@ -1,0 +1,101 @@
+```c
+void solution(void) {
+  // Tile counts
+  const int tiles_I = MATMUL_M / DIM;
+  const int tiles_J = MATMUL_N / DIM;
+  const int tiles_K = MATMUL_K / DIM;
+
+  // Scratchpad base addresses
+  const int a_base = 0;
+  const int b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+  const int SPAD_DEST = 0;
+
+  // Step 0: Precompute im2col source pointer LUT.
+  // x_row_lut[patch_idx][c * CONV_KSZ + dy] = pointer to X_in[c][y_base+dy][x_base]
+  // This eliminates repeated integer divide/modulo and multiply from the hot path.
+  // Total entries: MATMUL_M * CONV_C * CONV_KSZ pointers.
+  static const elem_t *x_row_lut[MATMUL_M][CONV_C * CONV_KSZ];
+
+  {
+    int pi = 0, pj = 0;
+    for (int patch_idx = 0; patch_idx < MATMUL_M; patch_idx++) {
+      int y_base = pi * CONV_KSZ;
+      int x_base = pj * CONV_KSZ;
+      for (int c = 0; c < CONV_C; c++) {
+        int c_off = c * CONV_KSZ;
+        for (int dy = 0; dy < CONV_KSZ; dy++) {
+          x_row_lut[patch_idx][c_off + dy] = &X_in[c][y_base + dy][x_base];
+        }
+      }
+      // Advance patch coordinates without divide/modulo
+      pj++;
+      if (pj >= PATCHES_X) {
+        pj = 0;
+        pi++;
+      }
+    }
+  }
+
+  // Step 1: Configure execution (MX FP8 -> BF16, weight-stationary)
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // Step 2: Load scale factors (A=sel 0, B=sel 1)
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Step 3: Load B tiles using mvin2 (port 1) — done once, amortized over all I tiles
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+  for (int j = 0; j < tiles_J; j++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin2(
+          (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+          b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+
+  // Step 4: Configure mvin port 0 for A tiles
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+
+  // Step 5: im2col using precomputed LUT + mvin, one i-row at a time.
+  for (int i = 0; i < tiles_I; i++) {
+    // im2col: produce DIM rows of A_buf for this i-tile using precomputed LUT
+    for (int li = 0; li < DIM; li++) {
+      int patch_idx = i * DIM + li;
+      elem_t *a_row = A_buf[patch_idx];
+      // Inner loop: use LUT pointer — no divide, modulo, or multiply in hot path
+      for (int c = 0; c < CONV_C; c++) {
+        int c_off = c * CONV_KSZ;
+        for (int dy = 0; dy < CONV_KSZ; dy++) {
+          const elem_t *x_row = x_row_lut[patch_idx][c_off + dy];
+          int dst_off = (c_off + dy) * CONV_KSZ;
+          for (int dx = 0; dx < CONV_KSZ; dx++)
+            a_row[dst_off + dx] = x_row[dx];
+        }
+      }
+    }
+
+    // Immediately mvin this i-row's tiles (port 0, non-blocking).
+    // Hardware DMA for row i proceeds while CPU begins im2col for row i+1.
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin(
+          (void*)(((elem_t*)A_buf) + i * DIM * MATMUL_K + k * DIM),
+          a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+  }
+
+  // Step 6: Configure output stride and requantizer.
+  // i_bound, j_bound, k_bound must match the tile counts used in loop_ws_spad.
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+      tiles_I, tiles_J, tiles_K, 0, 0, tiles_K);
+
+  // Step 7: Execute fused tiled weight-stationary matmul over scratchpad.
+  // funct 24 (LOOP_WS_CONFIG_SPAD_AB) is re-issued inside gemmini_loop_ws_spad
+  // macro before every LOOP_WS — the one-shot mx_loop_spad_marker is satisfied.
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+      a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+      false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // Step 8: Drain BF16 results from mx_smem to DRAM, then fence.
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```

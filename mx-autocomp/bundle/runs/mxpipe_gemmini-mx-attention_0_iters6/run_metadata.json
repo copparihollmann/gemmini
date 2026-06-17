@@ -1,0 +1,43 @@
+{
+  "num_analyses": 0,
+  "num_plan_candidates": 3,
+  "num_code_candidates": 1,
+  "num_pairs_to_combine": 0,
+  "num_gen_per_combine": 0,
+  "beam_size": 3,
+  "trigger_exhaustive_threshold": 1,
+  "trigger_exhaustive_iters": 20,
+  "start_exhaustive_iters": 0,
+  "reimplement_failed": true,
+  "skip_planning": false,
+  "use_edits": false,
+  "extra_seed_codes": [
+    [
+      "void solution(void) {\n  // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----\n  {\n    int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;\n    uint32_t a_base = 0;\n    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;\n    gemmini_flush(0);\n    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);\n    gemmini_mx_load_scales((uint64_t)&Q_scales_row, sizeof(Q_scales_row), 0);\n    gemmini_mx_load_scales((uint64_t)&KT_scales_col, sizeof(KT_scales_col), 1);\n    gemmini_config_ld(ATT_D * sizeof(elem_t));\n    for (int i = 0; i < tiles_I; i++)\n      for (int k = 0; k < tiles_K; k += 2) { int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;\n        gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),\n                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM); }\n    gemmini_config_ld(ATT_S * sizeof(elem_t));\n    for (int k = 0; k < tiles_K; k++)\n      for (int j = 0; j < tiles_J; j += 2) { int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;\n        gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),\n                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM); }\n    gemmini_config_st(S_OUT_COLS * sizeof(out_t));\n    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);\n    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,\n                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);\n    gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);\n    gemmini_fence();\n  }\n\n  // ---- 2) FLOAT-FREE integer softmax + fp8 requant (4 rows at a time) ----\n  for (int i = 0; i < ATT_S; i += 4) {\n    // Storage for 4 rows\n    int64_t q[4][ATT_S];\n    int64_t mq[4];\n    int64_t p[4][ATT_S];\n    int64_t sm[4];\n    int ls[4];\n    uint64_t inv_sm[4];\n\n    // Initialize max values\n    mq[0] = mq[1] = mq[2] = mq[3] = -((int64_t)1 << 62);\n\n    // Unpack 4 rows simultaneously + find max for each row\n    for (int j = 0; j < ATT_S; j += 4) {\n      uint64_t w0 = S1_hw[i + 0][j / 4];\n      uint64_t w1 = S1_hw[i + 1][j / 4];\n      uint64_t w2 = S1_hw[i + 2][j / 4];\n      uint64_t w3 = S1_hw[i + 3][j / 4];\n      for (int l = 0; l < 4; l++) {\n        int shift = l * 16;\n        int64_t qq0 = mx_ibf16_to_q((uint16_t)((w0 >> shift) & 0xFFFF));\n        int64_t qq1 = mx_ibf16_to_q((uint16_t)((w1 >> shift) & 0xFFFF));\n        int64_t qq2 = mx_ibf16_to_q((uint16_t)((w2 >> shift) & 0xFFFF));\n        int64_t qq3 = mx_ibf16_to_q((uint16_t)((w3 >> shift) & 0xFFFF));\n        q[0][j + l] = qq0; if (qq0 > mq[0]) mq[0] = qq0;\n        q[1][j + l] = qq1; if (qq1 > mq[1]) mq[1] = qq1;\n        q[2][j + l] = qq2; if (qq2 > mq[2]) mq[2] = qq2;\n        q[3][j + l] = qq3; if (qq3 > mq[3]) mq[3] = qq3;\n      }\n    }\n\n    // Compute iexp + sum for 4 rows simultaneously\n    sm[0] = sm[1] = sm[2] = sm[3] = 0;\n    for (int j = 0; j < ATT_S; j++) {\n      int64_t pv0 = mx_iexp(q[0][j] - mq[0]);\n      int64_t pv1 = mx_iexp(q[1][j] - mq[1]);\n      int64_t pv2 = mx_iexp(q[2][j] - mq[2]);\n      int64_t pv3 = mx_iexp(q[3][j] - mq[3]);\n      p[0][j] = pv0; sm[0] += pv0;\n      p[1][j] = pv1; sm[1] += pv1;\n      p[2][j] = pv2; sm[2] += pv2;\n      p[3][j] = pv3; sm[3] += pv3;\n    }\n\n    // Compute log2 + reciprocal for 4 rows\n    for (int r = 0; r < 4; r++) {\n      ls[r] = mx_ilog2((uint64_t)sm[r]);\n      inv_sm[r] = (((uint64_t)1 << (ls[r] + MX_FRAC)) + ((uint64_t)sm[r] >> 1)) / (uint64_t)sm[r];\n    }\n\n    // Scale computation: iterate over groups, process all 4 rows per group\n    for (int g = 0; g < GROUPS_S; g++) {\n      int jstart = g * 32;\n      int jend = (g + 1) * 32;\n\n      for (int r = 0; r < 4; r++) {\n        int row = i + r;\n        int64_t gmax = 0;\n        for (int j = jstart; j < jend; j++) if (p[r][j] > gmax) gmax = p[r][j];\n        if (gmax == 0) {\n          P_scales[g][row] = 0;\n          for (int j = jstart; j < jend; j++) P_q[row][j] = 0;\n          continue;\n        }\n        int e = mx_ilog2((uint64_t)gmax) - ls[r] - MX_P_TARGET_LOG2;\n        P_scales[g][row] = (uint8_t)(e + 127);\n        for (int j = jstart; j < jend; j++)\n          P_q[row][j] = mx_ienc_fp8(p[r][j], inv_sm[r], ls[r], e);\n      }\n    }\n  }\n\n  // ---- 3) O = P @ V on Gemmini (bf16 out) ----\n  {\n    int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;\n    uint32_t a_base = 0;\n    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;\n    gemmini_flush(0);\n    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);\n    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);\n    gemmini_mx_load_scales((uint64_t)&V_scales_col, sizeof(V_scales_col), 1);\n    gemmini_config_ld(ATT_S * sizeof(elem_t));\n    for (int i = 0; i < tiles_I; i++)\n      for (int k = 0; k < tiles_K; k += 2) { int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;\n        gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),\n                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM); }\n    gemmini_config_ld(ATT_D * sizeof(elem_t));\n    for (int k = 0; k < tiles_K; k++)\n      for (int j = 0; j < tiles_J; j += 2) { int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;\n        gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),\n                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM); }\n    gemmini_config_st(D_OUT_COLS * sizeof(out_t));\n    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);\n    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,\n                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);\n    gemmini_mx_read_smem(&O_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_D);\n    gemmini_fence();\n  }\n}\n",
+      "prior autocomp winner (mxpipe_gemmini-mx-attention_0_iters2)"
+    ]
+  ],
+  "problem": "Prob(gemmini-mx-attention, 0)",
+  "plan_models": [
+    "aws-bedrock::us.anthropic.claude-sonnet-4-6"
+  ],
+  "code_models": [
+    "aws-bedrock::us.anthropic.claude-sonnet-4-6"
+  ],
+  "metric": "latency",
+  "simulator": "spike",
+  "give_score_feedback": 1,
+  "give_util_feedback": 0,
+  "give_hw_feedback": 1,
+  "include_ancestors": false,
+  "plan_icl_examples": false,
+  "code_icl_examples": false,
+  "dropout_menu_options": 0.1,
+  "prevent_duplicate_level": 0,
+  "translate_iters": 0,
+  "translate_perf_threshold": 15,
+  "translate_drop_original": true,
+  "translate_score": true,
+  "early_stop_iters": 0,
+  "early_stop_threshold": 1.0
+}

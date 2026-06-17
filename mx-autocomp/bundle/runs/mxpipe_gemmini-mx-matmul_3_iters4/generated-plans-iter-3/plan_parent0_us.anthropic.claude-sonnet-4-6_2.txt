@@ -1,0 +1,62 @@
+## Analysis of the Original Code
+
+Looking at the original code, I can identify a key inefficiency related to **strategy 6**: the `gemmini_config_st` and `gemmini_mxquant_config_mvout` calls are placed **after** the mvin loops complete. This means:
+
+1. The mvin loops run to completion (loading all A and B tiles into the scratchpad)
+2. Only then does the hardware store path get configured
+3. This creates a sequential stall: the hardware must wait for the configuration before `gemmini_loop_ws_spad` can begin
+
+Additionally, I observe the mvin loops: A tiles are loaded with `gemmini_extended_mvin` (port 0) and B tiles with `gemmini_extended_mvin2` (port 1), but they are issued in **separate loops** (first all A tiles for a given k, then all B tiles for the same k). While this interleaves A and B by k-slice, the store configuration still trails the entire mvin sequence.
+
+## Plan: Apply Strategy 6
+
+**Hoist `gemmini_config_st` and `gemmini_mxquant_config_mvout` to before the mvin loops.**
+
+Specifically:
+1. Move `gemmini_config_st(OUT_COLS * sizeof(out_t))` to immediately after `gemmini_extended3_config_ld` for port 1 (before any mvin instructions).
+2. Move `gemmini_mxquant_config_mvout(...)` immediately after `gemmini_config_st`, still before the mvin loops.
+
+This way, while the DMA engine is streaming A and B tiles into the scratchpad, the hardware store path (requantizer configuration, output scale-factor destination, tile bounds) is already programmed. When `gemmini_loop_ws_spad` fires immediately after the last mvin, there is no intervening configuration stall — the hardware can begin computation without waiting for a config instruction to propagate.
+
+The ordering constraints from the programming model are still satisfied:
+- `gemmini_extended3_config_ex` → first ✓
+- `gemmini_mx_load_scales` (both) → second ✓
+- `gemmini_config_st` + `gemmini_mxquant_config_mvout` — these are store-path configurations, not part of the strict load/compute ordering; they can be issued any time before `gemmini_loop_ws_spad` ✓
+- mvin tiles → third ✓
+- `gemmini_loop_ws_spad` → fourth ✓
+- `gemmini_mx_read_smem` → fifth ✓
+- `gemmini_fence()` → sixth ✓
+
+## Rewritten Code
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), SCALE_IDENTITY, false, 0);
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), SCALE_IDENTITY, false, 1);
+
+  // Hoist store-path configuration before mvin loops so the hardware store
+  // path is fully programmed while DMA is in flight, eliminating the
+  // configuration stall that would otherwise occur between the last mvin
+  // and gemmini_loop_ws_spad.
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  for (int k = 0; k < tiles_K; k++) {
+    for (int i = 0; i < tiles_I; i++)
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    for (int j = 0; j < tiles_J; j++)
+      gemmini_extended_mvin2((void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+                             b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+  }
+
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```

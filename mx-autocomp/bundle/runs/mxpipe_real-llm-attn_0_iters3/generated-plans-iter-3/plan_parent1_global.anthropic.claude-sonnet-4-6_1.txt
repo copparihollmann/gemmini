@@ -1,0 +1,74 @@
+## Analysis
+
+Looking at the original code, the outer loop is `i0` (M-blocks) outer, `j0` (N-blocks) inner. This means:
+
+- For each `(i0, j0)` pair, **both A tiles and B tiles are mvin'd fresh**
+- A tiles for a fixed `i0` are loaded repeatedly for every `j0` iteration
+- B tiles for a fixed `j0` are loaded repeatedly for every `i0` iteration
+
+**Strategy 5** is directly applicable: reorder to `j0`-outer, `i0`-inner so that **B tiles are mvin'd once per `j0` block** and reused across all `i0` iterations. Since `BLOCKS_N` iterations currently waste B loads, and B is the larger operand in memory bandwidth terms (same size as A here, but the reuse pattern is clear), this eliminates a factor of `BLOCKS_M` redundant B mvins.
+
+## Plan
+
+### What to change
+
+**1. Swap the loop order**: Make `j0` the outer loop and `i0` the inner loop.
+
+**2. Hoist B mvin outside the `i0` loop**: For a fixed `j0`, load all B tiles (`tiles_K × tiles_J`) into the scratchpad once, before the `i0` loop begins. B tiles sit at `b_base = BANK_NUM*BANK_ROWS - tiles_K*tiles_J*DIM` (fixed, independent of `i0`).
+
+**3. Keep A mvin inside the `i0` loop**: A tiles differ for each `i0`, so they must still be loaded per `i0` iteration. A tiles sit at `a_base = 0`.
+
+**4. Hoist B scale loading outside `i0`**: `B_s[g][0]` depends only on `j0`, so `memcpy` for B scales moves outside the `i0` loop. Only A scale `memcpy` stays inside `i0`.
+
+**5. Reorder hardware init accordingly**: `gemmini_flush(0)` and `gemmini_extended3_config_ex` move outside both loops (they are format/dataflow config that doesn't change). Per the programming model sequence, `gemmini_mx_load_scales` for both A and B must precede each `gemmini_loop_ws_spad`. Since B scales change per `j0` and A scales change per `i0`, the load-scales call for B moves to the `j0` level, while A scale loading stays at `i0` level — but the **intrinsic pair** (both A and B must be called before compute) means we reload B scales at each `i0` iteration too (they're already in the staging buffer `B_s` from the `j0`-level memcpy). The B scale *memcpy* (CPU staging) is hoisted; the `gemmini_mx_load_scales` call itself stays inside `i0` per the programming model.
+
+**6. Scratchpad capacity check**: With `tiles = BLK/DIM` for J and `tiles_K = MATMUL_K/DIM` for K, A needs `tiles * tiles_K * DIM` rows (for one i0 block) and B needs `tiles * tiles_K * DIM` rows. Total = `2 * tiles * tiles_K * DIM`. For the problem dimensions (8×512×512, BLK=typical outer block), this must stay ≤ 8192. The existing single `(i0,j0)` call already satisfies this, so hoisting B outside `i0` doesn't change the scratchpad footprint per compute call — B is still sized for one `j0` block's worth of tiles.
+
+### Concrete code changes
+
+```
+// BEFORE (i0 outer, j0 inner):
+for (int i0 ...) {
+  for (int j0 ...) {
+    memcpy A_s and B_s
+    gemmini_flush(0);
+    config_ex, load_scales(A), load_scales(B)
+    mvin A tiles
+    mvin B tiles
+    compute + readout
+  }
+}
+
+// AFTER (j0 outer, i0 inner):
+gemmini_flush(0);
+gemmini_extended3_config_ex(...);   // hoisted, format is constant
+
+for (int j0 ...) {
+  // Hoist B scale CPU-staging and B mvin for this j0 block
+  for (int g ...) memcpy(&B_s[g][0], &B_scales_col[g][j0*BLK], BLK);
+
+  // Hoist B mvin: load all B tiles for this j0 block once
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int j = 0; j < tiles; j++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin(B_ptr(j0,j,k), b_base + (k*tiles+j)*DIM, DIM, DIM);
+
+  for (int i0 ...) {
+    // A scale CPU-staging (i0-dependent)
+    for (int g ...) memcpy(&A_s[g][0], &A_scales_row[g][i0*BLK], BLK);
+
+    // Programming model: load both A and B scales before compute
+    gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+    gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);  // B_s already staged
+
+    // A mvin (i0-dependent)
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i ...) for (int k ...) gemmini_extended_mvin(A_ptr(i0,i,k), ...);
+
+    // config_st, mxquant_config_mvout, loop_ws_spad, read_smem, fence
+    ...
+  }
+}
+```
+
+This eliminates `BLOCKS_M` redundant B-tile mvin sequences and `BLOCKS_M` redundant B-scale memcpy calls per `j0` block, directly reducing the dominant memory traffic.

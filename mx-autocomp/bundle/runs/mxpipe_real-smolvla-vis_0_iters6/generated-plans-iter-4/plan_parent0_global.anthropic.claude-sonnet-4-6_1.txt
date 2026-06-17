@@ -1,0 +1,38 @@
+## Analysis of the Current Code
+
+The current code has a nested loop structure where:
+- **Outer loop**: `j0` over column blocks — B tiles are loaded once per `j0` (good hoist)
+- **Inner loop**: `i0` over row blocks — A tiles are loaded tile-by-tile with individual `gemmini_extended_mvin` calls
+
+Looking at the A mvin loop:
+```c
+for (int i = 0; i < tiles; i++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(
+      (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+      a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+```
+
+Each call issues one DIM×DIM tile. With `tiles = BLK/DIM` and `tiles_K = MATMUL_K/DIM`, this results in `tiles × tiles_K` separate mvin instructions per `i0` block. Each A tile is loaded independently with `cols=DIM`, when adjacent K-dimension tiles are laid out **contiguously in DRAM** along the K axis (row-major A matrix, stride = MATMUL_K). However, adjacent tiles along the **i dimension** at fixed k are not contiguous in scratchpad, so batching along i doesn't apply. But tiles along the **k dimension** at fixed i are contiguous in both DRAM *and* scratchpad — we can batch them.
+
+## Selected Strategy: Strategy 4 — Batch A Tile Mvins
+
+### Plan
+
+**Key insight**: For a fixed row `i`, the A tiles across the K dimension are:
+- **Contiguous in DRAM**: `A_in + (i0*BLK + i*DIM)*MATMUL_K + k*DIM` — as k increases by 1, the DRAM pointer advances by `DIM` bytes (one tile width), which is exactly the configured stride step. Since the stride is set to `MATMUL_K * sizeof(elem_t)` bytes (one full row), consecutive k values within the same row are adjacent in memory.
+- **Contiguous in scratchpad**: `a_base + (i*tiles_K + k)*DIM` — as k increases by 1, the spad address advances by DIM, perfectly contiguous.
+
+`MAX_BLOCK_LEN = 4`, so we can issue up to 4 tiles per mvin using `cols = 4*DIM`. We batch up to `MAX_BLOCK_LEN` consecutive k-tiles into a single `gemmini_extended_mvin` call with `cols = batch*DIM`.
+
+**Changes**:
+
+1. In the A mvin loop, replace the inner `k` loop with a batched version: iterate `k` in steps of `MAX_BLOCK_LEN` (=4). For each batch starting at `k`, compute how many consecutive tiles fit (`batch = min(MAX_BLOCK_LEN, tiles_K - k)`). Issue one `gemmini_extended_mvin` with `cols = batch * DIM` and `rows = DIM`, pointing to the DRAM address of the first tile in the batch and the scratchpad address of the first tile in the batch.
+
+2. The stride config `gemmini_config_ld(MATMUL_K * sizeof(elem_t))` remains correct — it specifies the row-to-row stride in bytes, which is unchanged regardless of how many columns we read per instruction.
+
+3. No other part of the code changes — B mvin, scale loads, config, loop_ws_spad, and read_smem are all unaffected.
+
+**Reduction in mvin instructions**: With `tiles_K = MATMUL_K/DIM = 256/16 = 16` and `tiles = BLK/DIM`, the inner k loop previously issued `tiles_K = 16` instructions per `i`. With batching by 4, it issues `tiles_K / 4 = 4` instructions per `i` — a **4× reduction** in A mvin instruction count, reducing instruction dispatch overhead and improving pipeline utilization.
+
+**Scratchpad layout correctness**: The batched mvin writes `batch*DIM` columns starting at `a_base + (i*tiles_K + k)*DIM`, which exactly covers spad rows `(i*tiles_K + k)*DIM` through `(i*tiles_K + k + batch - 1)*DIM + DIM - 1` — identical to what the unbatched loop wrote. No layout change.

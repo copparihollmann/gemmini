@@ -1,0 +1,86 @@
+An elegant and highly effective optimization plan to address the inefficiencies in the provided code.
+
+### Optimization Plan
+
+We will apply **Strategy 4: Rewrite the algorithm to reduce total work** to dramatically optimize performance and eliminate all host-side overhead. 
+
+#### Analysis of Inefficiencies
+1. **Unnecessary Outer Tiling & Host-Side Copies:** The original code splits the $64 \times 64 \times 64$ matrix multiplication into smaller blocks (`BLOCKS_M`, `BLOCKS_N`) and performs expensive CPU-side `memcpy` operations to stage scale factors. However, the entire $64 \times 64$ problem fits easily within the 256KB scratchpad and 64KB accumulator. 
+2. **Underutilized Scratchpad & Accumulator:** Since the total scratchpad rows needed for a single-pass $64 \times 64 \times 64$ multiplication is only 512 rows (out of 8192), we can completely eliminate outer tiling loops.
+3. **High MVIN Command Overhead:** The original code loads individual tile blocks with redundant loops. Since the data is contiguous along the matrix dimension in DRAM, we can batch multiple scratchpad MVINs.
+
+#### Steps to Rewrite the Algorithm
+1. **Remove Outer Loops:** Eliminate the `i0` and `j0` loops entirely and compute the entire $64 \times 64 \times 64$ matmul in one hardware invocation.
+2. **Eliminate Host-Side Scale Staging:** Directly load the scale factors using `gemmini_mx_load_scales` on the source arrays (`A_scales_row` and `B_scales_col`). This completely bypasses the CPU `memcpy` overhead.
+3. **Batch MVINs:**
+   * Load the $K$ tiles of matrix $A$ contiguously. Since `tiles_K * DIM` = 64 bytes, and `MAX_BLOCK_LEN = 4` blocks of 16 bytes (64 bytes total), we can load the entire row-block of $A$ in a single command.
+   * Load the $J$ tiles of matrix $B$ contiguously in a similar manner. This reduces MVIN instruction overhead by 4x.
+4. **Single SMEM Readout:** Read the entire $64 \times 64$ result array back from SMEM in one call to `gemmini_mx_read_smem`.
+
+---
+
+### Optimized Code Implementation
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+#include "include/matmul_fp8_64x64.h"
+
+#define DIM 16
+#define ADDR_LEN 32
+
+typedef uint8_t  elem_t;   // fp8:e4m3 input elements
+typedef uint8_t  welem_t;  // fp8:e4m3 weight elements
+typedef uint64_t out_t;    // 4x bf16 packed per word
+
+static out_t C_hw[MATMUL_M][MATMUL_N/8];
+
+void solution(void) {
+  // 1. Configure output stride and format (FP8 execution, BF16 output format = 3)
+  gemmini_config_st(MATMUL_N * sizeof(out_t));
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // 2. Stream power-of-two scale factors directly from original DRAM addresses
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  gemmini_flush(0);
+
+  int tiles_I = MATMUL_M / DIM;
+  int tiles_J = MATMUL_N / DIM;
+  int tiles_K = MATMUL_K / DIM;
+
+  uint32_t a_base = 0;
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM; // 7936
+  int SPAD_DEST = 128;
+
+  // 3. MVIN A: Batch all 4 K-tiles (64 bytes total, matches MAX_BLOCK_LEN=4) per command
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K;
+    uint32_t sp_addr = a_base + (i * tiles_K) * DIM;
+    gemmini_extended_mvin((void *) dram_ptr, sp_addr, tiles_K * DIM, DIM);
+  }
+
+  // 4. MVIN B: Batch all 4 J-tiles (64 bytes total, matches MAX_BLOCK_LEN=4) per command
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int k = 0; k < tiles_K; k++) {
+    elem_t *dram_ptr = ((elem_t*)B_in) + (k * DIM) * MATMUL_N;
+    uint32_t sp_addr = b_base + (k * tiles_J) * DIM;
+    gemmini_extended_mvin((void *) dram_ptr, sp_addr, tiles_J * DIM, DIM);
+  }
+
+  // 5. Configure requantizer bounds and scale factors buffer
+  static uint32_t scale_factors[512] __attribute__((aligned(32))) = {0};
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // 6. Execute weight-stationary matmul in hardware
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // 7. Drain final BF16 results from SMEM back to output DRAM buffer
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```

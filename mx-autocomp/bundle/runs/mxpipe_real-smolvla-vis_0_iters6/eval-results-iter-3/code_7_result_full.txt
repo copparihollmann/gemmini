@@ -1,0 +1,205 @@
+{'correct': False, 'test_results': {0: False}, 'compiled': True, 'stdout': 'Kernel produced an INCORRECT/illegal result on spike. Diagnostic (fix this before optimizing):
+Gemmini extension configured with:
+dim = 16
+Generated implementation latency: 8328 cycles
+Incorrect result'}
+Prev latency: 10608
+New latency: N/A
+Plan: ## Analysis
+
+Looking at the current code, I identify the following inefficiency related to strategy 8:
+
+**Current behavior:** The output readout uses a per-row loop:
+```c
+for (int r = 0; r < mrows; r++)
+    gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                         SPAD_DEST * 16 + r * BLK, ncols);
+gemmini_fence();
+```
+This issues `mrows` separate `gemmini_mx_read_smem` instructions (up to BLK/DIM = several iterations), each transferring only `ncols` BF16 elements from a different row offset in smem.
+
+**The problem:** The smem layout after `gemmini_loop_ws_spad` stores the output block in row-major order with stride `BLK` BF16 elements per row (matching the tile's J dimension). If the output rows in smem are contiguous and the destination DRAM rows are also contiguous (i.e., C_hw is row-major with stride BLK/BF16_PER_WORD words per row), a single `gemmini_mx_read_smem` call with `mrows * BLK` total BF16 elements can replace the entire loop — but only when `ncols == BLK` (no partial last column block, i.e., `ncols == BLK`).
+
+However, for correctness when `ncols < BLK`, we still need per-row calls. But we can collapse the full-block case into one call, and reduce overhead in all cases.
+
+**Strategy 8 plan:** Replace the per-row `gemmini_mx_read_smem` loop with a single whole-block call when the output block is full (`ncols == BLK`), and keep the row loop only for the partial case. Since smem stores a full `mrows × BLK` BF16 region starting at `SPAD_DEST * 16`, and C_hw rows are packed with stride `MATMUL_N / BF16_PER_WORD` words, when `ncols == BLK` the destination is contiguous and we can issue one call for `mrows * BLK` elements. For the partial case (last column block), keep the row loop but with the correct `ncols` count.
+
+**Concrete change:**
+```c
+// Replace:
+for (int r = 0; r < mrows; r++)
+    gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                         SPAD_DEST * 16 + r * BLK, ncols);
+
+// With:
+if (ncols == BLK) {
+    // Full block: single call, smem is contiguous mrows*BLK BF16 elements
+    gemmini_mx_read_smem(&C_hw[i0 * BLK + 0][(j0 * BLK) / BF16_PER_WORD],
+                         SPAD_DEST * 16, mrows * BLK);
+} else {
+    // Partial last column block: must do per-row
+    for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+}
+```
+
+This reduces the instruction count from `mrows` (e.g., 7 for the last partial M block, or BLK/DIM for full blocks) down to 1 for the common full-block case, eliminating loop overhead and reducing RoCC instruction dispatch cost.
+
+CodeCandidate(parent=CodeCandidate(parent=None,
+plan='''prior autocomp winner (mxpipe_real-smolvla-vis_0_iters3)''',
+code='''// AUTO-GENERATED outer-tiled MX matmul baseline (113x256x256).
+void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+   for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Partial last M/N block: compute only the real rows/cols, pad the rest.
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+      // PROF cpu_stage
+      // Stage only the tiny per-32-group scales; A/B data is mvin\'d DIRECTLY
+      // from DRAM (no host-side block memcpy — that was 98% of the cycles).
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+      // PROF accel
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K (full block-aligned tiles)
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+      for (int j = 0; j < tiles; j++)                    // B[k][j0*BLK+j] -> slot (k*tiles + j)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      // Accelerator-centric readout: per-row hardware DMA from smem straight into the
+      // bf16-packed row-major output (block-internal smem row stride is BLK).
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+}
+''',
+score=10608,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'CPU/host data staging detected (2 memcpy, ~0 scalar copy loops). Host staging is typically the dominant cost on this accelerator and autocomp cannot speed it up directly: mvin tiles STRIDED straight from the source DRAM arrays instead of copying through a host buffer, and keep partial sums in shared memory (bf16 accumulate) rather than accumulating on the CPU.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''## Analysis
+
+Looking at the current code, I identify the following inefficiency related to strategy 8:
+
+**Current behavior:** The output readout uses a per-row loop:
+```c
+for (int r = 0; r < mrows; r++)
+    gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                         SPAD_DEST * 16 + r * BLK, ncols);
+gemmini_fence();
+```
+This issues `mrows` separate `gemmini_mx_read_smem` instructions (up to BLK/DIM = several iterations), each transferring only `ncols` BF16 elements from a different row offset in smem.
+
+**The problem:** The smem layout after `gemmini_loop_ws_spad` stores the output block in row-major order with stride `BLK` BF16 elements per row (matching the tile\'s J dimension). If the output rows in smem are contiguous and the destination DRAM rows are also contiguous (i.e., C_hw is row-major with stride BLK/BF16_PER_WORD words per row), a single `gemmini_mx_read_smem` call with `mrows * BLK` total BF16 elements can replace the entire loop — but only when `ncols == BLK` (no partial last column block, i.e., `ncols == BLK`).
+
+However, for correctness when `ncols < BLK`, we still need per-row calls. But we can collapse the full-block case into one call, and reduce overhead in all cases.
+
+**Strategy 8 plan:** Replace the per-row `gemmini_mx_read_smem` loop with a single whole-block call when the output block is full (`ncols == BLK`), and keep the row loop only for the partial case. Since smem stores a full `mrows × BLK` BF16 region starting at `SPAD_DEST * 16`, and C_hw rows are packed with stride `MATMUL_N / BF16_PER_WORD` words, when `ncols == BLK` the destination is contiguous and we can issue one call for `mrows * BLK` elements. For the partial case (last column block), keep the row loop but with the correct `ncols` count.
+
+**Concrete change:**
+```c
+// Replace:
+for (int r = 0; r < mrows; r++)
+    gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                         SPAD_DEST * 16 + r * BLK, ncols);
+
+// With:
+if (ncols == BLK) {
+    // Full block: single call, smem is contiguous mrows*BLK BF16 elements
+    gemmini_mx_read_smem(&C_hw[i0 * BLK + 0][(j0 * BLK) / BF16_PER_WORD],
+                         SPAD_DEST * 16, mrows * BLK);
+} else {
+    // Partial last column block: must do per-row
+    for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+}
+```
+
+This reduces the instruction count from `mrows` (e.g., 7 for the last partial M block, or BLK/DIM for full blocks) down to 1 for the common full-block case, eliminating loop overhead and reducing RoCC instruction dispatch cost.''',
+code='''void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+   for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Partial last M/N block: compute only the real rows/cols, pad the rest.
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+      // PROF cpu_stage
+      // Stage only the tiny per-32-group scales; A/B data is mvin\'d DIRECTLY
+      // from DRAM (no host-side block memcpy — that was 98% of the cycles).
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+      // PROF accel
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K (full block-aligned tiles)
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+      for (int j = 0; j < tiles; j++)                    // B[k][j0*BLK+j] -> slot (k*tiles + j)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      // Accelerator-centric readout: drain smem to DRAM.
+      // For full column blocks, issue a single contiguous read for all mrows*BLK elements.
+      // For partial last column blocks, fall back to per-row reads with ncols elements each.
+      if (ncols == BLK) {
+        // Full block: smem is contiguous mrows*BLK BF16 elements starting at SPAD_DEST*16
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + 0][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16, mrows * BLK);
+      } else {
+        // Partial last column block: must do per-row to avoid writing padding columns
+        for (int r = 0; r < mrows; r++)
+          gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                               SPAD_DEST * 16 + r * BLK, ncols);
+      }
+      gemmini_fence();
+    }
+}
+''',
+score=None,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='global.anthropic.claude-sonnet-4-6',
+code_gen_model='global.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None)

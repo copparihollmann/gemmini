@@ -1,0 +1,727 @@
+# MX-Gemmini Hardware Architecture Summary
+
+## What the Hardware Is
+
+MX-Gemmini is a microscaling (MX) floating-point matrix multiplication accelerator integrated as a RISC-V RoCC coprocessor. It extends the baseline Gemmini systolic array with native support for MX-format operands (FP8 E4M3, FP6 E3M2, FP4 E2M1) and per-block e8m0 scale factors, producing BF16-precision outputs. The programming model is instruction-driven: the host CPU issues RoCC custom-2 (`XCUSTOM_ACC`) instructions via C intrinsics to configure formats, load data and scales into on-chip memories, execute the fused hardware matmul loop, and drain results to DRAM. All kernels run on the Spike functional simulator (`-DSPIKE_SIM`), which provides bit-exact BF16 output matching the MX golden model.
+
+## Programming Model Sequence
+
+Every matmul invocation must follow this ordering or correctness is violated:
+
+1. **`gemmini_extended3_config_ex`** — sets MX format fields (`act_mx_fmt`[11:10], `wgt_mx_fmt`[13:12], `out_mx_fmt`[15:14]), `uselut`[5], dataflow (weight-stationary=1), transposes, strides, and activation function in CONFIG_EX RS1/RS2.
+2. **`gemmini_mx_load_scales(dram_addr, len, sel)`** (funct 27) — streams e8m0 scale codes from DRAM into `mx_scale_a_mem` (sel=1) or `mx_scale_b_mem` (sel=0). Must be issued for both A and B before compute.
+3. **`gemmini_mx_load_lut(dram_addr, num_luts, sel)`** (funct 29) — loads FP6 LUT banks (16 × 6-bit codes per LUT, packed as 3 × uint32 per LUT). Required only when `uselut=1`. LUT banks persist until overwritten, so reloading is unnecessary when the same weight block is reused across tiles.
+4. **`gemmini_config_ld` + `gemmini_extended_mvin{,2,3}`** — configure DRAM stride and DMA tiles into scratchpad (A via mvin, B via mvin2) or accumulator (D/bias via mvin3).
+5. **`gemmini_config_st` + `gemmini_mxquant_config_mvout`** (funct 26) — configure output stride and the requantizer: `scale_dram`, `i_bound`/`j_bound`/`k_bound` (9-bit tile counts), `scale_act_sel`/`scale_w_sel` (which loaded scale buffer feeds requant), and `lut_update_granularity` G (controls how often the output LUT refreshes during quantization; larger G = fewer refreshes = faster).
+6. **`gemmini_loop_ws_spad`** — issues funct 24 (`LOOP_WS_CONFIG_SPAD_AB`, sets one-shot `mx_loop_spad_marker`) then funct 8 (`LOOP_WS`). The marker is consumed on execution; funct 24 must be re-issued before every invocation. Executes the entire tiled I×J×K weight-stationary matmul in hardware.
+7. **`gemmini_mx_read_smem(dram_addr, smem_off_bf16, num_bf16)`** (funct 28) + **`gemmini_fence()`** — drains BF16-packed results from `mx_smem` to DRAM. Results are packed 4 BF16 values per uint64 word. The fence must complete before the host reads output.
+
+## Memory Hierarchy
+
+### Scratchpad (SRAM)
+- **Size:** 4 banks × 2048 rows = 8192 rows total; each row is `DIM × sizeof(elem_t)` = 16 × 1 = **16 bytes**; total **128 KB**
+- **Addressing:** word offsets (not byte addresses); programmer-managed layout
+- **A tile layout:** `a_base + (i*tiles_K + k)*DIM` row offset
+- **B tile layout:** `b_base + (j*tiles_K + k)*DIM`; B is placed at the **top** of the scratchpad: `b_base = BANK_NUM*BANK_ROWS - tiles_K*tiles_J*DIM`, growing downward to avoid overlap with A
+- **DMA limits:** `MAX_BLOCK_LEN = 4` — up to 4 consecutive DIM-row tiles per single mvin command (MAX_BYTES=64, elem_t=1 byte → 64/(16×1)=4)
+- **Double-buffering:** scratchpad is logically split into two halves (`BANK_NUM*BANK_ROWS/2` rows each); `a_spad_id`/`b_spad_id` (0=no reuse, 1=first buffer, 2=second buffer) control operand reuse in `gemmini_loop_ws_spad`
+
+### Accumulator
+- **Size:** 256 rows × 128 bytes/row = **32 KB**; row width = `DIM × sizeof(acc_t)` = 16 × 8 bytes
+- **DMA limits:** `MAX_BLOCK_LEN_ACC = 1` — only 1 accumulator tile per mvin command (128-byte rows exceed MAX_BYTES=64); accumulator mvins are 4× more command-intensive than scratchpad mvins
+- **Address space:** high bit set (`1 << (ADDR_LEN-1)`) for D/bias input; bits [ADDR_LEN-1:ADDR_LEN-2] = `11` for C output; double-buffer partition at `ACC_ROWS/2 = 128` rows
+- **Maximum in-flight output tiles:** 256 (single-buffer) or 128 (double-buffer); must mvout before overflow
+
+### MX Shared Memory (`mx_smem`)
+- Holds BF16-packed outputs (or packed FP4/FP6 codes) after `gemmini_loop_ws_spad` completes
+- Addressed in 16-bit word units; C spad word offset = `SPAD_DEST * 16`
+- Drained exclusively via `MX_READ_SMEM`; `MVOUT_SPAD` (funct 23) is a no-op in Spike
+
+### Scale Memory
+- Two independent buffers: `mx_scale_a_mem` (activation row scales) and `mx_scale_b_mem` (weight column scales)
+- Scale format: **e8m0** (8-bit exponent only, pure power-of-two); one scale per MX block along K
+- DRAM layout: `scale_dram + m * N_blocks + bi` (row-major, block-indexed)
+- Persist in hardware state until overwritten; reloading is only necessary when the scale block changes
+
+### LUT Memory
+- Three banks: `mx_lut_a`, `mx_lut_b`, `mx_lut_c`; each entry = 16 × 6-bit FP6 E3M2 codes
+- DRAM packing: 3 × LE uint32 per LUT (96 bits per LUT)
+- Persist until overwritten; amortize across all tiles sharing the same weight block
+
+### Off-Chip DRAM
+- Source for all tile data, scales, and LUTs; destination for BF16 results via `MX_READ_SMEM`
+- No hardware cache between DRAM and scratchpad; all data movement is explicit DMA
+
+## Compute Unit
+
+- **Type:** 16×16 weight-stationary systolic array
+- **Tile dimension:** DIM = 16; all tiling must use multiples of 16 in M, N, K
+- **Input element type:** `elem_t = uint8_t` (fp8/fp6/fp4 packed into 1-byte slots); `elem_t_max=4095`, `elem_t_min=0`
+- **Accumulator type:** `acc_t = uint64_t`; BF16-class precision (8 exponent bits, 8 significand bits)
+- **Output scale type:** `acc_scale_t = float` (IEEE 754 float32)
+- **Fused hardware loop:** `gemmini_loop_ws_spad` executes the entire tiled I×J×K matmul in hardware without software loop overhead; tile counts `tiles_I = M/DIM`, `tiles_J = N/DIM`, `tiles_K = K/DIM`
+- **Transpose support:** A-transpose (bit 8) and B-transpose (bit 9) in CONFIG_EX RS1
+- **`skips` bitmask** in `gemmini_loop_ws_spad` RS2[5:0]: suppresses sub-operations (e.g., redundant preloads or bias adds); tunable for performance without affecting correctness when the skipped operation is genuinely unnecessary
+- **Throughput:** one 16×16 MAC array; peak utilization requires keeping the systolic array fed with back-to-back tiles, which demands overlapping mvin with compute and minimizing configuration re-issue
+
+## Key Constraints Affecting Optimization
+
+**Tiling constraints:**
+- Scratchpad must hold all A and B tiles simultaneously: `(tiles_I*tiles_K + tiles_J*tiles_K)*DIM ≤ 8192` rows (single-buffer) or `≤ 4096` (double-buffer)
+- Accumulator must hold all C tiles: `tiles_I*tiles_J*DIM ≤ 256` rows (single-buffer) or `≤ 128` (double-buffer)
+- Tile dimension fields are 16-bit; I, J, K tile counts must each be < 65535
+- M, N, K must be exact multiples of DIM=16 (no partial-tile hardware padding in MX path)
+
+**Scale and LUT amortization:**
+- `gemmini_mx_load_scales` and `gemmini_mx_load_lut` are DRAM loads with non-trivial latency; they must be amortized across all tiles that share the same scale block or LUT
+- `lut_update_granularity` G in `gemmini_mxquant_config_mvout` controls requantizer LUT refresh frequency; set G as large as correctness allows to minimize refresh overhead
+- Scale selectors (`scale_act_sel`, `scale_w_sel`) choose between two loaded scale buffers, enabling ping-pong scale loading while compute proceeds
+
+**Instruction ordering and statefulness:**
+- `mx_loop_spad_marker` is one-shot: funct 24 must be re-issued before every `gemmini_loop_ws_spad` call
+- CONFIG_EX, CONFIG_LD, and CONFIG_ST fields persist until changed; avoid redundant re-issue when format, stride, and scale are unchanged across consecutive tiles
+- `set_only_strides` flag (CONFIG_EX RS1 bit 7) allows updating A/C strides without full reconfiguration
+- `gemmini_fence()` is a full memory barrier; use only when necessary (after `gemmini_mx_read_smem`, before consuming results)
+
+**Bandwidth and scheduling:**
+- Three independent mvin ports (mvin/mvin2/mvin3) can overlap A, B, and D loads with each other and with compute
+- Accumulator mvin is 4× more command-intensive than scratchpad mvin (MAX_BLOCK_LEN_ACC=1 vs. 4); minimize partial accumulator writes
+- B matrix must be placed at the top of the scratchpad (`BANK_NUM*BANK_ROWS - tiles_K*tiles_J*DIM`) before tiling begins; verify no overlap with A before issuing mvins
+- `MVOUT_SPAD` (funct 23) is a no-op in Spike; all output must flow through `mx_smem` → `MX_READ_SMEM` → DRAM
+
+**Correctness:**
+- Output must be bit-exact BF16 matching the MX golden model; no approximations are permitted
+- Scale memory layout in DRAM must match the expected `scale_dram + m*N_blocks + bi` indexing exactly
+- LUT banks are indexed by the `sel` field (0=B, 1=A, 2=C); loading to the wrong bank silently produces incorrect results
+## Configuration and Setup
+
+### gemmini_extended3_config_ex
+
+// RS1: [63:32] acc_scale | [31:16] a_stride | [15:14] out_mx_fmt | [13:12] wgt_mx_fmt | [11:10] act_mx_fmt | [9] b_transpose | [8] a_transpose | [7] set_only_strides | [6] spacer | [5] uselut | [4:3] activation | [2] dataflow | [1:0] cmd_type
+// RS2: [63:48] c_stride | [47:32] relu6_shift | [31:0] in_shift
+#define gemmini_extended3_config_ex(dataflow, sys_act, sys_shift, sys_acc_scale, C_stride, A_stride, A_transpose, B_transpose, set_only_strides, act_mx_fmt, wgt_mx_fmt, out_mx_fmt, uselut) \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, \
+        ((uint64_t)acc_scale_t_to_acc_scale_t_bits((acc_scale_t)sys_acc_scale) << 32) | \
+        ((uint64_t)(A_stride) << 16) | \
+        ((uint64_t)(out_mx_fmt) << 14) | \
+        ((uint64_t)(wgt_mx_fmt) << 12) | \
+        ((uint64_t)(act_mx_fmt) << 10) | \
+        ((uint64_t)(B_transpose) << 9) | \
+        ((uint64_t)(A_transpose) << 8) | \
+        ((uint64_t)(set_only_strides) << 7) | \
+        ((uint64_t)(uselut) << 5) | \
+        ((uint64_t)(sys_act) << 3) | \
+        ((uint64_t)(dataflow) << 2) | \
+        CONFIG_EX, \
+        ((uint64_t)(C_stride) << 48) | (uint64_t)(uint32_t)(sys_shift), \
+        k_CONFIG)
+
+### gemmini_extended3_config_ex
+
+1. **Configure execution** — set dataflow + the MX format fields:
+   ```c
+   gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+       /*C_stride*/1, /*A_stride*/1, /*A_transpose*/0, /*B_transpose*/0,
+       /*set_only_strides*/false,
+       /*act_mx_fmt*/0, /*wgt_mx_fmt*/0, /*out_mx_fmt*/3, /*uselut*/0);
+   ```
+   `act_mx_fmt`/`wgt_mx_fmt`/`out_mx_fmt` are 2-bit fields (config_ex RS1 bits
+   [11:10],[13:12],[15:14]). For fp8 the example uses act=0,wgt=0,out=3 (BF16
+   output). **For fp6/fp4 use the values shown in the corresponding
+   `matmul_tiled_fp6_*.c` / `matmul_tiled_fp4_*.c` example — do not guess the
+   encoding.** Set `uselut=1` and load a LUT (below) when the format requires it.
+
+---
+
+### gemmini_extended2_config_ex
+
+#define gemmini_extended2_config_ex(dataflow, sys_act, sys_shift, A_stride, A_transpose, B_transpose) \
+  gemmini_extended3_config_ex(dataflow, sys_act, sys_shift, ACC_SCALE_IDENTITY, 1, A_stride, A_transpose, B_transpose, false, 0, 0, 0, 0)
+
+---
+
+### gemmini_extended_config_ex
+
+#define gemmini_extended_config_ex(dataflow, sys_act, sys_shift, A_stride, A_transpose, B_transpose) \
+  gemmini_extended2_config_ex(dataflow, sys_act, sys_shift, A_stride, A_transpose, B_transpose)
+
+---
+
+### gemmini_extended5_config_ld
+
+// Note: The "pixel_repeats" parameter below is still experimental, andthere is
+// a high chance that it will be removed in future releases.
+#define gemmini_extended5_config_ld(stride, scale, shrunk, block_mvin_stride, pixel_repeats, id) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)(scale_t_to_scale_t_bits(scale)) << 32) | ((uint64_t)(block_mvin_stride) << 16) | ((uint64_t)(pixel_repeats) << 8) | ((id) << 3) | ((shrunk) << 2) | CONFIG_LD, stride, k_CONFIG)
+
+---
+
+### gemmini_extended4_config_ld
+
+#define gemmini_extended4_config_ld(stride, scale, shrunk, block_mvin_stride, id) \
+  gemmini_extended5_config_ld(stride, scale, shrunk, block_mvin_stride, 1, id) \
+
+---
+
+### gemmini_extended3_config_ld
+
+#define gemmini_extended3_config_ld(stride, scale, shrunk, id) \
+  gemmini_extended4_config_ld(stride, scale, shrunk, DIM, id)
+
+---
+
+### gemmini_extended2_config_ld
+
+#define gemmini_extended2_config_ld(stride, scale, shrunk) \
+  gemmini_extended3_config_ld(stride, scale, shrunk, 0)
+
+---
+
+### gemmini_extended_config_ld
+
+#define gemmini_extended_config_ld(stride, scale) \
+  gemmini_extended2_config_ld(stride, scale, false)
+
+---
+
+### gemmini_extended2_config_st
+
+#define gemmini_extended2_config_st(stride, acc_act, acc_scale, pool_stride, pool_size, pool_out_dim, porows, pocols, orows, ocols, upad, lpad) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)(ocols) << 56) | ((uint64_t)(orows) << 48) | ((uint64_t)(pocols) << 40) | ((uint64_t)(porows) << 32) | ((uint64_t)(pool_out_dim) << 24) | ((uint64_t)(lpad) << 10) | ((uint64_t)(upad) << 8) | ((uint64_t)(pool_size) << 6) | ((uint64_t)(pool_stride) << 4) | ((uint64_t)(acc_act) << 2) | CONFIG_ST, ((uint64_t)acc_scale_t_to_acc_scale_t_bits((acc_scale_t)acc_scale) << 32) | ((uint32_t)stride), k_CONFIG)
+
+---
+
+### gemmini_extended_config_st
+
+#define gemmini_extended_config_st(stride, acc_act, acc_scale) \
+    gemmini_extended2_config_st(stride, acc_act, acc_scale, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+---
+
+### gemmini_mxquant_config_mvout
+
+#define gemmini_mxquant_config_mvout(dram_addr, i_bound, j_bound, k_bound, scale_act_sel, scale_w_sel, lut_update_granularity) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, \
+   ((uint64_t)(scale_w_sel) << 61) | ((uint64_t)(scale_act_sel) << 60) |  ((uint64_t)(k_bound) << 51) | ((uint64_t)(j_bound) << 42) | ((uint64_t)(i_bound) << 33) | (uint64_t)(dram_addr), \
+    (uint64_t)(lut_update_granularity) & 0xFFFF, CONFIG_SCALE_MEM)
+
+### gemmini_mxquant_config_mvout
+
+5. **Configure the requantized mvout** — programs the requantizer + output scale
+   memory and bounds:
+   ```c
+   gemmini_config_st(OUT_COLS * sizeof(out_t));
+   gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+       /*i_bound*/tiles_I, /*j_bound*/tiles_J, /*k_bound*/tiles_K,
+       /*scale_act_sel*/0, /*scale_w_sel*/0, /*lut_update_granularity*/1);
+   ```
+
+---
+
+### MXQUANT_CONFIG_MVOUT
+
+| 26 | `MXQUANT_CONFIG_MVOUT`    | `[32:0]` = `scale_dram` (low 33 bits), `[33:42]` = `tiles_I`, `[42:51]` = `tiles_J`, `[51:60]` = `tiles_K`, `[60]` = `scale_act_sel`, `[61]` = `scale_wgt_sel` | `[15:0]` = `lut_update_granularity` (G) | Configures the requant write-back. Per-row, per-N-group e8m0 scale codes are stored at `scale_dram + m*N_blocks + bi`. |
+
+---
+
+### CONFIG_EX MX format fields
+
+### CONFIG_EX changes (funct 0, CONFIG_EX subtype, `rs1[1:0] == 0b00`)
+
+`gemmini_extended3_config_ex` now packs four MX format fields into
+previously-unused bits of `rs1`; the macro signature changed to take
+`(act_fmt, wgt_fmt, out_fmt, uselut)` as the last four arguments. The
+spike handler reads:
+
+| `rs1` bits | Field | Meaning |
+|------------|-------|---------|
+| `[5]`     | `uselut`  | When 1, the MX kernel takes the FP6 LUT path. |
+| `[11:10]` | `act_fmt` | A-side / activation format: 0 = FP8 E4M3, 1 = FP6 E3M2 (LUT-indexed), 2 = FP4 E2M1. Selects the matmul kernel. |
+| `[13:12]` | `wgt_fmt` | B-side / weight format (same encoding). |
+| `[15:14]` | `out_fmt` | Output format: 0 = FP8 E4M3 packed, 1 = FP6 (4-bit LUT indices), 2 = FP4 E2M1 packed, 3 = BF16. Selects whether a requant post-pass runs and which projection it uses. |
+
+All other config-EX bits (dataflow, sys_act, strides, transposes, sys
+shifts) keep their pre-existing meanings.
+
+## Control Flow and Synchronization
+
+### gemmini_flush
+
+#define gemmini_flush(skip) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, skip, 0, k_FLUSH)
+
+---
+
+### gemmini_fence
+
+#define gemmini_fence() asm volatile("fence")
+
+## Data Types and Formats
+
+### MX format table
+
+## Supported MX formats
+
+| Format | Enc | Notes |
+|--------|-----|-------|
+| FP4 (E2M1) | 4-bit | 2 elements packed (dual) |
+| FP6 E2M3 | 6-bit | single |
+| FP6 E3M2 | 6-bit | dual |
+| FP8 E4M3 | 8-bit | single — the most common input format |
+| FP8 E5M2 | 8-bit | dual |
+
+Each MX block shares one `fpe8m0` (power-of-two) scale factor. Scale factors are
+grouped: the golden headers expose `A_scales_row[GK][M]` and `B_scales_col[GK][N]`
+where `GK` is the number of scale groups along K.
+
+---
+
+### gemmini_state_t MX fields
+
+### State added to `gemmini_state_t`
+
+`mx_act_fmt`, `mx_wgt_fmt`, `mx_out_fmt`, `mx_use_lut`,
+`mx_lut_update_granularity`, `mx_scale_dram`, `mx_tiles_{I,J,K}`,
+`mx_scale_{act,wgt}_sel`, `mx_loop_{a,b,c}_spad`, `mx_loop_skips`,
+`mx_loop_spad_marker`, plus the buffers `mx_scale_a_mem`,
+`mx_scale_b_mem`, `mx_smem`, and per-format LUTs `mx_lut_{a,b,c}` (each
+16 codes × max LUTs). All cleared on `reset()`.
+
+
+## Memory Load Operations
+
+### gemmini_extended_mvin
+
+4. **MVIN tiles** of A and B into the scratchpad. Tiles are DIM×DIM (DIM=16):
+   ```c
+   gemmini_config_ld(MATMUL_M * sizeof(elem_t));
+   gemmini_extended_mvin(dram_ptr, spad_addr, DIM, DIM);
+   ```
+   Lay A tiles at `a_base + (i*tiles_K + k)*DIM`, B tiles at
+   `b_base + (j*tiles_K + k)*DIM` where `b_base = BANK_NUM*BANK_ROWS - tiles_K*tiles_J*DIM`.
+
+### gemmini_extended_mvin
+
+#define gemmini_extended_mvin(dram_addr, spad_addr, cols, rows) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, dram_addr, ((uint64_t)(rows) << (ADDR_LEN + 16)) | ((uint64_t)(cols) << ADDR_LEN) | (spad_addr), k_MVIN)
+
+---
+
+### gemmini_extended_mvin2
+
+#define gemmini_extended_mvin2(dram_addr, spad_addr, cols, rows) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, dram_addr, ((uint64_t)(rows) << (ADDR_LEN + 16)) | ((uint64_t)(cols) << ADDR_LEN) | (spad_addr), k_MVIN2)
+
+---
+
+### gemmini_extended_mvin3
+
+#define gemmini_extended_mvin3(dram_addr, spad_addr, cols, rows) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, dram_addr, ((uint64_t)(rows) << (ADDR_LEN + 16)) | ((uint64_t)(cols) << ADDR_LEN) | (spad_addr), k_MVIN3)
+
+---
+
+### gemmini_block_mvin
+
+#define gemmini_block_mvin(dram_addr, spad_addr, len) \
+  gemmini_extended_mvin(dram_addr, spad_addr, (len) * DIM, DIM)
+
+## Memory Store Operations
+
+### gemmini_extended_mvout
+
+#define gemmini_extended_mvout(dram_addr, spad_addr, cols, rows) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, dram_addr, ((uint64_t)(rows) << (ADDR_LEN + 16)) | ((uint64_t)(cols) << ADDR_LEN) | (uint64_t)(spad_addr), k_MVOUT)
+
+---
+
+### gemmini_extended_mvout_spad
+
+#define gemmini_extended_mvout_spad(dst_addr, dst_stride, src_addr, cols, rows) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)(dst_stride) << 32) | (uint64_t)(dst_addr), ((uint64_t)(rows) << (ADDR_LEN + 16)) | ((uint64_t)(cols) << ADDR_LEN) | (uint64_t)(src_addr), k_MVOUT_SPAD)
+
+---
+
+### gemmini_mvout_spad
+
+#define gemmini_mvout_spad(dst_addr, src_addr) \
+  gemmini_extended_mvout_spad(dst_addr, 1, src_addr, DIM, DIM)
+
+## MX Scale and LUT Management
+
+### gemmini_mx_load_scales
+
+2. **Load scale factors** into scale-factor memory (sel 0 = activations/A,
+   sel 1 = weights/B):
+   ```c
+   gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+   gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+   ```
+   (RTL builds instead MMIO-write the scale-factor memory at GEMMINI_SF_MEM;
+   spike uses the intrinsic. Optimize for the spike path.)
+
+### gemmini_mx_load_scales
+
+#define gemmini_mx_load_scales(dram_addr, len, sel) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, (uint64_t)(dram_addr), \
+    ((uint64_t)(sel) << 32) | ((uint64_t)(len) & 0xFFFFFFFFu), \
+    k_MX_LOAD_SCALES)
+
+---
+
+### gemmini_mx_load_lut
+
+// Load num_luts × (16 6-bit FP6 codes) from DRAM (3 LE uint32 per LUT).
+// sel: 0 = B (weight), 1 = A (activation), 2 = C (output)
+#define gemmini_mx_load_lut(dram_addr, num_luts, sel) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, (uint64_t)(dram_addr), \
+    ((uint64_t)(sel) << 32) | ((uint64_t)(num_luts) & 0xFFFFFFFFu), \
+    k_MX_LOAD_LUT)
+
+### gemmini_mx_load_lut
+
+3. **(Optional) Load a quant LUT** with `gemmini_mx_load_lut(dram_addr, num_luts, sel)`
+   for formats/requantization that need it (see `matmul_data_mx_lut_hw.h` users).
+
+---
+
+### MX_LOAD_SCALES
+
+| 27 | `MX_LOAD_SCALES`          | DRAM byte address of scale block | `[32]` = `sel` (0 = A-row scales, 1 = B-col scales), `[31:0]` = `len` (bytes) | Streams `len` e8m0 codes from DRAM into `mx_scale_a_mem` / `mx_scale_b_mem`. |
+
+---
+
+### MX_LOAD_LUT
+
+| 29 | `MX_LOAD_LUT`             | DRAM byte address | `[33:32]` = `sel` (0 = B, 1 = A, 2 = C), `[31:0]` = `num_luts` | Loads `num_luts × (3 LE uint32 = 96 bits)` from DRAM and unpacks 16 × 6-bit FP6 E3M2 codes per LUT into `mx_lut_a / b / c`. |
+
+## MX Shared Memory Operations
+
+### gemmini_mx_read_smem
+
+#define gemmini_mx_read_smem(dram_addr, smem_off_bf16, num_bf16) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, (uint64_t)(dram_addr), \
+    ((uint64_t)(num_bf16) << 32) | ((uint64_t)(smem_off_bf16) & 0xFFFFFFFFu), \
+    k_MX_READ_SMEM)
+
+### gemmini_mx_read_smem
+
+7. **Read the result** out of shared memory (BF16, packed 4 per uint64 word):
+   ```c
+   gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST*16, MATMUL_M*MATMUL_N);
+   gemmini_fence();
+   ```
+
+---
+
+### MX_READ_SMEM
+
+| 28 | `MX_READ_SMEM`            | DRAM byte address | `[63:32]` = `num_u16`, `[31:0]` = `smem_word_offset` | Copies `num_u16` 16-bit words from the MX shared memory (`mx_smem`) to DRAM. Used to drain BF16 outputs or packed FP4 / FP6 codes after the matmul. |
+
+## Compute and Systolic Array Operations
+
+### gemmini_extended_compute_preloaded
+
+#define gemmini_extended_compute_preloaded(A, BD, A_cols, A_rows, BD_cols, BD_rows) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)(A_rows) << (ADDR_LEN + 16)) | ((uint64_t)(A_cols) << ADDR_LEN) | (uint64_t)(A), ((uint64_t)(BD_rows) << (ADDR_LEN + 16)) | ((uint64_t)(BD_cols) << ADDR_LEN) | (uint64_t)(BD), k_COMPUTE_PRELOADED)
+
+---
+
+### gemmini_extended_compute_accumulated
+
+#define gemmini_extended_compute_accumulated(A, BD, A_cols, A_rows, BD_cols, BD_rows) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)(A_rows) << (ADDR_LEN + 16)) | ((uint64_t)(A_cols) << ADDR_LEN) | (uint64_t)(A), ((uint64_t)(BD_rows) << (ADDR_LEN + 16)) | ((uint64_t)(BD_cols) << ADDR_LEN) | (uint64_t)(BD), k_COMPUTE_ACCUMULATE)
+
+---
+
+### gemmini_extended_preload
+
+#define gemmini_extended_preload(BD, C, BD_cols, BD_rows, C_cols, C_rows) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)(BD_rows) << (ADDR_LEN + 16)) | ((uint64_t)(BD_cols) << ADDR_LEN) | (uint64_t)(BD), ((uint64_t)(C_rows) << (ADDR_LEN + 16)) | ((uint64_t)(C_cols) << ADDR_LEN) | (uint64_t)(C), k_PRELOAD)
+
+---
+
+### gemmini_preload
+
+#define gemmini_preload(BD, C) \
+  gemmini_extended_preload(BD, C, DIM, DIM, DIM, DIM)
+
+---
+
+### gemmini_preload_zeros
+
+#define gemmini_preload_zeros(C) \
+  gemmini_preload(GARBAGE_ADDR, C)
+
+## Fused Loop and Tiled Matmul
+
+### gemmini_loop_ws
+
+// weight-stationary matmul loop
+#define gemmini_loop_ws(I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_stride, B_stride, D_stride, C_stride, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act, a_spad_id, b_spad_id, is_resadd) \
+  { \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS) \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, A, B, k_LOOP_WS_CONFIG_ADDRS_AB) \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, D, C, k_LOOP_WS_CONFIG_ADDRS_DC) \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, A_stride, B_stride, k_LOOP_WS_CONFIG_STRIDES_AB) \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, D_stride, C_stride, k_LOOP_WS_CONFIG_STRIDES_DC) \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)(a_spad_id) << 18) | ((uint64_t)(b_spad_id) << 16) | ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (ex_accumulate), ((is_resadd) << 2) | ((B_transpose) << 1) | (A_transpose), k_LOOP_WS) \
+  }
+
+---
+
+### gemmini_loop_ws_spad
+
+#define gemmini_loop_ws_spad(I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act, a_spad_id, b_spad_id, is_resadd, skips) \
+  { \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS) \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, A, B, k_LOOP_WS_CONFIG_SPAD_AB) \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)(a_spad_id) << 18) | ((uint64_t)(b_spad_id) << 16) | ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (ex_accumulate), ((uint64_t)(C) << 32) | 0x200U | (skips) | ((is_resadd) << 2) | ((B_transpose) << 1) | (A_transpose), k_LOOP_WS) \
+  }
+
+### gemmini_loop_ws_spad
+
+6. **Compute** the weight-stationary tiled matmul over the scratchpad:
+   ```c
+   gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0,0,0,
+       a_base, BANK_NUM*BANK_ROWS, 0, SPAD_DEST,
+       false,false, false,false,false, NO_ACTIVATION, 0,0, false, 0x38);
+   ```
+   Results land in shared memory at `SPAD_DEST`, requantized to BF16.
+
+---
+
+### LOOP_WS_CONFIG_SPAD_AB
+
+| 24 | `LOOP_WS_CONFIG_SPAD_AB`  | A spad base address | B spad end address | Sets `mx_loop_a_spad`, `mx_loop_b_spad`. Also marks the next `LOOP_WS` as the MX (`mx_loop_ws_spad`) variant. |
+
+---
+
+### LOOP_WS_CONFIG_SPAD_C
+
+| 25 | `LOOP_WS_CONFIG_SPAD_C`   | C spad base address | – | Sets `mx_loop_c_spad`. |
+
+---
+
+### LOOP_WS (MX variant)
+
+The MX matmul itself reuses `LOOP_WS` (funct 8). When the preceding
+instruction was `LOOP_WS_CONFIG_SPAD_AB`, the spike handler dispatches
+to `mx_loop_ws_spad` instead of the legacy CISC loop; `rs1` is unused
+and in `rs2` the upper 32 bits are the C-side spad word offset, while
+`rs2[5:0]` is the existing skip-mask byte.
+
+## Reference Documentation and Workflows
+
+### MX intrinsics summary
+
+## Key MX intrinsics (from gemmini.h)
+
+- `gemmini_extended3_config_ex(dataflow, sys_act, sys_shift, sys_acc_scale, C_stride, A_stride, A_transpose, B_transpose, set_only_strides, act_mx_fmt, wgt_mx_fmt, out_mx_fmt, uselut)`
+- `gemmini_mx_load_scales(dram_addr, len, sel)` — sel 0=A, 1=B
+- `gemmini_mx_load_lut(dram_addr, num_luts, sel)`
+- `gemmini_mxquant_config_mvout(dram_addr, i_bound, j_bound, k_bound, scale_act_sel, scale_w_sel, lut_update_granularity)`
+- `gemmini_loop_ws_spad(I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act, a_spad_id, b_spad_id, is_resadd, skips)`
+- `gemmini_mx_read_smem(dram_addr, smem_off_bf16, num_bf16)`
+- Standard Gemmini intrinsics also apply: `gemmini_extended_mvin/mvin2/mvin3`,
+  `gemmini_extended_mvout`, `gemmini_preload`, `gemmini_compute_preloaded/accumulated`,
+  `gemmini_config_ld/st`, `gemmini_fence`, `gemmini_flush`.
+
+---
+
+### Kernel workflow (weight-stationary fp8 matmul)
+
+## The kernel workflow (weight-stationary fp8 matmul)
+
+A correct MX matmul kernel performs these steps (see
+`matmul_tiled_fp8_64x64.c` for the canonical example):
+
+1. **Configure execution** — set dataflow + the MX format fields:
+   ```c
+   gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+       /*C_stride*/1, /*A_stride*/1, /*A_transpose*/0, /*B_transpose*/0,
+       /*set_only_strides*/false,
+       /*act_mx_fmt*/0, /*wgt_mx_fmt*/0, /*out_mx_fmt*/3, /*uselut*/0);
+   ```
+   `act_mx_fmt`/`wgt_mx_fmt`/`out_mx_fmt` are 2-bit fields (config_ex RS1 bits
+   [11:10],[13:12],[15:14]). For fp8 the example uses act=0,wgt=0,out=3 (BF16
+   output). **For fp6/fp4 use the values shown in the corresponding
+   `matmul_tiled_fp6_*.c` / `matmul_tiled_fp4_*.c` example — do not guess the
+   encoding.** Set `uselut=1` and load a LUT (below) when the format requires it.
+
+2. **Load scale factors** into scale-factor memory (sel 0 = activations/A,
+   sel 1 = weights/B):
+   ```c
+   gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+   gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+   ```
+   (RTL builds instead MMIO-write the scale-factor memory at GEMMINI_SF_MEM;
+   spike uses the intrinsic. Optimize for the spike path.)
+
+3. **(Optional) Load a quant LUT** with `gemmini_mx_load_lut(dram_addr, num_luts, sel)`
+   for formats/requantization that need it (see `matmul_data_mx_lut_hw.h` users).
+
+4. **MVIN tiles** of A and B into the scratchpad. Tiles are DIM×DIM (DIM=16):
+   ```c
+   gemmini_config_ld(MATMUL_M * sizeof(elem_t));
+   gemmini_extended_mvin(dram_ptr, spad_addr, DIM, DIM);
+   ```
+   Lay A tiles at `a_base + (i*tiles_K + k)*DIM`, B tiles at
+   `b_base + (j*tiles_K + k)*DIM` where `b_base = BANK_NUM*BANK_ROWS - tiles_K*tiles_J*DIM`.
+
+5. **Configure the requantized mvout** — programs the requantizer + output scale
+   memory and bounds:
+   ```c
+   gemmini_config_st(OUT_COLS * sizeof(out_t));
+   gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+       /*i_bound*/tiles_I, /*j_bound*/tiles_J, /*k_bound*/tiles_K,
+       /*scale_act_sel*/0, /*scale_w_sel*/0, /*lut_update_granularity*/1);
+   ```
+
+6. **Compute** the weight-stationary tiled matmul over the scratchpad:
+   ```c
+   gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0,0,0,
+       a_base, BANK_NUM*BANK_ROWS, 0, SPAD_DEST,
+       false,false, false,false,false, NO_ACTIVATION, 0,0, false, 0x38);
+   ```
+   Results land in shared memory at `SPAD_DEST`, requantized to BF16.
+
+7. **Read the result** out of shared memory (BF16, packed 4 per uint64 word):
+   ```c
+   gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST*16, MATMUL_M*MATMUL_N);
+   gemmini_fence();
+   ```
+
+---
+
+### Tiling parameters and scratchpad layout
+
+DIM = 16 (the systolic array / tile dimension). Tiling counts are
+`tiles_I = M/DIM`, `tiles_J = N/DIM`, `tiles_K = K/DIM`. `BANK_NUM`/`BANK_ROWS`
+come from `gemmini_params.h`.
+
+---
+
+### Optimizer tuning knobs
+
+## What an optimizer can tune
+
+- **Tiling / loop order** of I/J/K and how tiles are laid out in the scratchpad
+  (`a_base`/`b_base`, `SPAD_DEST`), to maximize scratchpad/accumulator reuse.
+- **MVIN strategy**: batching, strides (`gemmini_config_ld`), which of
+  mvin/mvin2/mvin3 ports to use, overlapping loads with compute.
+- **Using `gemmini_loop_ws_spad`** (a fused hardware loop) vs hand-rolled
+  preload/compute sequences.
+- **Skips / flags** in `loop_ws_spad` (last arg is a skip bitmask, e.g. 0x38).
+- Avoiding redundant scale/LUT reloads across tiles.
+
+You are an expert performance engineer generating high-performance code for this hardware target. 
+The code was:
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+#include "include/matmul_fp8_64x64.h"
+
+#define DIM 16
+#define ADDR_LEN 32
+
+typedef uint8_t  elem_t;   // fp8:e4m3 input elements
+typedef uint8_t  welem_t;  // fp8:e4m3 weight elements
+typedef uint64_t out_t;    // 4x bf16 packed per word
+
+static out_t C_hw[MATMUL_M][MATMUL_N/8]; // 50x256 -> 50x32 (256/8)
+
+void solution(void) {
+  // 1. Configure output stride and format (FP8 execution, BF16 output format = 3)
+  gemmini_config_st(MATMUL_N * sizeof(elem_t)); // Each row has MATMUL_N elements
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 
+                              1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // 2. Stream power-of-two scale factors directly from original DRAM addresses
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);  // A/activation scales
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);  // B/weight scales
+
+  gemmini_flush(0);
+
+  int tiles_I = (MATMUL_M + DIM - 1) / DIM;  // Ceiling division: (50+15)/16 = 4
+  int tiles_J = MATMUL_N / DIM;              // Exact division: 256/16 = 16
+  int tiles_K = MATMUL_K / DIM;              // Exact division: 512/16 = 32
+
+  uint32_t a_base = 0;
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM; // Place B at top
+  int SPAD_DEST = 128;
+
+  // 3. MVIN A: Load all tiles for each I dimension
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K;
+    uint32_t sp_addr = a_base + (i * tiles_K) * DIM;
+    // Load all K tiles for this I block in one go
+    gemmini_extended_mvin((void *) dram_ptr, sp_addr, MATMUL_K, DIM);
+  }
+
+  // 4. MVIN B: Load all tiles for each K dimension
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int k = 0; k < tiles_K; k++) {
+    elem_t *dram_ptr = ((elem_t*)B_in) + (k * DIM) * MATMUL_N;
+    uint32_t sp_addr = b_base + (k * tiles_J) * DIM;
+    // Load all J tiles for this K block in one go
+    gemmini_extended_mvin((void *) dram_ptr, sp_addr, MATMUL_N, DIM);
+  }
+
+  // 5. Configure requantizer bounds and scale factors buffer
+  static uint32_t scale_factors[512] __attribute__((aligned(32))) = {0};
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // 6. Execute weight-stationary matmul in hardware
+  // Issue the one-shot marker before the loop
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, a_base, BANK_NUM * BANK_ROWS, k_LOOP_WS_CONFIG_SPAD_AB);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, 
+                       a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, 
+                       NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // 7. Drain final BF16 results from SMEM back to output DRAM buffer
+  // Need to account for the fact that output is BF16 but stored in uint64_t out_t (4 BF16 per word)
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+
+
+However, the code failed with the following output:
+=== STDOUT ===
+/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/auto_comp_test.c:37:35: error: expected ')' before '*' token
+/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/auto_comp_test.c:37:53: error: expected ')' before numeric constant
+make[1]: *** [/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/Makefile:145: auto_comp_test-baremetal] Error 1
+make: *** [Makefile:20: bareMetalC] Error 2
+|                                                     ^~~~~~~~~~~~
+/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/auto_comp_test.c:113:19: note: in expansion of macro 'scale_factors'
+113 |   static uint32_t scale_factors[512] __attribute__((aligned(32))) = {0};
+|                   ^~~~~~~~~~~~~
+/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/auto_comp_test.c:132:44: warning: passing argument 2 of 'full_is_equal' from incompatible pointer type [-Wincompatible-pointer-types]
+132 |     if (!full_is_equal(OUTPUT_MATRIX_NAME, gold)) {
+|                                            ^~~~
+|                                            |
+|                                            out_t (*)[1] {aka long unsigned int (*)[1]}
+/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/auto_comp_test.c:53:60: note: expected 'const out_t (*)[128]' {aka 'const long unsigned int (*)[128]'} but argument is of type 'out_t (*)[1]' {aka 'long unsigned int (*)[1]'}
+53 | int full_is_equal(out_t x[MATMUL_M][OUT_COLS], const out_t y[MATMUL_M][OUT_COLS]) {
+|                                                ~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~
+make[1]: Leaving directory '/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/bareMetalC'
+
+Please fix the code to address the errors while still applying the plan. Make sure to follow these rules:
+1. The Gemmini systolic array is 16 by 16.
+2. Elements in the scratchpad are 1 byte, and elements in the accumulator are 4 bytes.
+3. The scratchpad size is 256KB and the accumulator size is 64KB.
+4. The rewritten program should be semantically equivalent to the original program, within a small numerical tolerance.
+5. Keep the same function name and signature as the original program (helper functions can be renamed or deleted).
+6. The programming model sequence must be followed in order: gemmini_extended3_config_ex → gemmini_mx_load_scales (both A and B) → gemmini_mx_load_lut (if uselut=1) → mvin tiles to scratchpad → gemmini_mxquant_config_mvout → gemmini_loop_ws_spad → gemmini_mx_read_smem → gemmini_fence(); violating this order causes the accelerator to use stale/uninitialized scale, LUT, or format settings, producing silently incorrect results.
+7. DIM=16, BANK_NUM=4, BANK_ROWS=2048 (total 8192 scratchpad rows), ACC_ROWS=256, MAX_BLOCK_LEN=4 (scratchpad), MAX_BLOCK_LEN_ACC=1 (accumulator); any tile dimension, address, or block-length calculation using different values produces incorrect memory layout, out-of-bounds access, or corrupted data.
+8. elem_t is uint8_t (1 byte) and acc_t is uint64_t (8 bytes); any pointer arithmetic, sizeof, or stride calculation treating these as different widths produces incorrect mvin/mvout addresses and wrong results.
+9. gemmini_fence() must be issued after gemmini_mx_read_smem and before the host reads the DRAM output buffer; omitting the fence causes the host to observe partially written or stale data, producing incorrect results.
+10. Wrap the generated code with ``` at the beginning and ``` at the end.
+11. gemmini_mx_load_scales sel must be 0 for A (activation) scales and 1 for B (weight) scales; gemmini_mx_load_lut uses the opposite convention, sel 0 for B LUT, 1 for A LUT, 2 for C LUT; swapping selectors loads scale/LUT into the wrong hardware buffer, producing silently incorrect matmul results.
+12. gemmini_mxquant_config_mvout must be called with i_bound=tiles_I, j_bound=tiles_J, k_bound=tiles_K matching the actual tile dimensions used in the subsequent gemmini_loop_ws_spad; a mismatch causes the requantizer to operate on wrong tile boundaries, producing silently incorrect quantized output.
+13. The act_mx_fmt, wgt_mx_fmt, and out_mx_fmt fields in gemmini_extended3_config_ex must match the actual MX format of the data being loaded, and uselut must be set to 1 when fp6 or fp4 LUT-based dequantization is required; a format mismatch or uselut=0 causes the systolic array to misinterpret operand bit patterns or bypass the LUT, producing silently incorrect results.
+14. gemmini_loop_ws_spad (not gemmini_loop_ws) must be used when operands are already in the scratchpad; funct 24 (LOOP_WS_CONFIG_SPAD_AB) must be re-issued before every gemmini_loop_ws_spad call because the mx_loop_spad_marker is one-shot; omitting either causes the hardware to attempt DRAM loads from invalid addresses or use stale configuration, producing incorrect results or a runtime fault.
+
+Fixed code:

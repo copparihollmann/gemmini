@@ -1,0 +1,182 @@
+An elegant and highly effective optimization plan to significantly reduce latency is to apply **Strategy 4: Active-Row Pipelining for Softmax and Gemmini**.
+
+### Optimization Plan
+
+1. **Preload and Hold Weights ($K^T$ and $V$) in Scratchpad**:
+   Instead of loading the weights $K^T$ and $V$ inside separate, disjoint matmul calls, we can exploit the spacious 256KB scratchpad (8192 rows) to host both $K^T$ and $V$ simultaneously.
+   - $K^T$ ($64 \times 128$) requires $4 \times 8 \times 16 = 512$ rows. We place it at the top of the scratchpad: $[7680, 8192)$.
+   - $V$ ($128 \times 64$) requires $8 \times 4 \times 16 = 512$ rows. We place it directly below $K^T$: $[7168, 7680)$.
+   - We load both matrices exactly once at the beginning of the function.
+
+2. **Interleaved Row-Block Pipelining (Active-Row Pipelining)**:
+   We partition the $128$ rows into $8$ sub-blocks of $16$ rows each (matching the hardware tile size `DIM=16`). We loop $i$ from $0$ to $7$:
+   - **Step A (Matmul 1 block $i$)**: 
+     - MVIN $16$ rows of $Q$ into scratchpad base `0`.
+     - Execute `gemmini_loop_ws_spad` with `tiles_I = 1`, `tiles_J = 8`, `tiles_K = 4`, using `B_end_addr = 8192`.
+     - Drain the $16 \times 128$ slice of $S1$ to DRAM using `gemmini_mx_read_smem` followed by a `gemmini_fence()`.
+   - **Step B (Softmax block $i$)**: 
+     - Immediately run the host-side integer Softmax on the $16$ rows of $S1$ just loaded. This avoids waiting for the entire matrix and keeps intermediate data hot in the L1/L2 cache.
+     - The output $P\_q$ slice ($16 \times 128$) is written to DRAM.
+   - **Step C (Matmul 2 block $i$)**:
+     - MVIN $16$ rows of $P\_q$ into scratchpad base `0`.
+     - Execute `gemmini_loop_ws_spad` with `tiles_I = 1`, `tiles_J = 4`, `tiles_K = 8`, using `B_end_addr = 7680` (to target $V$ at $[7168, 7680)$).
+     - Drain the $16 \times 64$ slice of $O$ to DRAM via `gemmini_mx_read_smem` followed by a `gemmini_fence()`.
+
+This reduces DRAM transfers of large weights to a single load, eliminates massive intermediate synchronization barriers, and pipelines the host Softmax execution directly with hardware matmul steps.
+
+### Rewritten Program
+
+```c
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+
+#define GEMMINI_SF_MEM 0x40088000
+#define GEMMINI_SF_MEM_A (GEMMINI_SF_MEM + 0x2000)
+#define GEMMINI_SF_MEM_B GEMMINI_SF_MEM
+#define SMEM 0x40000000
+
+#define DIM 16
+#define ADDR_LEN 32
+
+#define BF16_PER_WORD 4
+
+// S=128, D=64
+#define ATT_S 128
+#define ATT_D 64
+#define GROUPS_S 4
+#define S_OUT_COLS (ATT_S / BF16_PER_WORD)
+#define D_OUT_COLS (ATT_D / BF16_PER_WORD)
+
+typedef uint8_t  elem_t;   // fp8:e4m3 input elements
+typedef uint64_t out_t;    // 4x bf16 packed per word
+
+extern elem_t Q_in[ATT_S][ATT_D];
+extern elem_t KT_in[ATT_D][ATT_S];
+extern elem_t V_in[ATT_S][ATT_D];
+extern uint8_t Q_scales_row[GROUPS_S][ATT_S];
+extern uint8_t KT_scales_col[GROUPS_S][ATT_S];
+extern uint8_t V_scales_col[GROUPS_S][ATT_D];
+extern out_t S1_hw[ATT_S][S_OUT_COLS];
+extern out_t O_hw[ATT_S][D_OUT_COLS];
+extern uint8_t P_scales[GROUPS_S][ATT_S];
+extern elem_t P_q[ATT_S][ATT_S];
+extern uint8_t scale_factors[10000];
+
+// Helper functions declared in the test environment
+int64_t mx_ibf16_to_q(uint16_t x);
+int64_t mx_iexp(int64_t x);
+int mx_ilog2(uint64_t x);
+elem_t mx_ienc_fp8(int64_t p, uint64_t inv_sm, int ls, int e);
+
+void solution(void) {
+  gemmini_flush(0);
+
+  // ---- 1) Preload KT and V to unique scratchpad locations ----
+  // KT goes to [7680, 8192)
+  gemmini_config_ld(ATT_S * sizeof(elem_t));
+  for (int k = 0; k < 4; k++) {
+    for (int j = 0; j < 8; j++) {
+      elem_t *dram_ptr = ((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM;
+      uint32_t sp_addr = 7680 + (k * 8 + j) * DIM;
+      gemmini_extended_mvin((void*)dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  // V goes to [7168, 7680)
+  gemmini_config_ld(ATT_D * sizeof(elem_t));
+  for (int k = 0; k < 8; k++) {
+    for (int j = 0; j < 4; j++) {
+      elem_t *dram_ptr = ((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM;
+      uint32_t sp_addr = 7168 + (k * 4 + j) * DIM;
+      gemmini_extended_mvin((void*)dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+  gemmini_fence();
+
+  // ---- 2) Interleaved Active-Row Block Loop ----
+  for (int i = 0; i < 8; i++) {
+    // ---- Step A: S1_sub = Q_sub @ KT ----
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&Q_scales_row, sizeof(Q_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&KT_scales_col, sizeof(KT_scales_col), 1);
+
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int k = 0; k < 4; k++) {
+      elem_t *dram_ptr = ((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM;
+      uint32_t sp_addr = 0 + k * DIM;
+      gemmini_extended_mvin((void*)dram_ptr, sp_addr, DIM, DIM);
+    }
+
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, 1, 8, 4, 0, 0, 1);
+    gemmini_loop_ws_spad(1, 8, 4, 0, 0, 0, 0, 8192, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[i * 16][0], SPAD_DEST * 16, 16 * ATT_S);
+    gemmini_fence();
+
+    // ---- Step B: Softmax on active sub-block (16 rows) ----
+    for (int row = i * 16; row < (i + 1) * 16; row++) {
+      int64_t q[ATT_S];
+      int64_t mq = -((int64_t)1 << 62);
+      for (int j = 0; j < ATT_S; j += 4) {
+        uint64_t w = S1_hw[row][j / 4];
+        for (int l = 0; l < 4; l++) {
+#if ATT_CAUSAL
+          if (j + l > row) { q[j + l] = -((int64_t)1 << 62); continue; }
+#endif
+          int64_t qq = mx_ibf16_to_q((uint16_t)((w >> (l * 16)) & 0xFFFF));
+          q[j + l] = qq; if (qq > mq) mq = qq;
+        }
+      }
+      int64_t p[ATT_S];
+      int64_t sm = 0;
+      int64_t gmax_arr[GROUPS_S];
+      for (int g = 0; g < GROUPS_S; g++) {
+        int64_t gmax = 0;
+        for (int j = g * 32; j < (g + 1) * 32; j++) {
+          int64_t pv = mx_iexp(q[j] - mq);
+          p[j] = pv; sm += pv;
+          if (pv > gmax) gmax = pv;
+        }
+        gmax_arr[g] = gmax;
+      }
+      int ls = mx_ilog2((uint64_t)sm);
+      uint64_t inv_sm = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;
+      for (int g = 0; g < GROUPS_S; g++) {
+        int64_t gmax = gmax_arr[g];
+        if (gmax == 0) {
+          P_scales[g][row] = 0;
+          for (int j = g * 32; j < (g + 1) * 32; j++) P_q[row][j] = 0;
+          continue;
+        }
+        int e = mx_ilog2((uint64_t)gmax) - ls - MX_P_TARGET_LOG2;
+        P_scales[g][row] = (uint8_t)(e + 127);
+        for (int j = g * 32; j < (g + 1) * 32; j++) {
+          P_q[row][j] = mx_ienc_fp8(p[j], inv_sm, ls, e);
+        }
+      }
+    }
+
+    // ---- Step C: O_sub = P_sub @ V ----
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+    gemmini_mx_load_scales((uint64_t)&V_scales_col, sizeof(V_scales_col), 1);
+
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int k = 0; k < 8; k++) {
+      elem_t *dram_ptr = ((elem_t*)P_q) + i * DIM * ATT_S + k * DIM;
+      uint32_t sp_addr = 0 + k * DIM;
+      gemmini_extended_mvin((void*)dram_ptr, sp_addr, DIM, DIM);
+    }
+
+    gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, 1, 4, 8, 0, 0, 1);
+    gemmini_loop_ws_spad(1, 4, 8, 0, 0, 0, 0, 7680, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[i * 16][0], SPAD_DEST * 16, 16 * ATT_D);
+    gemmini_fence();
+  }
+}
+```

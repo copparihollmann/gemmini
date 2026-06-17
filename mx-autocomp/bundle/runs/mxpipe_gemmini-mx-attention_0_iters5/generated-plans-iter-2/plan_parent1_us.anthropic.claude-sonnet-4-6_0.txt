@@ -1,0 +1,115 @@
+## Analysis
+
+Looking at the code, I need to identify which strategy applies best.
+
+**Strategy 8: Hoist the identical `gemmini_extended3_config_ex` call outside both matmul blocks**
+
+The code has two matmul blocks (Q@K^T and P@V), each starting with:
+```c
+gemmini_flush(0);
+gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+```
+
+The `gemmini_extended3_config_ex` call is **identical** in both blocks — same dataflow (WEIGHT_STATIONARY), same format fields (act=0, wgt=0, out=3, uselut=0), same strides, same transposes. This configuration is invariant across both matmuls. Issuing it twice wastes instruction overhead.
+
+However, the `gemmini_flush(0)` in block 2 resets state, so the config from block 1 would be lost. The second `gemmini_flush` is also unnecessary since after the first matmul completes (with `gemmini_fence()`), the accelerator is already idle. But flushing also resets the MX state, so we can eliminate the second flush as well — the pipeline is already drained after `gemmini_fence()`.
+
+**Plan:**
+1. Keep `gemmini_flush(0)` only once at the very beginning (before block 1).
+2. Issue `gemmini_extended3_config_ex(...)` exactly once before block 1, outside both matmul blocks.
+3. Remove both the `gemmini_flush(0)` and `gemmini_extended3_config_ex(...)` from inside block 2.
+4. The programming model sequence is preserved within each block: scales are loaded after the config, then mvins, then mxquant_config_mvout, then loop_ws_spad, then read_smem, then fence.
+
+This is safe because:
+- The `gemmini_fence()` at the end of block 1 ensures the accelerator is fully idle before block 2 starts.
+- No intervening instruction modifies the CONFIG_EX state between the two blocks.
+- The format (act=0, wgt=0, out=3, uselut=0), dataflow, and strides are all identical.
+
+## Rewritten Code
+
+```c
+void solution(void) {
+  // Hoist flush and config_ex outside both matmul blocks — format fields
+  // (act=0, wgt=0, out=3, uselut=0) and dataflow are invariant across Q@K^T and P@V.
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_mx_load_scales((uint64_t)&Q_scales_row, sizeof(Q_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&KT_scales_col, sizeof(KT_scales_col), 1);
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int j = 0; j < tiles_J; j++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+    gemmini_fence();
+  }
+
+  // ---- 2) P = softmax(S1) rows on CPU; quantize to fp8 + per-32-group scales ----
+  for (int i = 0; i < ATT_S; i++) {
+    float row[ATT_S];
+    float maxv = -1e30f;
+    for (int j = 0; j < ATT_S; j++) {
+      uint16_t b = (uint16_t)((S1_hw[i][j / 4] >> ((j % 4) * 16)) & 0xFFFF);
+      row[j] = bf16_to_f(b);
+      if (row[j] > maxv) maxv = row[j];
+    }
+    float sum = 0.0f;
+    for (int j = 0; j < ATT_S; j++) { row[j] = exp_f(row[j] - maxv); sum += row[j]; }
+    float inv_sum = 1.0f / sum;
+    for (int j = 0; j < ATT_S; j++) row[j] *= inv_sum;
+    for (int g = 0; g < GROUPS_S; g++) {
+      float gmax = 0.0f;
+      for (int j = g * 32; j < (g + 1) * 32; j++)
+        if (f_abs(row[j]) > gmax) gmax = f_abs(row[j]);
+      int e = 0;
+      if (gmax > 0.0f) e = f_exp(gmax / 16.0f) + 1;
+      float inv_scale = pow2i(-e);
+      P_scales[g][i] = (uint8_t)(e + 127);
+      for (int j = g * 32; j < (g + 1) * 32; j++)
+        P_q[i][j] = fp8_e4m3_rtz(row[j] * inv_scale);
+    }
+  }
+
+  // ---- 3) O = P @ V on Gemmini (bf16 out) ----
+  // gemmini_flush and gemmini_extended3_config_ex are hoisted above; state is
+  // preserved after gemmini_fence() — no flush or reconfig needed here.
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+    gemmini_mx_load_scales((uint64_t)&V_scales_col, sizeof(V_scales_col), 1);
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int j = 0; j < tiles_J; j++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+    gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+    gemmini_fence();
+  }
+}
+```

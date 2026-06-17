@@ -1,0 +1,90 @@
+## Analysis
+
+Looking at the original code, I can identify the key inefficiency related to **strategy 9**: the `gemmini_config_st`, and `gemmini_mxquant_config_mvout` calls are placed **after** the mvin loops but more importantly, `gemmini_config_ld` is issued **twice** with different strides (once for A, once for B), and these configuration calls are interleaved between the A-mvin loop and the B-mvin loop.
+
+However, the most impactful strategy here is **strategy 7**: `gemmini_config_ld` for A stride and B stride are issued separately between the loops. While this is already somewhat sequential, the deeper issue is that **all configuration (config_st, mxquant_config_mvout) is placed after the mvin loops but before compute**, which is acceptable. But looking more carefully at the actual bottleneck:
+
+The code has `gemmini_config_ld(MATMUL_K * sizeof(elem_t))` for A tiles, then the A mvin loop, then `gemmini_config_ld(MATMUL_N * sizeof(elem_t))` for B tiles. The `gemmini_config_st` and `gemmini_mxquant_config_mvout` are issued after all mvins. **Strategy 9** specifically targets hoisting all config calls before mvin loops to avoid pipeline bubbles.
+
+## Plan: Apply Strategy 9
+
+**Hoist `gemmini_config_ld` (for both A and B strides), `gemmini_config_st`, and `gemmini_mxquant_config_mvout` to before any mvin loop.**
+
+### Specific Changes:
+
+1. Move `gemmini_config_ld(MATMUL_K * sizeof(elem_t))` (A stride config) to immediately after the scale loads and before any mvin.
+
+2. The B stride config `gemmini_config_ld(MATMUL_N * sizeof(elem_t))` must remain before the B mvin loop since it uses a different stride — this is inherently a port-switch. However, we can **also** hoist `gemmini_config_st` and `gemmini_mxquant_config_mvout` to before the A mvin loop entirely. This way the hardware command queue sees: [config_st, config_mxquant, config_ld_A, mvin_A..., config_ld_B, mvin_B..., loop_ws_spad] — no configuration instructions break up the mvin streams.
+
+3. Move `SPAD_DEST` definition and `gemmini_config_st(DIM * sizeof(elem_t))` and `gemmini_mxquant_config_mvout(...)` to before the first mvin loop.
+
+### Resulting Code:
+
+```c
+void solution(void) {
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+#ifdef SPIKE_SIM
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+#else
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
+#endif
+
+  // ---- Hoist all configuration before mvin loops ----
+  int SPAD_DEST = 0;
+  gemmini_config_st(DIM * sizeof(elem_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // ---- MVIN A: tile (i,k) -> a_base + (i*tiles_K + k)*DIM ----
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  // ---- MVIN B: tile (k,j) -> b_base + (k*tiles_J + j)*DIM ----
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j++) {
+      elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+      gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  // ---- Compute ----
+  gemmini_loop_ws_spad(
+      tiles_I, tiles_J, tiles_K,
+      0, 0, 0,
+      a_base,
+      BANK_NUM * BANK_ROWS,
+      0,
+      SPAD_DEST,
+      false, false,
+      false, false, false,
+      NO_ACTIVATION,
+      0, 0,
+      false,
+      0x38);
+
+  gemmini_fence();
+
+#ifdef SPIKE_SIM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+#else
+  for (int i = 0; i < tiles_J*tiles_I*2; i++) {
+      gemmini_mvout((void*)((uint64_t*) C_hw + i*2*DIM), SPAD_DEST + i*DIM);
+  }
+  gemmini_fence();
+#endif
+  gemmini_fence();
+}
+```
+
+**Why this helps:** By hoisting `gemmini_config_st` and `gemmini_mxquant_config_mvout` before the mvin loops, the hardware command queue receives a clean uninterrupted stream of mvin commands for both A and B after the initial configuration burst. No pipeline bubble is inserted between the A-mvin stream and B-mvin stream (only the necessary `config_ld` stride switch remains, which is unavoidable). The `loop_ws_spad` instruction then finds all configuration already committed, eliminating any stall between the last mvin and the compute launch.

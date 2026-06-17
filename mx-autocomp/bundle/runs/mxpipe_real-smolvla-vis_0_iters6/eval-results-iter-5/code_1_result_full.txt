@@ -1,0 +1,719 @@
+{'correct': False, 'test_results': {0: False}, 'compiled': True, 'stdout': 'Kernel produced an INCORRECT/illegal result on spike. Diagnostic (fix this before optimizing):
+Gemmini extension configured with:
+dim = 16
+Generated implementation latency: 7822 cycles
+Incorrect result'}
+Prev latency: 7766
+New latency: N/A
+Plan: ## Analysis
+
+Looking at the code, I need to identify which strategy provides the most benefit.
+
+**Current structure:**
+- Outer loop: `j0` (B blocks)
+- Inner loop: `i0` (A blocks)
+- B tiles are loaded once per `j0` (already hoisted)
+- After `gemmini_loop_ws_spad`, we do `gemmini_mx_read_smem` row by row, then `gemmini_fence()`
+- Then the next `i0` iteration starts with `gemmini_flush`, config, scale loads, A mvin, etc.
+
+**Strategy 4: Pipeline B-tile mvin for next j0 with current j0 compute**
+
+Currently, after `gemmini_loop_ws_spad` completes for all `i0` iterations of a given `j0`, the next `j0` iteration starts by loading B tiles. During the output drain (`gemmini_mx_read_smem` calls), the DMA engine could be loading B tiles for the *next* `j0` block simultaneously.
+
+The idea: after the last `i0` iteration's `gemmini_loop_ws_spad` (but before the last `gemmini_fence`), issue the B mvin for the *next* `j0` block. This overlaps:
+- Next `j0`'s B-tile DMA loads
+- Current output's `gemmini_mx_read_smem` drain
+
+## Plan
+
+1. **Restructure the `j0` loop** to separate B-tile loading from the start of the loop body into a "pre-issue" pattern.
+
+2. **Before the `j0` loop begins**, pre-load B tiles for `j0=0`.
+
+3. **Inside the `j0` loop**, after processing all `i0` iterations (after `gemmini_loop_ws_spad` for the last `i0`, before or interleaved with `gemmini_mx_read_smem`):
+   - Issue B mvin for `j0+1` (if it exists) immediately after `gemmini_loop_ws_spad`
+   - Then issue `gemmini_mx_read_smem` + `gemmini_fence()`
+   
+   This way, the B DMA for the next block overlaps with the output drain latency of the current block.
+
+4. **Concretely**, the loop body becomes:
+   - Use "already loaded B tiles" (pre-loaded from previous iteration or pre-loop)
+   - For each `i0`: configure, load scales, mvin A, config mvout, compute
+   - After the last `i0`'s `gemmini_loop_ws_spad` and before/during `gemmini_mx_read_smem`: issue B mvin for `j0+1`
+   - Then `gemmini_mx_read_smem` + `gemmini_fence()` for all `i0` outputs
+
+   Wait — but `gemmini_mx_read_smem` must come right after `gemmini_loop_ws_spad` for each `i0` iteration (the smem gets overwritten each iteration). So we can only pipeline B-load for `j0+1` after the *last* `i0`'s drain.
+
+   Actually, looking more carefully: we issue B mvin for `j0+1` right after `gemmini_loop_ws_spad` of the last `i0` iteration, then do `gemmini_mx_read_smem` + `gemmini_fence()`. The B DMA and the smem read overlap in hardware.
+
+**Specific code changes:**
+
+- Extract B-tile mvin into a helper lambda/inline block parameterized by `j0`
+- Pre-load B for `j0=0` before the loop
+- At the end of each `j0` iteration (after the last `i0`'s `gemmini_loop_ws_spad`, before `gemmini_mx_read_smem`), issue B mvin for `j0+1`
+- Skip the B mvin at the top of the `j0` loop (it's already loaded from previous iteration's pre-issue)
+- Use `gemmini_config_ld(MATMUL_N * sizeof(elem_t))` before the pre-issued B mvin (config persists, so only need to set it once per B-load group)
+
+This directly addresses strategy 4 and overlaps DMA with output drain latency, which should reduce the total wall-clock time by hiding B-load latency behind the `gemmini_mx_read_smem` calls.
+
+CodeCandidate(parent=CodeCandidate(parent=CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED outer-tiled MX matmul baseline (113x256x256).
+void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+   for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Partial last M/N block: compute only the real rows/cols, pad the rest.
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+      // PROF cpu_stage
+      // Stage only the tiny per-32-group scales; A/B data is mvin\'d DIRECTLY
+      // from DRAM (no host-side block memcpy — that was 98% of the cycles).
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+      // PROF accel
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K (full block-aligned tiles)
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+      for (int j = 0; j < tiles; j++)                    // B[k][j0*BLK+j] -> slot (k*tiles + j)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      // Accelerator-centric readout: per-row hardware DMA from smem straight into the
+      // bf16-packed row-major output (block-internal smem row stride is BLK).
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+}
+''',
+score=10608,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'CPU/host data staging detected (2 memcpy, ~0 scalar copy loops). Host staging is typically the dominant cost on this accelerator and autocomp cannot speed it up directly: mvin tiles STRIDED straight from the source DRAM arrays instead of copying through a host buffer, and keep partial sums in shared memory (bf16 accumulate) rather than accumulating on the CPU.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''## Strategy: Hoist B-tile mvin Outside the i0 Loop (Weight Reuse Across Row-Block Iterations)
+
+### Analysis of the Current Code
+
+In the current code, the outer loop structure is:
+
+```c
+for (int i0 = 0; i0 < BLOCKS_M; i0++)
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // ... mvin A tiles for this i0
+      // ... mvin B tiles for this j0   <-- B tiles loaded every (i0, j0) pair
+      // ... compute
+  }
+```
+
+For a fixed `j0`, the B tiles (weight matrix block) are **identical across all `i0` iterations**. B is `K × N` shaped, and the block at column `j0` does not change as we sweep over row-blocks `i0`. Yet the current code re-issues all `tiles * tiles_K` B-tile mvin commands on every `(i0, j0)` pair. With `BLOCKS_M` row-block iterations, each B column-block is loaded `BLOCKS_M` times unnecessarily.
+
+### Concrete Change
+
+Reorder the loop nest to **`j0` outer, `i0` inner**, and hoist the B-tile mvin (and the associated `gemmini_config_ld` for B\'s stride) outside the `i0` loop. B tiles are placed at the top of the scratchpad at `b_base`, which depends only on `tiles_K` and `tiles_J` (i.e., only on the tile counts, not on `i0`). Since B occupies the top of the scratchpad and A occupies the bottom, and the scratchpad is large enough to hold all A+B tiles for one `(i0, j0)` block simultaneously, the layout is valid for every `i0` iteration within the same `j0`.
+
+The scale loads must also be reorganized: B scales (`B_s`) are loaded once per `j0`, outside the `i0` loop. A scales (`A_s`) are loaded once per `i0`, inside the `j0` loop but before compute — this is safe because `gemmini_mx_load_scales` for A (sel=0) does not disturb the B scale buffer (sel=1), and vice versa.
+
+### Why This Works
+
+- `b_base = BANK_NUM*BANK_ROWS - tiles*tiles_K*DIM` is a fixed address that depends only on tile geometry, not on `i0` or `j0`. The same B tiles at the same scratchpad addresses are valid inputs for every `i0` iteration.
+- The scratchpad constraint `(tiles_I*tiles_K + tiles_J*tiles_K)*DIM ≤ 8192` holds for the same tile counts regardless of loop order.
+- `gemmini_loop_ws_spad` reads B from `BANK_NUM*BANK_ROWS` (the top sentinel), so B simply needs to be present before each `gemmini_loop_ws_spad` call — which it is, since it was loaded before the `i0` loop.
+- The `mx_loop_spad_marker` (funct 24) is still re-issued before every `gemmini_loop_ws_spad` call inside the `i0` loop, satisfying the one-shot marker requirement.
+
+### Expected Improvement
+
+Each B column-block is loaded `tiles * tiles_K` mvin instructions per `(i0, j0)` pair. After the transformation, those mvins execute **once per `j0`** rather than **`BLOCKS_M` times per `j0`**. For `MATMUL_M=113`, `BLK=16` (so `tiles=1`), `MATMUL_K=256` (so `tiles_K=16`), and `BLOCKS_M=8`, this reduces B mvin count from `8 × 16 = 128` to `16` per `j0` column-block — an 8× reduction in B data movement, which is the dominant mvin cost for weight-stationary workloads.
+
+### Implementation
+
+```c
+// AUTO-GENERATED outer-tiled MX matmul baseline (113x256x256).
+void solution(void) {
+  int tiles   = BLK / DIM;
+  int tiles_K = MATMUL_K / DIM;
+
+  // b_base depends only on tile geometry, not on i0/j0 — fixed for all blocks.
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+  uint32_t a_base = 0;
+  int SPAD_DEST = 128;
+
+  // Reorder: j0 outer so B tiles can be hoisted; i0 inner sweeps rows.
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    int ncols = REAL_N - j0 * BLK;
+    if (ncols > BLK) ncols = BLK;
+    if (ncols <= 0) continue;
+
+    // --- Load B scales ONCE per j0 (weight column-block is fixed across all i0) ---
+    for (int g = 0; g < MATMUL_K / 32; g++)
+      memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+
+    // --- Mvin B tiles ONCE per j0 into the top of the scratchpad ---
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));   // B row stride = N
+    for (int j = 0; j < tiles; j++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin(
+          (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+          b_base + (k * tiles + j) * DIM, DIM, DIM);
+
+    for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      // --- Load A scales once per (i0, j0) — A sel=0 does not disturb B sel=1 ---
+      for (int g = 0; g < MATMUL_K / 32; g++)
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+
+      // PROF accel
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                  1, 1, 0, 0, false, 0, 0, 3, 0);
+
+      // Load A and B scales into hardware (B_s was already staged above).
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      // --- Mvin A tiles for this i0 ---
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));  // A row stride = K
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+      // B tiles are already in the scratchpad from the j0-level hoist above.
+
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                   tiles, tiles, tiles_K, 0, 0, 1);
+
+      // mx_loop_spad_marker is one-shot: issued inside gemmini_loop_ws_spad macro.
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0,
+                           a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                           false, false, false, false, false,
+                           NO_ACTIVATION, 0, 0, false, 0x38);
+
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(
+          &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+          SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+  }
+}
+```''',
+code='''// AUTO-GENERATED outer-tiled MX matmul baseline (113x256x256).
+void solution(void) {
+  int tiles   = BLK / DIM;
+  int tiles_K = MATMUL_K / DIM;
+
+  // b_base depends only on tile geometry, not on i0/j0 — fixed for all blocks.
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+  uint32_t a_base = 0;
+  int SPAD_DEST = 128;
+
+  // Reorder: j0 outer so B tiles can be hoisted; i0 inner sweeps rows.
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    int ncols = REAL_N - j0 * BLK;
+    if (ncols > BLK) ncols = BLK;
+    if (ncols <= 0) continue;
+
+    // --- Stage B scales ONCE per j0 (weight column-block is fixed across all i0) ---
+    for (int g = 0; g < MATMUL_K / 32; g++)
+      memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+
+    // --- Mvin B tiles ONCE per j0 into the top of the scratchpad ---
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));   // B row stride = N
+    for (int j = 0; j < tiles; j++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin(
+          (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+          b_base + (k * tiles + j) * DIM, DIM, DIM);
+
+    for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      // --- Stage A scales once per (i0, j0) — sel=0 does not disturb B sel=1 ---
+      for (int g = 0; g < MATMUL_K / 32; g++)
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+
+      // PROF accel
+      gemmini_flush(0);
+
+      // Step 1: Configure execution (must precede scale loads and mvins).
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                  1, 1, 0, 0, false, 0, 0, 3, 0);
+
+      // Step 2: Load A and B scales into hardware.
+      // sel=0 → mx_scale_a_mem (activations/A), sel=1 → mx_scale_b_mem (weights/B).
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      // Step 3: Mvin A tiles for this i0 row-block.
+      // B tiles are already resident in the scratchpad from the j0-level hoist.
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));  // A row stride = K
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+      // Step 4: Configure requantized mvout.
+      // i_bound=tiles, j_bound=tiles, k_bound=tiles_K must match gemmini_loop_ws_spad.
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                   tiles, tiles, tiles_K, 0, 0, 1);
+
+      // Step 5: Execute fused hardware matmul.
+      // mx_loop_spad_marker (funct 24) is one-shot and re-issued inside the macro
+      // before every gemmini_loop_ws_spad call.
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0,
+                           a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                           false, false, false, false, false,
+                           NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Step 6: Drain BF16 results from mx_smem to DRAM, row by row.
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(
+          &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+          SPAD_DEST * 16 + r * BLK, ncols);
+
+      // Step 7: Fence — ensures all mx_read_smem DMA writes are visible to the host.
+      gemmini_fence();
+    }
+  }
+}
+''',
+score=8771,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'CPU/host data staging detected (2 memcpy, ~0 scalar copy loops). Host staging is typically the dominant cost on this accelerator and autocomp cannot speed it up directly: mvin tiles STRIDED straight from the source DRAM arrays instead of copying through a host buffer, and keep partial sums in shared memory (bf16 accumulate) rather than accumulating on the CPU.'],
+plan_gen_model='global.anthropic.claude-sonnet-4-6',
+code_gen_model='global.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None),
+plan='''## Analysis of the Current Code
+
+The current code has **two `memcpy` calls** per `(i0, j0)` pair (one for A scales, one for B scales per outer loop) that copy scale factor slices into intermediate staging arrays `A_s` and `B_s`, which are then passed to `gemmini_mx_load_scales`. This is pure overhead:
+
+1. The `B_s` memcpy copies `B_scales_col[g][j0 * BLK ... j0*BLK + BLK-1]` into `B_s[g][0..BLK-1]` — done once per `j0`.
+2. The `A_s` memcpy copies `A_scales_row[g][i0 * BLK ... i0*BLK + BLK-1]` into `A_s[g][0..BLK-1]` — done once per `(i0, j0)`.
+
+The profiler confirmed: **2 memcpy calls, CPU/host data staging detected**, and this is identified as the dominant cost.
+
+## Selected Strategy: #6 — Eliminate Staging Arrays by Pointing Directly at Source Slices
+
+## Plan
+
+**The core idea:** `gemmini_mx_load_scales` accepts a raw DRAM address and length. Instead of copying scales into `A_s`/`B_s` and then passing those pointers, pass a pointer directly into the appropriate row/column slice of `A_scales_row`/`B_scales_col`.
+
+### Step 1: Understand the current layout
+
+- `A_scales_row` has shape `[MATMUL_K/32][REAL_M]` (or similar), indexed as `A_scales_row[g][i0 * BLK]` for group `g`, row-block `i0`.
+- `B_scales_col` has shape `[MATMUL_K/32][REAL_N]`, indexed as `B_scales_col[g][j0 * BLK]` for group `g`, column-block `j0`.
+- `A_S_BYTES` bytes are loaded for A; `B_S_BYTES` bytes for B.
+
+The memcpy gathers non-contiguous rows of `A_scales_row`/`B_scales_col` into a contiguous flat buffer. But if the per-block slice `A_scales_row[g][i0*BLK]` for all `g` is **already contiguous in memory** at the right stride, we can point directly at it.
+
+### Step 2: Verify contiguity
+
+`A_scales_row[g][i0 * BLK]` for `g = 0..MATMUL_K/32-1` is contiguous only if the second dimension (columns) equals `BLK` (which it does when the full matrix fits a single block column). However, in the outer-tiled case, `A_scales_row` has full-matrix width. The slice for a block is **not** contiguous across `g` rows.
+
+The memcpy currently extracts `BLK` elements from each row `g`. This non-contiguity is why staging was needed. **However**, we can replace the `memcpy` + `gemmini_mx_load_scales(A_s, A_S_BYTES, 0)` pattern with a **per-group direct pointer** approach: instead of loading all groups at once from a contiguous staging buffer, load each group\'s slice directly from `A_scales_row[g]` with a per-group call.
+
+### Step 3: Concrete changes
+
+**Remove** `A_s`, `B_s` staging arrays and their `memcpy` loops entirely.
+
+**For B scales** (currently in the `j0` loop, one `memcpy` per group):
+```c
+// OLD:
+for (int g = 0; g < MATMUL_K / 32; g++)
+    memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+// ... later:
+gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+// NEW: No staging, no memcpy. Pass pointer directly inside the i0 loop
+// (B scales load must precede each loop_ws_spad per programming model):
+// For each g, the slice &B_scales_col[g][j0*BLK] has BLK contiguous bytes.
+// We need all GK=MATMUL_K/32 groups loaded. Since they\'re not contiguous
+// in the full 2D array, issue GK individual load calls, each loading BLK bytes:
+for (int g = 0; g < MATMUL_K / 32; g++)
+    gemmini_mx_load_scales((uint64_t)&B_scales_col[g][j0 * BLK], BLK, 1);
+// Wait — this changes semantics unless hardware supports multi-call accumulation.
+```
+
+Actually, re-examining: `gemmini_mx_load_scales(dram_addr, len, sel)` streams `len` bytes sequentially into the scale memory. The hardware fills `mx_scale_b_mem[0..len-1]` from one call, then the next call would **overwrite from offset 0** unless the hardware appends. This makes multiple calls incorrect for non-contiguous slices.
+
+**Correct approach:** Ensure the source data IS contiguous by re-examining the array layout. Since `A_scales_row` is declared as `A_scales_row[GK][REAL_M]` in row-major order, the slice for block `i0` is `&A_scales_row[0][i0*BLK]` — but across `g` rows these are separated by `REAL_M` bytes each. They are NOT contiguous.
+
+**Therefore**: The right fix is to change the **data layout** from `[GK][REAL_M]` to `[REAL_M][GK]` (transpose the scale array) — but since `A_scales_row` comes from the header (golden data), we cannot change it.
+
+**Alternative**: Keep exactly one contiguous staging buffer per operand, but **hoist the B-scale staging and load outside the `i0` loop** (it\'s already outside — the `memcpy` is in `j0`), and for A scales, the staging happens inside `i0` (also correct). The issue is the cost of the memcpy itself.
+
+**The real fix**: Allocate `A_s` and `B_s` as flat 1D arrays matching the hardware\'s expected layout (row-major: `[g * BLK + lane]`), which they already are. The memcpy cost is unavoidable *only if* the source is non-contiguous.
+
+**Key insight from strategy #6**: The B-scale staging (`memcpy` into `B_s`, then `gemmini_mx_load_scales(B_s)`) happens in the `j0` loop — once per `j0`. We can instead compute the pointer to the contiguous per-block slice differently. If `B_scales_col` is stored as `[GK][N_full]`, the slice `B_scales_col[g][j0*BLK .. j0*BLK+BLK-1]` is indeed contiguous *within one row* but not across `g` rows.
+
+**However**, examining more carefully: `A_S_BYTES = (MATMUL_K/32) * BLK` total bytes loaded. The staging array `A_s[GK][BLK]` is exactly `GK * BLK` bytes, laid out as `A_s[0][0..BLK-1], A_s[1][0..BLK-1], ...` — i.e., group-major, block-minor. The hardware scale memory indexing is `scale_dram + m * N_blocks + bi` — so row-major in (output-row, k-group) order.
+
+### Revised Plan (Practical and Correct)
+
+The **B-scale memcpy is in the `j0` loop** and is done once per `j0` iteration, shared across all `i0`. This is already hoisted optimally for B. But it\'s still a `memcpy`.
+
+For **A scales**, the `memcpy` runs every `(i0, j0)` pair — `BLOCKS_M * BLOCKS_N` times total. This is the hot path.
+
+**Strategy #6 applied correctly**: If `A_scales_row` is stored as `[GK][M_full]` with `M_full` being a multiple of `BLK`, then for a given `i0`, the data needed is `A_scales_row[g][i0*BLK]` for `g=0..GK-1` — these are at byte offsets `g * M_full + i0*BLK` in the flat array. They are NOT a contiguous block.
+
+**But** — if `M_full == BLK` (i.e., `REAL_M <= BLK` and there\'s only one row-block), the entire A scale array IS contiguous and no staging is needed. Similarly if `N_full == BLK` for B.
+
+For the general case with multiple blocks: **create a transposed layout** at initialization time (once, before the loop), or accept that staging is needed. But strategy #6 says "eliminate the intermediate staging arrays entirely by pointing directly using pointer arithmetic."
+
+This is valid **when the slice is contiguous** — which happens when loading B scales for a fixed `j0` across all `g` from a column-major layout, or when the problem dimensions equal BLK.
+
+**Practical plan that applies strategy #6 as stated:**
+
+Replace the per-`(i0,j0)` `memcpy` of A-scales and per-`j0` `memcpy` of B-scales with a **one-time transposition** of the scale arrays into a pre-transposed layout before the loop, so that the per-block slice IS contiguous. Then point `gemmini_mx_load_scales` directly at the pre-transposed data.
+
+Specifically:
+1. Before the `j0/i0` loops, create `A_scales_T[BLOCKS_M][GK * BLK]` and `B_scales_T[BLOCKS_N][GK * BLK]` once (or use flat arrays).
+2. For each block `i0`, `A_scales_T[i0]` is laid out as `[A_scales_row[0][i0*BLK .. i0*BLK+BLK-1], A_scales_row[1][i0*BLK..], ...]` — exactly what `A_s` was.
+3. Do this transposition **once** before the loops.
+4. Inside the loops, call `gemmini_mx_load_scales((uint64_t)A_scales_T[i0], A_S_BYTES, 0)` and `gemmini_mx_load_scales((uint64_t)B_scales_T[j0], B_S_BYTES, 1)` with no intermediate copy.
+
+This eliminates the per-iteration memcpy (hot path cost), replacing it with a one-time setup cost amortized across all `BLOCKS_M * BLOCKS_N` iterations. The `memcpy` total work is the same, but it becomes a single cache-warm sequential pass instead of scattered per-tile copies, and removes the staging copies from the critical timed path.
+
+## Summary of Changes
+
+1. **Before the `j0` loop**: Allocate and fill `A_scales_T[BLOCKS_M][A_S_BYTES]` and `B_scales_T[BLOCKS_N][B_S_BYTES]` by iterating over blocks and groups once.
+2. **Remove** the `memcpy` loops inside `j0` (for B) and inside `i0` (for A).
+3. **Replace** `gemmini_mx_load_scales((uint64_t)A_s, ...)` with `gemmini_mx_load_scales((uint64_t)A_scales_T[i0], ...)`.
+4. **Replace** `gemmini_mx_load_scales((uint64_t)B_s, ...)` with `gemmini_mx_load_scales((uint64_t)B_scales_T[j0], ...)`.
+5. **Remove** `A_s`, `B_s` local arrays and their per-iteration `memcpy` calls.
+
+This removes `2 * BLOCKS_M * BLOCKS_N` memcpy calls from the hot timed region, replacing them with pointer loads to pre-staged contiguous buffers.''',
+code='''// AUTO-GENERATED outer-tiled MX matmul baseline (113x256x256).
+// Optimization: pre-transpose scale arrays once before the loop nest,
+// eliminating per-iteration memcpy calls from the hot timed path.
+void solution(void) {
+  int tiles   = BLK / DIM;
+  int tiles_K = MATMUL_K / DIM;
+  int GK      = MATMUL_K / 32;
+
+  // b_base depends only on tile geometry, not on i0/j0 — fixed for all blocks.
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+  uint32_t a_base = 0;
+  int SPAD_DEST = 128;
+
+  // --- One-time pre-transposition of scale arrays into block-contiguous layout ---
+  // A_scales_T[i0] = [A_scales_row[0][i0*BLK..i0*BLK+BLK-1],
+  //                   A_scales_row[1][i0*BLK..i0*BLK+BLK-1], ...]
+  // B_scales_T[j0] = [B_scales_col[0][j0*BLK..j0*BLK+BLK-1],
+  //                   B_scales_col[1][j0*BLK..j0*BLK+BLK-1], ...]
+  // Each block\'s data is contiguous: GK * BLK bytes total per block.
+
+  static uint8_t A_scales_T[BLOCKS_M][A_S_BYTES];
+  static uint8_t B_scales_T[BLOCKS_N][B_S_BYTES];
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int g = 0; g < GK; g++) {
+      memcpy(&A_scales_T[i0][g * BLK],
+             &A_scales_row[g][i0 * BLK],
+             BLK);
+    }
+  }
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    for (int g = 0; g < GK; g++) {
+      memcpy(&B_scales_T[j0][g * BLK],
+             &B_scales_col[g][j0 * BLK],
+             BLK);
+    }
+  }
+
+  // Reorder: j0 outer so B tiles can be hoisted; i0 inner sweeps rows.
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    int ncols = REAL_N - j0 * BLK;
+    if (ncols > BLK) ncols = BLK;
+    if (ncols <= 0) continue;
+
+    // --- Mvin B tiles ONCE per j0 into the top of the scratchpad ---
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));   // B row stride = N
+    for (int j = 0; j < tiles; j++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin(
+          (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+          b_base + (k * tiles + j) * DIM, DIM, DIM);
+
+    for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      // PROF accel
+      gemmini_flush(0);
+
+      // Step 1: Configure execution (must precede scale loads and mvins).
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                  1, 1, 0, 0, false, 0, 0, 3, 0);
+
+      // Step 2: Load A and B scales into hardware directly from pre-transposed buffers.
+      // sel=0 → mx_scale_a_mem (activations/A), sel=1 → mx_scale_b_mem (weights/B).
+      // No memcpy needed: A_scales_T[i0] and B_scales_T[j0] are already contiguous.
+      gemmini_mx_load_scales((uint64_t)A_scales_T[i0], A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_scales_T[j0], B_S_BYTES, 1);
+
+      // Step 3: Mvin A tiles for this i0 row-block.
+      // B tiles are already resident in the scratchpad from the j0-level hoist.
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));  // A row stride = K
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+      // Step 4: Configure requantized mvout.
+      // i_bound=tiles, j_bound=tiles, k_bound=tiles_K must match gemmini_loop_ws_spad.
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                   tiles, tiles, tiles_K, 0, 0, 1);
+
+      // Step 5: Execute fused hardware matmul.
+      // mx_loop_spad_marker (funct 24) is one-shot and re-issued inside the macro
+      // before every gemmini_loop_ws_spad call.
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0,
+                           a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                           false, false, false, false, false,
+                           NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Step 6: Drain BF16 results from mx_smem to DRAM, row by row.
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(
+          &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+          SPAD_DEST * 16 + r * BLK, ncols);
+
+      // Step 7: Fence — ensures all mx_read_smem DMA writes are visible to the host.
+      gemmini_fence();
+    }
+  }
+}
+''',
+score=7766,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'CPU/host data staging detected (2 memcpy, ~0 scalar copy loops). Host staging is typically the dominant cost on this accelerator and autocomp cannot speed it up directly: mvin tiles STRIDED straight from the source DRAM arrays instead of copying through a host buffer, and keep partial sums in shared memory (bf16 accumulate) rather than accumulating on the CPU.'],
+plan_gen_model='global.anthropic.claude-sonnet-4-6',
+code_gen_model='global.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None),
+plan='''## Analysis
+
+Looking at the code, I need to identify which strategy provides the most benefit.
+
+**Current structure:**
+- Outer loop: `j0` (B blocks)
+- Inner loop: `i0` (A blocks)
+- B tiles are loaded once per `j0` (already hoisted)
+- After `gemmini_loop_ws_spad`, we do `gemmini_mx_read_smem` row by row, then `gemmini_fence()`
+- Then the next `i0` iteration starts with `gemmini_flush`, config, scale loads, A mvin, etc.
+
+**Strategy 4: Pipeline B-tile mvin for next j0 with current j0 compute**
+
+Currently, after `gemmini_loop_ws_spad` completes for all `i0` iterations of a given `j0`, the next `j0` iteration starts by loading B tiles. During the output drain (`gemmini_mx_read_smem` calls), the DMA engine could be loading B tiles for the *next* `j0` block simultaneously.
+
+The idea: after the last `i0` iteration\'s `gemmini_loop_ws_spad` (but before the last `gemmini_fence`), issue the B mvin for the *next* `j0` block. This overlaps:
+- Next `j0`\'s B-tile DMA loads
+- Current output\'s `gemmini_mx_read_smem` drain
+
+## Plan
+
+1. **Restructure the `j0` loop** to separate B-tile loading from the start of the loop body into a "pre-issue" pattern.
+
+2. **Before the `j0` loop begins**, pre-load B tiles for `j0=0`.
+
+3. **Inside the `j0` loop**, after processing all `i0` iterations (after `gemmini_loop_ws_spad` for the last `i0`, before or interleaved with `gemmini_mx_read_smem`):
+   - Issue B mvin for `j0+1` (if it exists) immediately after `gemmini_loop_ws_spad`
+   - Then issue `gemmini_mx_read_smem` + `gemmini_fence()`
+   
+   This way, the B DMA for the next block overlaps with the output drain latency of the current block.
+
+4. **Concretely**, the loop body becomes:
+   - Use "already loaded B tiles" (pre-loaded from previous iteration or pre-loop)
+   - For each `i0`: configure, load scales, mvin A, config mvout, compute
+   - After the last `i0`\'s `gemmini_loop_ws_spad` and before/during `gemmini_mx_read_smem`: issue B mvin for `j0+1`
+   - Then `gemmini_mx_read_smem` + `gemmini_fence()` for all `i0` outputs
+
+   Wait — but `gemmini_mx_read_smem` must come right after `gemmini_loop_ws_spad` for each `i0` iteration (the smem gets overwritten each iteration). So we can only pipeline B-load for `j0+1` after the *last* `i0`\'s drain.
+
+   Actually, looking more carefully: we issue B mvin for `j0+1` right after `gemmini_loop_ws_spad` of the last `i0` iteration, then do `gemmini_mx_read_smem` + `gemmini_fence()`. The B DMA and the smem read overlap in hardware.
+
+**Specific code changes:**
+
+- Extract B-tile mvin into a helper lambda/inline block parameterized by `j0`
+- Pre-load B for `j0=0` before the loop
+- At the end of each `j0` iteration (after the last `i0`\'s `gemmini_loop_ws_spad`, before `gemmini_mx_read_smem`), issue B mvin for `j0+1`
+- Skip the B mvin at the top of the `j0` loop (it\'s already loaded from previous iteration\'s pre-issue)
+- Use `gemmini_config_ld(MATMUL_N * sizeof(elem_t))` before the pre-issued B mvin (config persists, so only need to set it once per B-load group)
+
+This directly addresses strategy 4 and overlaps DMA with output drain latency, which should reduce the total wall-clock time by hiding B-load latency behind the `gemmini_mx_read_smem` calls.''',
+code='''void solution(void) {
+  int tiles   = BLK / DIM;
+  int tiles_K = MATMUL_K / DIM;
+  int GK      = MATMUL_K / 32;
+
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+  uint32_t a_base = 0;
+  int SPAD_DEST = 128;
+
+  static uint8_t A_scales_T[BLOCKS_M][A_S_BYTES];
+  static uint8_t B_scales_T[BLOCKS_N][B_S_BYTES];
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int g = 0; g < GK; g++) {
+      memcpy(&A_scales_T[i0][g * BLK],
+             &A_scales_row[g][i0 * BLK],
+             BLK);
+    }
+  }
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    for (int g = 0; g < GK; g++) {
+      memcpy(&B_scales_T[j0][g * BLK],
+             &B_scales_col[g][j0 * BLK],
+             BLK);
+    }
+  }
+
+  // Helper: issue B mvin for a given j0 block into the scratchpad top.
+  // Assumes gemmini_config_ld(MATMUL_N * sizeof(elem_t)) has been set.
+#define ISSUE_B_MVIN(j0_val) \
+  do { \
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t)); \
+    for (int _j = 0; _j < tiles; _j++) \
+      for (int _k = 0; _k < tiles_K; _k++) \
+        gemmini_extended_mvin2( \
+          (void*)(((elem_t*)B_in) + (_k * DIM) * MATMUL_N + ((j0_val) * BLK + _j * DIM)), \
+          b_base + (_k * tiles + _j) * DIM, DIM, DIM); \
+  } while(0)
+
+  // Pre-load B tiles for j0=0 before the main loop.
+  {
+    int j0 = 0;
+    if (j0 < BLOCKS_N) {
+      int ncols = REAL_N - j0 * BLK;
+      if (ncols > BLK) ncols = BLK;
+      if (ncols > 0) {
+        ISSUE_B_MVIN(j0);
+      }
+    }
+  }
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    int ncols = REAL_N - j0 * BLK;
+    if (ncols > BLK) ncols = BLK;
+    if (ncols <= 0) continue;
+
+    // B tiles for this j0 are already in the scratchpad (pre-loaded from
+    // previous iteration\'s end or the pre-loop block above).
+
+    for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+      int is_last_i0 = (i0 == BLOCKS_M - 1) ||
+                       (REAL_M - (i0 + 1) * BLK <= 0);
+
+      // PROF accel
+      gemmini_flush(0);
+
+      // Step 1: Configure execution.
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                  1, 1, 0, 0, false, 0, 0, 3, 0);
+
+      // Step 2: Load A and B scales.
+      gemmini_mx_load_scales((uint64_t)A_scales_T[i0], A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_scales_T[j0], B_S_BYTES, 1);
+
+      // Step 3: Mvin A tiles for this i0 row-block.
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+      // Step 4: Configure requantized mvout.
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                   tiles, tiles, tiles_K, 0, 0, 1);
+
+      // Step 5: Execute fused hardware matmul.
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0,
+                           a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                           false, false, false, false, false,
+                           NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // After the last i0\'s compute for this j0, pre-issue B tiles for j0+1
+      // so that B DMA overlaps with the output drain below.
+      if (is_last_i0) {
+        int next_j0 = j0 + 1;
+        if (next_j0 < BLOCKS_N) {
+          int next_ncols = REAL_N - next_j0 * BLK;
+          if (next_ncols > BLK) next_ncols = BLK;
+          if (next_ncols > 0) {
+            ISSUE_B_MVIN(next_j0);
+          }
+        }
+      }
+
+      // Step 6: Drain BF16 results from mx_smem to DRAM, row by row.
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(
+          &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+          SPAD_DEST * 16 + r * BLK, ncols);
+
+      // Step 7: Fence.
+      gemmini_fence();
+    }
+  }
+
+#undef ISSUE_B_MVIN
+}
+''',
+score=None,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='global.anthropic.claude-sonnet-4-6',
+code_gen_model='global.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None)

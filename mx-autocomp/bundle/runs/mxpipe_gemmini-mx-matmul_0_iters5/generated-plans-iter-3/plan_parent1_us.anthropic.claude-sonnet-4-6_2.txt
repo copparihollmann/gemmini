@@ -1,0 +1,108 @@
+## Analysis of the Current Code
+
+Looking at the current code, I notice the **B tile layout in the scratchpad uses a different indexing than A tiles**. The reference pattern lays B tiles as `b_base + (j*tiles_K + k)*DIM`, but the current code uses `gemmini_block_mvin` with B indexed as `b_base + k*tiles_J*DIM` (iterating k outer, j inner via block_mvin).
+
+More importantly, I see a concrete inefficiency: **the `lut_update_granularity` parameter in `gemmini_mxquant_config_mvout` is set to 1**, meaning the requantizer refreshes the output LUT at every single tile during the post-compute requantization pass. Since the total number of output tiles is `tiles_I * tiles_J = 4 * 4 = 16`, setting `lut_update_granularity = 16` (or any value ≥ 16) would refresh the LUT only once for the entire output, eliminating 15 unnecessary LUT refresh operations.
+
+## Strategy: Maximize `lut_update_granularity` to Minimize Requantizer LUT Refresh Overhead
+
+**What:** Change `lut_update_granularity` from `1` to `tiles_I * tiles_J` (= 16 for this 64×64 problem).
+
+**Why it improves performance:** The `lut_update_granularity` G parameter controls how often the requantizer rebuilds its internal LUT during the output write-back phase. With G=1, it rebuilds after every output tile. With G=16, it rebuilds once at the start. Since this is a single monolithic call to `gemmini_loop_ws_spad` with fixed format (fp8→bf16), the LUT content is identical across all tiles — the refresh is redundant overhead. Fewer refreshes = fewer stall cycles during the requant drain phase.
+
+```c
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+#include "include/matmul_fp8_64x64.h"
+
+void solution(void) {
+    // Tile counts
+    const int tiles_I = MATMUL_M / DIM;  // 4
+    const int tiles_J = MATMUL_N / DIM;  // 4
+    const int tiles_K = MATMUL_K / DIM;  // 4
+
+    // Scratchpad layout
+    const uint32_t a_base    = 0;
+    const uint32_t b_base    = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    const uint32_t SPAD_DEST = 128;
+
+    // -----------------------------------------------------------------------
+    // 1. Configure execution (fp8 e4m3 inputs, BF16 output, weight-stationary)
+    // -----------------------------------------------------------------------
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+        /*C_stride*/1, /*A_stride*/1,
+        /*A_transpose*/0, /*B_transpose*/0,
+        /*set_only_strides*/false,
+        /*act_mx_fmt*/0, /*wgt_mx_fmt*/0, /*out_mx_fmt*/3, /*uselut*/0);
+
+    // -----------------------------------------------------------------------
+    // 2. Load scale factors (A: sel=0, B: sel=1)
+    // -----------------------------------------------------------------------
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+    // -----------------------------------------------------------------------
+    // 3. MVIN A tiles: for each i, batch all k tiles in one block_mvin
+    //    A is row-major with stride MATMUL_K bytes per row-group of DIM rows.
+    //    For fixed i, tiles k=0..tiles_K-1 are contiguous in DRAM (stride=DIM).
+    //    tiles_K=4 == MAX_BLOCK_LEN=4 → single block_mvin per i-tile.
+    //    Scratchpad slots a_base + (i*tiles_K + 0)*DIM .. (i*tiles_K+3)*DIM
+    //    are contiguous, so block_mvin fills them correctly.
+    // -----------------------------------------------------------------------
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    {
+        const elem_t *A_ptr = (const elem_t *)A_in;
+        for (int i = 0; i < tiles_I; i++) {
+            const void *dram_ptr = (const void *)(A_ptr + (i * DIM) * MATMUL_K);
+            uint32_t    sp_addr  = a_base + i * tiles_K * DIM;
+            gemmini_block_mvin(dram_ptr, sp_addr, tiles_K);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 4. MVIN B tiles: for each k, batch all j tiles in one block_mvin
+    //    B is row-major with stride MATMUL_N bytes per row.
+    //    For fixed k, tiles j=0..tiles_J-1 are contiguous in DRAM (stride=DIM).
+    //    tiles_J=4 == MAX_BLOCK_LEN=4 → single block_mvin per k-tile.
+    // -----------------------------------------------------------------------
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+    {
+        const elem_t *B_ptr = (const elem_t *)B_in;
+        for (int k = 0; k < tiles_K; k++) {
+            const void *dram_ptr = (const void *)(B_ptr + (k * DIM) * MATMUL_N);
+            uint32_t    sp_addr  = b_base + k * tiles_J * DIM;
+            gemmini_block_mvin(dram_ptr, sp_addr, tiles_J);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 5. Configure output store and requantizer
+    //    lut_update_granularity = tiles_I * tiles_J = 16: refresh the
+    //    requantizer LUT only once for the entire output rather than once
+    //    per tile (G=1). Since format is invariant across all output tiles,
+    //    the LUT content is identical — refreshing 15 extra times is pure
+    //    overhead. Setting G >= total output tiles eliminates all redundant
+    //    refreshes during the requant drain phase.
+    // -----------------------------------------------------------------------
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+        tiles_I, tiles_J, tiles_K,
+        /*scale_act_sel*/0, /*scale_w_sel*/0,
+        /*lut_update_granularity*/tiles_I * tiles_J);
+
+    // -----------------------------------------------------------------------
+    // 6. Execute fused weight-stationary tiled matmul
+    // -----------------------------------------------------------------------
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+        a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+        false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+    // -----------------------------------------------------------------------
+    // 7. Drain BF16 results from shared memory to DRAM, then fence
+    // -----------------------------------------------------------------------
+    gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+    gemmini_fence();
+}
+```

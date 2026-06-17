@@ -1,0 +1,64 @@
+## Analysis of the Original Code
+
+Looking at the original code, I need to identify the key inefficiency:
+
+```c
+gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+for (int i = 0; i < tiles_I; i++)
+    for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin(...)  // loads A tiles via mvin (port 0)
+
+for (int j = 0; j < tiles_J; j++)
+    for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin(...)  // also loads B tiles via mvin (port 0)
+```
+
+Both A and B tiles are loaded sequentially using the **same** `mvin` port (port 0). This means A and B loads are serialized — B loads cannot begin until all A loads complete. The hardware has three independent mvin ports (`mvin`, `mvin2`, `mvin3`) that can operate in parallel.
+
+## Strategy: Use `mvin2` Port for B Tiles (Strategy 5)
+
+**Plan:** Use `gemmini_extended_mvin` (port 0) for A tiles and `gemmini_extended_mvin2` (port 1) for B tiles. Both A and B loads can then proceed concurrently via independent DMA ports, overlapping their latencies.
+
+Key changes:
+1. Configure the load stride for port 1 (B tiles) using `gemmini_extended3_config_ld(..., id=1)` since `gemmini_config_ld` only configures port 0.
+2. Issue A mvins via `gemmini_extended_mvin` (port 0) and B mvins via `gemmini_extended_mvin2` (port 1) in an interleaved loop so they overlap in flight.
+3. The strides differ: A uses `MATMUL_K * sizeof(elem_t)` and B also uses `MATMUL_K * sizeof(elem_t)` (same stride in this case), but they must be configured on their respective ports independently.
+
+The interleaved loop issues A and B loads together, allowing the hardware's independent DMA engines to service both ports concurrently:
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // Configure port 0 for A tiles
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+  // Configure port 1 for B tiles
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+  // Interleave A and B mvins across both ports to overlap DMA transfers
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    }
+  }
+  for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin2((void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+                             b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+    }
+  }
+
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+By separating A loads onto port 0 and B loads onto port 1, the hardware can service both DMA streams concurrently, effectively halving the load phase latency and reducing overall execution time.

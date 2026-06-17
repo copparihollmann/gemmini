@@ -1,0 +1,89 @@
+Looking at the error message, the issue is that `cols=128` overflows the 6-bit hardware `num_cols` field. The maximum value for the 6-bit field is 63, which means we can only transfer 63 columns at a time. Since `DIM=16`, this limits us to `63/16 = 3.9375`, so effectively a maximum of 3 tiles (48 columns) per block transfer.
+
+The problem is in the MVIN loops where we're trying to transfer `tk * DIM = 4 * 16 = 64` columns at once, but the hardware limit is 63 columns (roughly 3 tiles).
+
+Let me fix this by breaking up the MVIN operations into smaller blocks that respect the `MAX_BLOCK_LEN=4` limitation:
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+#include "include/matmul_fp4_64x64.h"
+
+#define DIM 16
+#define ADDR_LEN 32
+#define BF16_PER_WORD 4
+#define OUT_COLS (MATMUL_N / BF16_PER_WORD)
+
+typedef uint8_t  elem_t;
+typedef uint64_t out_t;
+
+// Optimized MX matmul kernel (64x64x64, fp4:e2m1) using fully-contiguous scratchpad packing.
+void solution(void) {
+  {
+    // Define tile counts to fully span the matrix size
+    const int ti = MATMUL_M / DIM;  // 64/16 = 4
+    const int tj = MATMUL_N / DIM;  // 64/16 = 4  
+    const int tk = MATMUL_K / DIM;  // 64/16 = 4
+    
+    const uint32_t ab = 0;
+    const uint32_t bb = BANK_NUM * BANK_ROWS - tk * tj * DIM;  // Place B at top of scratchpad
+    const int SDST = 128;
+    
+    // 1. Configure execution formats and dataflow
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 2, 2, 3, 0);
+    
+    // 2. Load scale factors
+    gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);  // A/activation scales
+    gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);  // B/weight scales
+    
+    // 3. Configure store stride and requantizer bounds
+    gemmini_config_st(OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti, tj, tk, 0, 0, 1);
+    
+    // 4. MVIN A: Load entire rows of tiles of A contiguously (in chunks due to MAX_BLOCK_LEN=4)
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i = 0; i < ti; i++) {
+      // Split the transfer into blocks of maximum 4 tiles (64 columns) but stay within 63 column limit
+      // Since 4 tiles = 64 columns > 63 limit, we need to do 3 tiles per block (48 columns)
+      int k_remaining = tk;
+      int k_offset = 0;
+      
+      while (k_remaining > 0) {
+        int k_batch = (k_remaining > 3) ? 3 : k_remaining;  // Max 3 tiles per batch due to 63-column limit
+        gemmini_extended_mvin((void*)(((elem_t*)A_in_hw) + i * DIM * MATMUL_K + k_offset * DIM), 
+                              ab + i * tk * DIM + k_offset * DIM, 
+                              k_batch * DIM, 
+                              DIM);
+        k_offset += k_batch;
+        k_remaining -= k_batch;
+      }
+    }
+    
+    // 5. MVIN B: Load entire rows of tiles of B contiguously (in chunks due to MAX_BLOCK_LEN=4)
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+    for (int k = 0; k < tk; k++) {
+      // Split the transfer into blocks of maximum 3 tiles (48 columns) to stay under 63-column limit
+      int j_remaining = tj;
+      int j_offset = 0;
+      
+      while (j_remaining > 0) {
+        int j_batch = (j_remaining > 3) ? 3 : j_remaining;  // Max 3 tiles per batch
+        gemmini_extended_mvin2((void*)(((elem_t*)B_in) + k * DIM * MATMUL_N + j_offset * DIM), 
+                               bb + k * tj * DIM + j_offset * DIM, 
+                               j_batch * DIM, 
+                               DIM);
+        j_offset += j_batch;
+        j_remaining -= j_batch;
+      }
+    }
+    
+    // 6. Compute weight-stationary loop in hardware
+    gemmini_loop_ws_spad(ti, tj, tk, 0, 0, 0, ab, BANK_NUM * BANK_ROWS, 0, SDST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    
+    // 7. Read BF16 results from SMEM and sync
+    gemmini_mx_read_smem(&C_hw[0][0], SDST * 16, MATMUL_M * MATMUL_N);
+    gemmini_fence();
+  }
+}
+```

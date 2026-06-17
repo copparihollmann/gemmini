@@ -1,0 +1,109 @@
+```c
+// AUTO-GENERATED outer-tiled MX matmul baseline (113x256x256).
+// Optimization: pre-transpose scale arrays once before the loop nest,
+// eliminating per-iteration memcpy calls from the hot timed path.
+void solution(void) {
+  int tiles   = BLK / DIM;
+  int tiles_K = MATMUL_K / DIM;
+  int GK      = MATMUL_K / 32;
+
+  // b_base depends only on tile geometry, not on i0/j0 — fixed for all blocks.
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+  uint32_t a_base = 0;
+  int SPAD_DEST = 128;
+
+  // --- One-time pre-transposition of scale arrays into block-contiguous layout ---
+  // A_scales_T[i0] = [A_scales_row[0][i0*BLK..i0*BLK+BLK-1],
+  //                   A_scales_row[1][i0*BLK..i0*BLK+BLK-1], ...]
+  // B_scales_T[j0] = [B_scales_col[0][j0*BLK..j0*BLK+BLK-1],
+  //                   B_scales_col[1][j0*BLK..j0*BLK+BLK-1], ...]
+  // Each block's data is contiguous: GK * BLK bytes total per block.
+
+  static uint8_t A_scales_T[BLOCKS_M][A_S_BYTES];
+  static uint8_t B_scales_T[BLOCKS_N][B_S_BYTES];
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int g = 0; g < GK; g++) {
+      memcpy(&A_scales_T[i0][g * BLK],
+             &A_scales_row[g][i0 * BLK],
+             BLK);
+    }
+  }
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    for (int g = 0; g < GK; g++) {
+      memcpy(&B_scales_T[j0][g * BLK],
+             &B_scales_col[g][j0 * BLK],
+             BLK);
+    }
+  }
+
+  // Reorder: j0 outer so B tiles can be hoisted; i0 inner sweeps rows.
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    int ncols = REAL_N - j0 * BLK;
+    if (ncols > BLK) ncols = BLK;
+    if (ncols <= 0) continue;
+
+    // --- Mvin B tiles ONCE per j0 into the top of the scratchpad ---
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));   // B row stride = N
+    for (int j = 0; j < tiles; j++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin(
+          (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+          b_base + (k * tiles + j) * DIM, DIM, DIM);
+
+    for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      // PROF accel
+      gemmini_flush(0);
+
+      // Step 1: Configure execution (must precede scale loads and mvins).
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                  1, 1, 0, 0, false, 0, 0, 3, 0);
+
+      // Step 2: Load A and B scales into hardware directly from pre-transposed buffers.
+      // sel=0 → mx_scale_a_mem (activations/A), sel=1 → mx_scale_b_mem (weights/B).
+      // No memcpy needed: A_scales_T[i0] and B_scales_T[j0] are already contiguous.
+      gemmini_mx_load_scales((uint64_t)A_scales_T[i0], A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_scales_T[j0], B_S_BYTES, 1);
+
+      // Step 3: Mvin A tiles for this i0 row-block.
+      // B tiles are already resident in the scratchpad from the j0-level hoist.
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));  // A row stride = K
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+      // Step 4: Configure requantized mvout.
+      // i_bound=tiles, j_bound=tiles, k_bound=tiles_K must match gemmini_loop_ws_spad.
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                   tiles, tiles, tiles_K, 0, 0, 1);
+
+      // Step 5: Execute fused hardware matmul.
+      // mx_loop_spad_marker (funct 24) is one-shot and re-issued inside the macro
+      // before every gemmini_loop_ws_spad call.
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0,
+                           a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                           false, false, false, false, false,
+                           NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Step 6: Drain BF16 results from mx_smem to DRAM, row by row.
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(
+          &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+          SPAD_DEST * 16 + r * BLK, ncols);
+
+      // Step 7: Fence — ensures all mx_read_smem DMA writes are visible to the host.
+      gemmini_fence();
+    }
+  }
+}
+```

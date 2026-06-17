@@ -1,0 +1,126 @@
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+
+#define DIM 16
+#define ADDR_LEN 32
+#define BF16_PER_WORD 4
+
+typedef uint8_t  elem_t;
+typedef uint64_t out_t;
+
+void solution(void) {
+  int tiles   = BLK / DIM;
+  int tiles_K = MATMUL_K / DIM;
+  int GK      = MATMUL_K / 32;
+
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+  uint32_t a_base = 0;
+  int SPAD_DEST = 128;
+
+  // Align scale matrices to 64-byte boundaries to avoid split-bus transaction penalties
+  static uint8_t A_scales_T[BLOCKS_M][A_S_BYTES] __attribute__((aligned(64)));
+  static uint8_t B_scales_T[BLOCKS_N][B_S_BYTES] __attribute__((aligned(64)));
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int g = 0; g < GK; g++) {
+      memcpy(&A_scales_T[i0][g * BLK],
+             &A_scales_row[g][i0 * BLK],
+             BLK);
+    }
+  }
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    for (int g = 0; g < GK; g++) {
+      memcpy(&B_scales_T[j0][g * BLK],
+             &B_scales_col[g][j0 * BLK],
+             BLK);
+    }
+  }
+
+  // Hoist the configuration outside all loops as the parameters are invariant
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                              1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // Pre-configure the A load stride outside the j0 loop
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    int ncols = REAL_N - j0 * BLK;
+    if (ncols > BLK) ncols = BLK;
+    if (ncols <= 0) continue;
+
+    // Load B scales once per j0
+    gemmini_mx_load_scales((uint64_t)B_scales_T[j0], B_S_BYTES, 1);
+
+    // Mvin B tiles: Batch consecutive tiles along J dimension
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+    for (int k = 0; k < tiles_K; k++) {
+      for (int j = 0; j < tiles; j += 2) {
+        int batch_size = (j + 1 < tiles) ? 2 : 1;  // Handle odd number of tiles
+        gemmini_extended_mvin(
+          (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+          b_base + (k * tiles + j) * DIM, batch_size * DIM, DIM);
+      }
+    }
+
+    for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+
+      gemmini_flush(0);
+
+      // Load A scales for current i0 block
+      gemmini_mx_load_scales((uint64_t)A_scales_T[i0], A_S_BYTES, 0);
+
+      // Mvin A tiles: Batch consecutive tiles along K dimension
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++) {
+        for (int k = 0; k < tiles_K; k += 2) {
+          int batch_size = (k + 1 < tiles_K) ? 2 : 1;  // Handle odd number of tiles
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM, batch_size * DIM, DIM);
+        }
+      }
+
+      // Configure requantized mvout
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                   tiles, tiles, tiles_K, 0, 0, 1);
+
+      // Dispatch: fast interior path vs slow boundary path
+      if (i0 < BLOCKS_M - 1 && j0 < BLOCKS_N - 1) {
+        // Fast interior: pad_i = 0, pad_j = 0, mrows = BLK, ncols = BLK
+        gemmini_loop_ws_spad(tiles, tiles, tiles_K, 0, 0, 0,
+                             a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                             false, false, false, false, false,
+                             NO_ACTIVATION, 0, 0, false, 0x38);
+
+        for (int r = 0; r < BLK; r++)
+          gemmini_mx_read_smem(
+            &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+            SPAD_DEST * 16 + r * BLK, BLK);
+
+        gemmini_fence();
+      } else {
+        // Slow boundary path: handle partial tiles
+        int pad_i = BLK - mrows;
+        int pad_j = BLK - ncols;
+
+        gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0,
+                             a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                             false, false, false, false, false,
+                             NO_ACTIVATION, 0, 0, false, 0x38);
+
+        for (int r = 0; r < mrows; r++)
+          gemmini_mx_read_smem(
+            &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+            SPAD_DEST * 16 + r * BLK, ncols);
+
+        gemmini_fence();
+      }
+    }
+  }
+}

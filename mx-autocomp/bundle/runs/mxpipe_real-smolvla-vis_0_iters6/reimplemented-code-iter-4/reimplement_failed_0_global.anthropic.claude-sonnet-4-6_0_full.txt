@@ -1,0 +1,87 @@
+Looking at the failing code, I need to identify the bugs:
+
+1. **Scratchpad size**: The problem states 4 banks × 2048 rows = 8192 rows, each 16 bytes = 128KB total (not 256KB). Let me recheck - actually 8192 × 16 = 131072 = 128KB. The accumulator is 256 rows × 128 bytes = 32KB (not 64KB as rule 3 says, but rule 7 takes precedence with specific values).
+
+2. **`gemmini_mx_load_scales` sel convention**: sel=0 for A (activations), sel=1 for B (weights). The original code has this correct.
+
+3. **B mvin outside i-loop**: B is loaded once per j-tile but A scales change per i-block. The scale load happens inside the i-loop which is correct, but B scales are staged outside - this should be fine.
+
+4. **`gemmini_flush` placement**: Should be before config_ex in the sequence, but the flush is called before config_ex which seems okay.
+
+5. **A scale layout**: `A_scales_row[g][row]` - the scale memory layout should match `scale_dram + m*N_blocks + bi`. The A scales staging and loading needs careful attention.
+
+6. **`SPAD_DEST` and `gemmini_mx_read_smem` offset**: `smem_off_bf16 = SPAD_DEST * 16`. The C spad word offset = `SPAD_DEST * 16` in 16-bit units.
+
+7. **B mvin uses wrong stride**: B matrix stride should be `MATMUL_N * sizeof(elem_t)` which is correct.
+
+8. **The main bug**: `gemmini_flush` should not be inside the inner loop repeatedly, and the B mvin before scale loading violates the ordering requirement - but more critically, the `A_s` staging transposes the layout incorrectly for the scale memory expected format.
+
+Let me rewrite with a simpler, correct single-tile approach:
+
+```c
+void solution(void) {
+  const int tiles_I = MATMUL_M / DIM;
+  const int tiles_J = MATMUL_N / DIM;
+  const int tiles_K = MATMUL_K / DIM;
+
+  // b_base: B occupies top of scratchpad
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+  uint32_t a_base = 0;
+  int SPAD_DEST = 0;
+
+  // Verify no overlap: a_base + tiles_I*tiles_K*DIM <= b_base
+  // tiles_I*tiles_K*DIM + tiles_J*tiles_K*DIM <= 8192
+  // If that fits, do the whole matmul in one shot.
+
+  // Step 1: Configure execution (FP8 E4M3, BF16 output)
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                              1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // Step 2: Load all A and B scale factors
+  gemmini_mx_load_scales((uint64_t)A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)B_scales_col, sizeof(B_scales_col), 1);
+
+  // Step 3: Mvin all B tiles (weight-stationary: B reused across all i)
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin2(
+        (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + j * DIM),
+        b_base + (j * tiles_K + k) * DIM,
+        DIM, DIM);
+    }
+  }
+
+  // Step 4: Mvin all A tiles
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin(
+        (void*)(((elem_t*)A_in) + (i * DIM) * MATMUL_K + k * DIM),
+        a_base + (i * tiles_K + k) * DIM,
+        DIM, DIM);
+    }
+  }
+
+  // Step 5: Configure requantized mvout
+  gemmini_config_st(MATMUL_N * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                               tiles_I, tiles_J, tiles_K,
+                               0, 0, 1);
+
+  // Step 6: Execute fused hardware matmul
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K,
+                       0, 0, 0,
+                       a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                       false, false, false, false, false,
+                       NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // Step 7: Drain BF16 results from mx_smem to DRAM
+  gemmini_mx_read_smem((uint64_t)&C_hw[0][0],
+                       SPAD_DEST * 16,
+                       MATMUL_M * MATMUL_N);
+
+  // Step 8: Fence
+  gemmini_fence();
+}
+```

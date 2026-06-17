@@ -1,0 +1,178 @@
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+
+#define GEMMINI_SF_MEM 0x40088000
+#define GEMMINI_SF_MEM_A (GEMMINI_SF_MEM + 0x2000)
+#define GEMMINI_SF_MEM_B GEMMINI_SF_MEM
+#define SMEM 0x40000000
+
+#define DIM 16
+#define ADDR_LEN 32
+
+#define BF16_PER_WORD 4
+
+// S=128, D=64
+#define ATT_S 128
+#define ATT_D 64
+#define GROUPS_S 4
+#define S_OUT_COLS (ATT_S / BF16_PER_WORD)
+#define D_OUT_COLS (ATT_D / BF16_PER_WORD)
+
+#define BANK_NUM 4
+#define BANK_ROWS 2048
+#define SPAD_DEST 0
+
+typedef uint8_t  elem_t;   // fp8:e4m3 input elements
+typedef uint64_t out_t;    // 4x bf16 packed per word
+
+extern elem_t Q_in[ATT_S][ATT_D];
+extern elem_t KT_in[ATT_D][ATT_S];
+extern elem_t V_in[ATT_S][ATT_D];
+extern uint8_t Q_scales_row[GROUPS_S][ATT_S];
+extern uint8_t KT_scales_col[GROUPS_S][ATT_S];
+extern uint8_t V_scales_col[GROUPS_S][ATT_D];
+extern out_t S1_hw[ATT_S][S_OUT_COLS];
+extern out_t O_hw[ATT_S][D_OUT_COLS];
+extern uint8_t P_scales[GROUPS_S][ATT_S];
+extern elem_t P_q[ATT_S][ATT_S];
+extern uint8_t scale_factors[10000];
+
+// Helper functions declared in the test environment
+int64_t mx_ibf16_to_q(uint16_t x);
+int64_t mx_iexp(int64_t x);
+int mx_ilog2(uint64_t x);
+elem_t mx_ienc_fp8(int64_t p, uint64_t inv_sm, int ls, int e);
+
+void solution(void) {
+  gemmini_flush(0);
+
+  // Preload KT to scratchpad at the top - calculate correct base address
+  int tiles_D_KT = ATT_D / DIM;  // 64/16 = 4
+  int tiles_S_KT = ATT_S / DIM;  // 128/16 = 8
+  uint32_t kt_base = BANK_NUM * BANK_ROWS - tiles_D_KT * tiles_S_KT * DIM; // 8192 - 4*8*16 = 7680
+  
+  gemmini_config_ld(ATT_S * sizeof(elem_t));
+  for (int k = 0; k < tiles_D_KT; k++) {
+    for (int j = 0; j < tiles_S_KT; j++) {
+      elem_t *dram_ptr = ((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM;
+      uint32_t sp_addr = kt_base + (k * tiles_S_KT + j) * DIM;
+      gemmini_extended_mvin((void*)dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  // Preload V to scratchpad below KT
+  int tiles_S_V = ATT_S / DIM;   // 128/16 = 8
+  int tiles_D_V = ATT_D / DIM;   // 64/16 = 4
+  uint32_t v_base = kt_base - tiles_S_V * tiles_D_V * DIM; // 7680 - 8*4*16 = 7168
+  
+  gemmini_config_ld(ATT_D * sizeof(elem_t));
+  for (int k = 0; k < tiles_S_V; k++) {
+    for (int j = 0; j < tiles_D_V; j++) {
+      elem_t *dram_ptr = ((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM;
+      uint32_t sp_addr = v_base + (k * tiles_D_V + j) * DIM;
+      gemmini_extended_mvin((void*)dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+  gemmini_fence();
+
+  // Interleaved Active-Row Block Loop
+  int tiles_S = ATT_S / DIM;  // 128/16 = 8
+  int tiles_D = ATT_D / DIM;  // 64/16 = 4
+  
+  for (int i = 0; i < tiles_S; i++) {
+    // ---- Step A: S1_sub = Q_sub @ KT ----
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&Q_scales_row, sizeof(Q_scales_row), 0);  // A scales
+    gemmini_mx_load_scales((uint64_t)&KT_scales_col, sizeof(KT_scales_col), 1); // B scales
+
+    // Load Q_sub block to bottom of scratchpad (starting at address 0)
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int k = 0; k < tiles_D; k++) {
+      elem_t *dram_ptr = ((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM;
+      uint32_t sp_addr = 0 + k * DIM;
+      gemmini_extended_mvin((void*)dram_ptr, sp_addr, DIM, DIM);
+    }
+
+    // Compute and drain S1
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, 1, tiles_S_KT, tiles_D, 0, 0, 1);
+    
+    // Correct parameters: I=1, J=tiles_S_KT, K=tiles_D
+    // A starts at 0, B starts at kt_base
+    gemmini_loop_ws_spad(1, tiles_S_KT, tiles_D, 0, 0, 0, 
+                         0, kt_base, 0, SPAD_DEST,
+                         false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[i * DIM][0], SPAD_DEST * 16, DIM * ATT_S);
+    gemmini_fence();
+
+    // ---- Step B: Softmax on active sub-block (16 rows) ----
+    for (int row = i * DIM; row < (i + 1) * DIM; row++) {
+      int64_t q[ATT_S];
+      int64_t mq = -((int64_t)1 << 62);
+      for (int j = 0; j < ATT_S; j += 4) {
+        uint64_t w = S1_hw[row][j / 4];
+        for (int l = 0; l < 4; l++) {
+#if ATT_CAUSAL
+          if (j + l > row) { q[j + l] = -((int64_t)1 << 62); continue; }
+#endif
+          int64_t qq = mx_ibf16_to_q((uint16_t)((w >> (l * 16)) & 0xFFFF));
+          q[j + l] = qq; if (qq > mq) mq = qq;
+        }
+      }
+      int64_t p[ATT_S];
+      int64_t sm = 0;
+      int64_t gmax_arr[GROUPS_S];
+      for (int g = 0; g < GROUPS_S; g++) {
+        int64_t gmax = 0;
+        for (int j = g * 32; j < (g + 1) * 32; j++) {
+          int64_t pv = mx_iexp(q[j] - mq);
+          p[j] = pv; sm += pv;
+          if (pv > gmax) gmax = pv;
+        }
+        gmax_arr[g] = gmax;
+      }
+      int ls = mx_ilog2((uint64_t)sm);
+      uint64_t inv_sm = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;
+      for (int g = 0; g < GROUPS_S; g++) {
+        int64_t gmax = gmax_arr[g];
+        if (gmax == 0) {
+          P_scales[g][row] = 0;
+          for (int j = g * 32; j < (g + 1) * 32; j++) P_q[row][j] = 0;
+          continue;
+        }
+        int e = mx_ilog2((uint64_t)gmax) - ls - MX_P_TARGET_LOG2;
+        P_scales[g][row] = (uint8_t)(e + 127);
+        for (int j = g * 32; j < (g + 1) * 32; j++) {
+          P_q[row][j] = mx_ienc_fp8(p[j], inv_sm, ls, e);
+        }
+      }
+    }
+
+    // ---- Step C: O_sub = P_sub @ V ----
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);  // A scales
+    gemmini_mx_load_scales((uint64_t)&V_scales_col, sizeof(V_scales_col), 1); // B scales
+
+    // Load P_sub block to bottom of scratchpad (starting at address 0)
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int k = 0; k < tiles_S; k++) {
+      elem_t *dram_ptr = ((elem_t*)P_q) + i * DIM * ATT_S + k * DIM;
+      uint32_t sp_addr = 0 + k * DIM;
+      gemmini_extended_mvin((void*)dram_ptr, sp_addr, DIM, DIM);
+    }
+
+    // Compute and drain O
+    gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, 1, tiles_D_V, tiles_S, 0, 0, 1);
+    
+    // Correct parameters: I=1, J=tiles_D_V, K=tiles_S
+    // A starts at 0, B starts at v_base
+    gemmini_loop_ws_spad(1, tiles_D_V, tiles_S, 0, 0, 0,
+                         0, v_base, 0, SPAD_DEST,
+                         false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[i * DIM][0], SPAD_DEST * 16, DIM * ATT_D);
+    gemmini_fence();
+  }
+}

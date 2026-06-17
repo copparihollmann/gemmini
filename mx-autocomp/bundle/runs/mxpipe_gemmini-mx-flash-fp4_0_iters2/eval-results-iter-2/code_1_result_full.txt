@@ -1,0 +1,315 @@
+{'correct': False, 'test_results': {0: False}, 'compiled': True}
+Prev latency: 1855175
+New latency: N/A
+Plan: # Performance Analysis and Optimization Plan
+
+## Identifying the Bottleneck
+
+The baseline code runs two Gemmini matmuls per token-block `t`:
+1. **QK^T**: `Q [S×D]` × `K^T [D×BT]` → `S1_hw [S×BT]` (fp4)
+2. **PV**: `P [S×BT]` × `V [BT×D]` → `O_hw [S×D]` (fp4)
+
+Between them, the CPU runs a **scalar softmax + fp4 requantization loop** over all `S×BT` elements. The profiler flags "~4 scalar copy loops" and the scratchpad/accumulator utilization is 0KB — meaning the hardware is completely idle during the softmax computation.
+
+The critical observation: **the softmax loop is the dominant CPU bottleneck**, and the two Gemmini matmuls are back-to-back with a full CPU scalar loop in between, serializing compute and memory bandwidth.
+
+## Selected Strategy: **Rewrite the Algorithm to Reduce Total Work**
+
+### Strategy Rationale
+
+Strategy 3 — *rewrite the algorithm to reduce total work* — directly targets the scalar softmax loop and the redundant `gemmini_flush(0)` + full reconfiguration that happens twice per tile block `t`. Specifically:
+
+1. **Eliminate `gemmini_flush(0)` on the second matmul.** The baseline calls `gemmini_flush(0)` before *both* Gemmini kernels inside each `t` iteration. `gemmini_flush` is a full pipeline drain + state reset. Since the second kernel (PV) uses the same dataflow (WEIGHT_STATIONARY, fp4, BF16 output), the `gemmini_flush` on the second call is unnecessary and wasteful — it stalls the pipeline for no reason.
+
+2. **Hoist the QK^T `gemmini_extended3_config_ex` outside the `t` loop.** Both Gemmini kernels use identical `config_ex` parameters (`WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 2, 2, 3, 0`). Currently, `gemmini_extended3_config_ex` is issued twice per `t` iteration. Since the format never changes across iterations, issuing it once before the `t` loop halves this overhead.
+
+3. **Fuse the MVIN-B for PV with the softmax scalar loop.** Currently the code sequentially: (a) does QK^T matmul, (b) reads smem, (c) does full softmax+requant CPU loop (touching `S×BT` elements), then (d) issues all PV MVIN-B commands. The scalar softmax loop over `BT` columns per row and the MVIN-B tiles of V are completely independent — V tiles don't depend on P values. We can issue all V MVIN-B tiles **before** the softmax loop begins (after MVIN-A for P is still pending, but V loads can start during the softmax CPU computation since the hardware is idle). This overlaps DRAM→scratchpad DMA for V with CPU-side softmax, hiding the DMA latency.
+
+4. **Reduce the KT scale-factor copy loop.** The baseline copies `K^T` scales into `KTsc[]` with a double-nested loop (`ATT_D/32 × BT`) before every `t` iteration. With `ATT_D=64` and `BT` elements, this is `2×BT` scalar copies. Since `KT_scales_col` is laid out as `KT_scales_col[g][t*BT + n]`, we can pass a direct pointer into `KT_scales_col` offset by `t*BT` for each group, avoiding the copy entirely, provided the two groups are contiguous in memory (which they are if the array is `[ATT_D/32][NT*BT]` row-major). This eliminates `2×BT` scalar stores per outer iteration.
+
+### Concrete Changes
+
+**Change 1: Hoist config and remove redundant flush**
+
+```c
+// BEFORE (inside loop):
+gemmini_flush(0);
+gemmini_extended3_config_ex(WEIGHT_STATIONARY,0,0,ACC_SCALE_IDENTITY,1,1,0,0,false,2,2,3,0);
+// ... QK^T ...
+gemmini_flush(0);                          // <-- REMOVE THIS
+gemmini_extended3_config_ex(...same...);   // <-- REMOVE THIS
+
+// AFTER: hoist once before the t-loop:
+gemmini_flush(0);
+gemmini_extended3_config_ex(WEIGHT_STATIONARY,0,0,ACC_SCALE_IDENTITY,1,1,0,0,false,2,2,3,0);
+for (int t = 0; t < NT; t++) {
+    // QK^T: only load_scales, mvin, loop, read_smem
+    // PV:   only load_scales, mvin, loop, read_smem
+}
+```
+
+**Change 2: Eliminate KTsc copy — pass pointer directly**
+
+```c
+// BEFORE:
+for(int g=0;g<ATT_D/32;g++)
+  for(int n=0;n<BT;n++)
+    KTsc[g*BT+n]=KT_scales_col[g][t*BT+n];
+gemmini_mx_load_scales((uint64_t)KTsc,(ATT_D/32)*BT,1);
+
+// AFTER (requires KT_scales_col to be [ATT_D/32][NT*BT] contiguous):
+// Each row g has KT_scales_col[g][0..NT*BT-1]; t-th block starts at t*BT.
+// Since rows are contiguous and BT-aligned, the t-th column block is:
+//   KT_scales_col[0][t*BT .. t*BT+BT-1], KT_scales_col[1][t*BT .. t*BT+BT-1]
+// These are NOT contiguous across g-rows, so the copy is needed IF the hw
+// expects a flat [GK][BT] block. Keep copy but move it earlier (before flush)
+// so it overlaps with prior iteration's fence, OR restructure as a single
+// memcpy of (ATT_D/32)*BT bytes if stride allows.
+// Simplest safe fix: keep copy but note it's ATT_D/32 * BT = 2*BT scalar ops.
+```
+
+**Change 3: Issue V-tile MVINs before the softmax CPU loop**
+
+The key structural change — reorder the PV setup to overlap V DRAM loads with CPU softmax:
+
+```c
+// After QK^T gemmini_mx_read_smem + gemmini_fence():
+
+// === START PV SETUP EARLY (V tiles are independent of P) ===
+// Configure load stride for V now, issue all MVIN-B (V) tiles:
+int ti_pv = ATT_S/DIM/2, tj_pv = ATT_D/DIM/2, tk_pv = BT/DIM;
+uint32_t ab_pv = 0;
+uint32_t bb_pv = BANK_NUM*BANK_ROWS - tk_pv*tj_pv*DIM;
+
+gemmini_config_ld(ATT_D*sizeof(elem_t)/2);
+for(int k=0;k<tk_pv;k++)
+  for(int j=0;j<tj_pv;j++)
+    gemmini_extended_mvin2(  // use mvin2 port for B (V tiles)
+      (void*)(((elem_t*)V_in)+(t*BT+k*DIM)*(ATT_D/2)+j*DIM),
+      bb_pv+(k*tj_pv+j)*DIM, DIM, DIM);
+
+// === NOW run softmax + P quantization on CPU (V DMA runs in parallel) ===
+for(int i=0;i<ATT_S;i++) { /* ... existing softmax + P_hw fill ... */ }
+
+// === THEN load P (A tiles) into scratchpad (after P_hw is ready) ===
+gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+gemmini_mx_load_scales((uint64_t)&V_scales_col[t*GBT][0], GBT*ATT_D, 1);
+gemmini_config_ld(BT*sizeof(elem_t));
+for(int i=0;i<ti_pv;i++)
+  for(int k=0;k<tk_pv;k++)
+    gemmini_extended_mvin(
+      (void*)(((elem_t*)P_hw)+i*DIM*BT+k*DIM),
+      ab_pv+(i*tk_pv+k)*DIM, DIM, DIM);
+
+// NOTE: mvin2 and mvin are different funct codes; V tiles (mvin2) issued
+// before softmax do not conflict with P tiles (mvin) issued after.
+// The hardware queues them independently. We must ensure V MVIN-B addresses
+// (bb_pv) and P MVIN-A addresses (ab_pv) do not overlap:
+// A uses [0 .. ti_pv*tk_pv*DIM) = [0 .. 4*2*16) = [0..128)
+// B uses [bb_pv .. 8192) = [8192-tk_pv*tj_pv*DIM .. 8192) = [8192-128..8192)
+// No overlap. ✓
+
+gemmini_config_st((ATT_D/BF16_PER_WORD)*sizeof(out_t));
+gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti_pv, tj_pv, tk_pv, 0,0,1);
+gemmini_loop_ws_spad(ti_pv,tj_pv,tk_pv,0,0,0,ab_pv,BANK_NUM*BANK_ROWS,0,128,
+    false,false,false,false,false,NO_ACTIVATION,0,0,false,0x38);
+gemmini_mx_read_smem(&O_hw[0][0],128*16,ATT_S*ATT_D);
+gemmini_fence();
+```
+
+**Why this works:** After `gemmini_mx_read_smem + gemmini_fence()` for QK^T, the hardware is idle. Issuing V MVIN2 commands immediately starts DMA from DRAM into the scratchpad. The CPU then executes the softmax loop (which is the dominant scalar bottleneck). During those ~thousands of CPU cycles, the DMA engine fills V tiles into the scratchpad concurrently. When the CPU finishes softmax and quantizes P, the V tiles are already in the scratchpad (or nearly so), and only P MVIN-A tiles remain, which are smaller (since P is fp4 packed).
+
+### Expected Performance Improvement
+
+- **Eliminating 1 `gemmini_flush` per `t` iteration**: Each flush drains the entire pipeline and reinitializes state — this is hundreds of cycles. Over `NT` iterations this is `NT × (flush cost)` cycles saved.
+- **Eliminating redundant `gemmini_extended3_config_ex`**: Saves 1 RoCC instruction (and its associated scoreboard/serialization overhead) per `t` iteration.
+- **Overlapping V DRAM→scratchpad DMA with CPU softmax**: The softmax loop touches `S×BT = 128×BT` elements with exp/log2 operations — this is the dominant CPU cost. V tiles total `tk_pv × tj_pv × DIM × DIM/2 = 2×2×16×8 = 512` bytes of DRAM reads. Overlapping this DMA with softmax hides essentially the entire V-load latency, which currently serializes after softmax.
+- **Total reduction**: Estimated 15–25% wall-clock reduction depending on NT and the relative cost of flush vs. compute.
+
+CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED baseline MX FLASH attention kernel (S=128, D=64, fp4:e2m1).
+void solution(void) {
+  for(int i=0;i<ATT_S;i++){Mr[i]=-((int64_t)1<<62);Lr[i]=0;for(int d=0;d<ATT_D;d++)O_acc[i][d]=0;}
+  for(int t=0;t<NT;t++){
+    { int ti=ATT_S/DIM/2, tj=BT/DIM/2, tk=ATT_D/DIM; uint32_t ab=0,bb=BANK_NUM*BANK_ROWS-tk*tj*DIM;
+      for(int g=0;g<ATT_D/32;g++)for(int n=0;n<BT;n++)KTsc[g*BT+n]=KT_scales_col[g][t*BT+n];
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY,0,0,ACC_SCALE_IDENTITY,1,1,0,0,false,2,2,3,0);
+      gemmini_mx_load_scales((uint64_t)&Q_scales_row,sizeof(Q_scales_row),0);
+      gemmini_mx_load_scales((uint64_t)KTsc,(ATT_D/32)*BT,1);
+      gemmini_config_st((BT/BF16_PER_WORD)*sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,ti,tj,tk,0,0,1);
+      gemmini_config_ld(ATT_D*sizeof(elem_t));
+      for(int i=0;i<ti;i++)for(int k=0;k<tk;k++) gemmini_extended_mvin((void*)(((elem_t*)Q_hw)+i*DIM*ATT_D+k*DIM),ab+(i*tk+k)*DIM,DIM,DIM);
+      gemmini_config_ld(ATT_S*sizeof(elem_t)/2);
+      for(int k=0;k<tk;k++)for(int j=0;j<tj;j++) gemmini_extended_mvin((void*)(((elem_t*)KT_in)+k*DIM*(ATT_S/2)+(t*BT)/2+j*DIM),bb+(k*tj+j)*DIM,DIM,DIM);
+      gemmini_loop_ws_spad(ti,tj,tk,0,0,0,ab,BANK_NUM*BANK_ROWS,0,128,false,false,false,false,false,NO_ACTIVATION,0,0,false,0x38);
+      gemmini_mx_read_smem(&S1_hw[0][0],128*16,ATT_S*BT); gemmini_fence(); }
+    for(int i=0;i<ATT_S;i++){  /* FLOAT-FREE integer online softmax + fp6/4 requant */
+      int64_t q[BT]; int64_t mn=Mr[i];
+      for(int j=0;j<BT;j++){int64_t qq=mx_ibf16_to_q((uint16_t)((S1_hw[i][j/4]>>((j%4)*16))&0xFFFF));q[j]=qq;if(qq>mn)mn=qq;}
+      int64_t corr=mx_iexp(Mr[i]-mn); int64_t p[BT],st=0;
+      for(int j=0;j<BT;j++){int64_t pv=mx_iexp(q[j]-mn);p[j]=pv;st+=pv;}
+      Lr[i]=(Lr[i]*corr)/MX_IEXP0+st;
+      for(int d=0;d<ATT_D;d++)O_acc[i][d]=(O_acc[i][d]*corr)/MX_IEXP0; Mr[i]=mn;
+      for(int g=0;g<GBT;g++){int64_t gm=0;for(int j=g*32;j<g*32+32;j++)if(p[j]>gm)gm=p[j];
+        int e=(gm>0)?(mx_ilog2((uint64_t)gm)-2):0;P_scales[g][i]=(uint8_t)(e+127);
+        for(int j=g*32;j<g*32+32;j++){uint64_t Rt=(e>=0)?(((uint64_t)p[j]<<MX_FRAC)>>e):((uint64_t)p[j]<<(MX_FRAC-e));uint8_t idx=mx_enc_P(Rt);
+          if((i&1)==0)P_hw[i>>1][j]=(P_hw[i>>1][j]&0xF0)|idx; else P_hw[i>>1][j]=(P_hw[i>>1][j]&0x0F)|(idx<<4);}}}
+    { int ti=ATT_S/DIM/2, tj=ATT_D/DIM/2, tk=BT/DIM; uint32_t ab=0,bb=BANK_NUM*BANK_ROWS-tk*tj*DIM;
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY,0,0,ACC_SCALE_IDENTITY,1,1,0,0,false,2,2,3,0);
+      gemmini_mx_load_scales((uint64_t)&P_scales,sizeof(P_scales),0);
+      gemmini_mx_load_scales((uint64_t)&V_scales_col[t*GBT][0],GBT*ATT_D,1);
+      gemmini_config_st((ATT_D/BF16_PER_WORD)*sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,ti,tj,tk,0,0,1);
+      gemmini_config_ld(BT*sizeof(elem_t));
+      for(int i=0;i<ti;i++)for(int k=0;k<tk;k++) gemmini_extended_mvin((void*)(((elem_t*)P_hw)+i*DIM*BT+k*DIM),ab+(i*tk+k)*DIM,DIM,DIM);
+      gemmini_config_ld(ATT_D*sizeof(elem_t)/2);
+      for(int k=0;k<tk;k++)for(int j=0;j<tj;j++) gemmini_extended_mvin((void*)(((elem_t*)V_in)+(t*BT+k*DIM)*(ATT_D/2)+j*DIM),bb+(k*tj+j)*DIM,DIM,DIM);
+      gemmini_loop_ws_spad(ti,tj,tk,0,0,0,ab,BANK_NUM*BANK_ROWS,0,128,false,false,false,false,false,NO_ACTIVATION,0,0,false,0x38);
+      gemmini_mx_read_smem(&O_hw[0][0],128*16,ATT_S*ATT_D); gemmini_fence();
+      for(int i=0;i<ATT_S;i++)for(int d=0;d<ATT_D;d++){uint16_t b=(uint16_t)((O_hw[i][d/4]>>((d%4)*16))&0xFFFF);O_acc[i][d]+=mx_bf16_to_fx(b,MX_O_F);} } }
+  for(int i=0;i<ATT_S;i++){int64_t l=Lr[i];if(l==0)l=1;for(int d=0;d<ATT_D;d++)O_acc[i][d]=O_acc[i][d]/l;}
+}
+''',
+score=1855175,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'CPU/host data staging detected (0 memcpy, ~4 scalar copy loops). Host staging is typically the dominant cost on this accelerator and autocomp cannot speed it up directly: mvin tiles STRIDED straight from the source DRAM arrays instead of copying through a host buffer, and keep partial sums in shared memory (bf16 accumulate) rather than accumulating on the CPU.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''# Performance Analysis and Optimization Plan
+
+## Identifying the Bottleneck
+
+The baseline code runs two Gemmini matmuls per token-block `t`:
+1. **QK^T**: `Q [S×D]` × `K^T [D×BT]` → `S1_hw [S×BT]` (fp4)
+2. **PV**: `P [S×BT]` × `V [BT×D]` → `O_hw [S×D]` (fp4)
+
+Between them, the CPU runs a **scalar softmax + fp4 requantization loop** over all `S×BT` elements. The profiler flags "~4 scalar copy loops" and the scratchpad/accumulator utilization is 0KB — meaning the hardware is completely idle during the softmax computation.
+
+The critical observation: **the softmax loop is the dominant CPU bottleneck**, and the two Gemmini matmuls are back-to-back with a full CPU scalar loop in between, serializing compute and memory bandwidth.
+
+## Selected Strategy: **Rewrite the Algorithm to Reduce Total Work**
+
+### Strategy Rationale
+
+Strategy 3 — *rewrite the algorithm to reduce total work* — directly targets the scalar softmax loop and the redundant `gemmini_flush(0)` + full reconfiguration that happens twice per tile block `t`. Specifically:
+
+1. **Eliminate `gemmini_flush(0)` on the second matmul.** The baseline calls `gemmini_flush(0)` before *both* Gemmini kernels inside each `t` iteration. `gemmini_flush` is a full pipeline drain + state reset. Since the second kernel (PV) uses the same dataflow (WEIGHT_STATIONARY, fp4, BF16 output), the `gemmini_flush` on the second call is unnecessary and wasteful — it stalls the pipeline for no reason.
+
+2. **Hoist the QK^T `gemmini_extended3_config_ex` outside the `t` loop.** Both Gemmini kernels use identical `config_ex` parameters (`WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 2, 2, 3, 0`). Currently, `gemmini_extended3_config_ex` is issued twice per `t` iteration. Since the format never changes across iterations, issuing it once before the `t` loop halves this overhead.
+
+3. **Fuse the MVIN-B for PV with the softmax scalar loop.** Currently the code sequentially: (a) does QK^T matmul, (b) reads smem, (c) does full softmax+requant CPU loop (touching `S×BT` elements), then (d) issues all PV MVIN-B commands. The scalar softmax loop over `BT` columns per row and the MVIN-B tiles of V are completely independent — V tiles don\'t depend on P values. We can issue all V MVIN-B tiles **before** the softmax loop begins (after MVIN-A for P is still pending, but V loads can start during the softmax CPU computation since the hardware is idle). This overlaps DRAM→scratchpad DMA for V with CPU-side softmax, hiding the DMA latency.
+
+4. **Reduce the KT scale-factor copy loop.** The baseline copies `K^T` scales into `KTsc[]` with a double-nested loop (`ATT_D/32 × BT`) before every `t` iteration. With `ATT_D=64` and `BT` elements, this is `2×BT` scalar copies. Since `KT_scales_col` is laid out as `KT_scales_col[g][t*BT + n]`, we can pass a direct pointer into `KT_scales_col` offset by `t*BT` for each group, avoiding the copy entirely, provided the two groups are contiguous in memory (which they are if the array is `[ATT_D/32][NT*BT]` row-major). This eliminates `2×BT` scalar stores per outer iteration.
+
+### Concrete Changes
+
+**Change 1: Hoist config and remove redundant flush**
+
+```c
+// BEFORE (inside loop):
+gemmini_flush(0);
+gemmini_extended3_config_ex(WEIGHT_STATIONARY,0,0,ACC_SCALE_IDENTITY,1,1,0,0,false,2,2,3,0);
+// ... QK^T ...
+gemmini_flush(0);                          // <-- REMOVE THIS
+gemmini_extended3_config_ex(...same...);   // <-- REMOVE THIS
+
+// AFTER: hoist once before the t-loop:
+gemmini_flush(0);
+gemmini_extended3_config_ex(WEIGHT_STATIONARY,0,0,ACC_SCALE_IDENTITY,1,1,0,0,false,2,2,3,0);
+for (int t = 0; t < NT; t++) {
+    // QK^T: only load_scales, mvin, loop, read_smem
+    // PV:   only load_scales, mvin, loop, read_smem
+}
+```
+
+**Change 2: Eliminate KTsc copy — pass pointer directly**
+
+```c
+// BEFORE:
+for(int g=0;g<ATT_D/32;g++)
+  for(int n=0;n<BT;n++)
+    KTsc[g*BT+n]=KT_scales_col[g][t*BT+n];
+gemmini_mx_load_scales((uint64_t)KTsc,(ATT_D/32)*BT,1);
+
+// AFTER (requires KT_scales_col to be [ATT_D/32][NT*BT] contiguous):
+// Each row g has KT_scales_col[g][0..NT*BT-1]; t-th block starts at t*BT.
+// Since rows are contiguous and BT-aligned, the t-th column block is:
+//   KT_scales_col[0][t*BT .. t*BT+BT-1], KT_scales_col[1][t*BT .. t*BT+BT-1]
+// These are NOT contiguous across g-rows, so the copy is needed IF the hw
+// expects a flat [GK][BT] block. Keep copy but move it earlier (before flush)
+// so it overlaps with prior iteration\'s fence, OR restructure as a single
+// memcpy of (ATT_D/32)*BT bytes if stride allows.
+// Simplest safe fix: keep copy but note it\'s ATT_D/32 * BT = 2*BT scalar ops.
+```
+
+**Change 3: Issue V-tile MVINs before the softmax CPU loop**
+
+The key structural change — reorder the PV setup to overlap V DRAM loads with CPU softmax:
+
+```c
+// After QK^T gemmini_mx_read_smem + gemmini_fence():
+
+// === START PV SETUP EARLY (V tiles are independent of P) ===
+// Configure load stride for V now, issue all MVIN-B (V) tiles:
+int ti_pv = ATT_S/DIM/2, tj_pv = ATT_D/DIM/2, tk_pv = BT/DIM;
+uint32_t ab_pv = 0;
+uint32_t bb_pv = BANK_NUM*BANK_ROWS - tk_pv*tj_pv*DIM;
+
+gemmini_config_ld(ATT_D*sizeof(elem_t)/2);
+for(int k=0;k<tk_pv;k++)
+  for(int j=0;j<tj_pv;j++)
+    gemmini_extended_mvin2(  // use mvin2 port for B (V tiles)
+      (void*)(((elem_t*)V_in)+(t*BT+k*DIM)*(ATT_D/2)+j*DIM),
+      bb_pv+(k*tj_pv+j)*DIM, DIM, DIM);
+
+// === NOW run softmax + P quantization on CPU (V DMA runs in parallel) ===
+for(int i=0;i<ATT_S;i++) { /* ... existing softmax + P_hw fill ... */ }
+
+// === THEN load P (A tiles) into scratchpad (after P_hw is ready) ===
+gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+gemmini_mx_load_scales((uint64_t)&V_scales_col[t*GBT][0], GBT*ATT_D, 1);
+gemmini_config_ld(BT*sizeof(elem_t));
+for(int i=0;i<ti_pv;i++)
+  for(int k=0;k<tk_pv;k++)
+    gemmini_extended_mvin(
+      (void*)(((elem_t*)P_hw)+i*DIM*BT+k*DIM),
+      ab_pv+(i*tk_pv+k)*DIM, DIM, DIM);
+
+// NOTE: mvin2 and mvin are different funct codes; V tiles (mvin2) issued
+// before softmax do not conflict with P tiles (mvin) issued after.
+// The hardware queues them independently. We must ensure V MVIN-B addresses
+// (bb_pv) and P MVIN-A addresses (ab_pv) do not overlap:
+// A uses [0 .. ti_pv*tk_pv*DIM) = [0 .. 4*2*16) = [0..128)
+// B uses [bb_pv .. 8192) = [8192-tk_pv*tj_pv*DIM .. 8192) = [8192-128..8192)
+// No overlap. ✓
+
+gemmini_config_st((ATT_D/BF16_PER_WORD)*sizeof(out_t));
+gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti_pv, tj_pv, tk_pv, 0,0,1);
+gemmini_loop_ws_spad(ti_pv,tj_pv,tk_pv,0,0,0,ab_pv,BANK_NUM*BANK_ROWS,0,128,
+    false,false,false,false,false,NO_ACTIVATION,0,0,false,0x38);
+gemmini_mx_read_smem(&O_hw[0][0],128*16,ATT_S*ATT_D);
+gemmini_fence();
+```
+
+**Why this works:** After `gemmini_mx_read_smem + gemmini_fence()` for QK^T, the hardware is idle. Issuing V MVIN2 commands immediately starts DMA from DRAM into the scratchpad. The CPU then executes the softmax loop (which is the dominant scalar bottleneck). During those ~thousands of CPU cycles, the DMA engine fills V tiles into the scratchpad concurrently. When the CPU finishes softmax and quantizes P, the V tiles are already in the scratchpad (or nearly so), and only P MVIN-A tiles remain, which are smaller (since P is fp4 packed).
+
+### Expected Performance Improvement
+
+- **Eliminating 1 `gemmini_flush` per `t` iteration**: Each flush drains the entire pipeline and reinitializes state — this is hundreds of cycles. Over `NT` iterations this is `NT × (flush cost)` cycles saved.
+- **Eliminating redundant `gemmini_extended3_config_ex`**: Saves 1 RoCC instruction (and its associated scoreboard/serialization overhead) per `t` iteration.
+- **Overlapping V DRAM→scratchpad DMA with CPU softmax**: The softmax loop touches `S×BT = 128×BT` elements with exp/log2 operations — this is the dominant CPU cost. V tiles total `tk_pv × tj_pv × DIM × DIM/2 = 2×2×16×8 = 512` bytes of DRAM reads. Overlapping this DMA with softmax hides essentially the entire V-load latency, which currently serializes after softmax.
+- **Total reduction**: Estimated 15–25% wall-clock reduction depending on NT and the relative cost of flush vs. compute.''',
+code='''Error: max retries reached''',
+score=None,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='us.anthropic.claude-sonnet-4-6',
+code_gen_model='us.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None)

@@ -1,0 +1,196 @@
+void solution(void) {
+  // Initialize accumulators
+  for(int i = 0; i < ATT_S; i++) {
+    Mr[i] = -1e30f;
+    Lr[i] = 0.f;
+    for(int d = 0; d < ATT_D; d++) O_acc[i][d] = 0.f;
+  }
+
+  const int ti_qk = ATT_S / DIM / 2;  // tiles_I for QK^T: (128/16)/2 = 4 (fp6 dual)
+  const int tj_qk = BT / DIM / 2;     // tiles_J for QK^T
+  const int tk_qk = ATT_D / DIM;      // tiles_K for QK^T: 64/16 = 4
+
+  const int ti_pv = ATT_S / DIM / 2;  // tiles_I for PV
+  const int tj_pv = ATT_D / DIM / 2;  // tiles_J for PV
+  const int tk_pv = BT / DIM;         // tiles_K for PV
+
+  const uint32_t ab_qk = 0;
+  const uint32_t bb_qk = BANK_NUM * BANK_ROWS - tk_qk * tj_qk * DIM;
+
+  const uint32_t ab_pv = 0;
+  const uint32_t bb_pv = BANK_NUM * BANK_ROWS - tk_pv * tj_pv * DIM;
+
+  // Precompute KT scale rearrangement size
+  const int kt_scale_len = (ATT_D / 32) * BT;
+
+  for(int t = 0; t < NT; t++) {
+    // -------------------------------------------------------
+    // Step 1: Compute attention scores S = Q * K^T
+    // -------------------------------------------------------
+
+    // Rearrange KT scales for this tile
+    for(int g = 0; g < ATT_D / 32; g++)
+      for(int n = 0; n < BT; n++)
+        KTsc[g * BT + n] = KT_scales_col[g][t * BT + n];
+
+    // 1a. Configure execution (FP6 E3M2 format, BF16 output, uselut=1)
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+        1, 1, 0, 0, false,
+        /*act_mx_fmt*/1, /*wgt_mx_fmt*/1, /*out_mx_fmt*/3, /*uselut*/1);
+
+    // 1b. Load scale factors (A=Q scales sel=0, B=KT scales sel=1)
+    gemmini_mx_load_scales((uint64_t)&Q_scales_row, sizeof(Q_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)KTsc, kt_scale_len, 1);
+
+    // 1c. Load LUTs (sel 0=B/KT LUT, sel 1=A/Q LUT)
+    gemmini_mx_load_lut((uint64_t)KT_lp, 1, 0);
+    gemmini_mx_load_lut((uint64_t)Q_lp, 1, 1);
+
+    // 1d. MVIN Q tiles into scratchpad (A operand)
+    gemmini_extended3_config_ld(ATT_D * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+    for(int i = 0; i < ti_qk; i++)
+      for(int k = 0; k < tk_qk; k++)
+        gemmini_extended_mvin(
+            (void*)(((elem_t*)Q_hw) + i * DIM * ATT_D + k * DIM),
+            ab_qk + (i * tk_qk + k) * DIM,
+            DIM, DIM);
+
+    // 1e. MVIN KT tiles into scratchpad (B operand)
+    gemmini_extended3_config_ld(ATT_S * sizeof(elem_t) / 2, MVIN_SCALE_IDENTITY, false, 1);
+    for(int k = 0; k < tk_qk; k++)
+      for(int j = 0; j < tj_qk; j++)
+        gemmini_extended_mvin2(
+            (void*)(((elem_t*)KT_in) + k * DIM * (ATT_S / 2) + (t * BT) / 2 + j * DIM),
+            bb_qk + (k * tj_qk + j) * DIM,
+            DIM, DIM);
+
+    // 1f. Configure output stride and requantizer
+    gemmini_extended_config_st((BT / BF16_PER_WORD) * sizeof(out_t), 0, ACC_SCALE_IDENTITY);
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+        ti_qk, tj_qk, tk_qk,
+        /*scale_act_sel*/0, /*scale_w_sel*/0, /*lut_update_granularity*/8);
+
+    // 1g. Compute Q * K^T
+    gemmini_loop_ws_spad(ti_qk, tj_qk, tk_qk, 0, 0, 0,
+        ab_qk, BANK_NUM * BANK_ROWS, 0, 128,
+        false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+    // 1h. Read scores from smem
+    gemmini_mx_read_smem(&S1_hw[0][0], 128 * 16, ATT_S * BT);
+    gemmini_fence();
+
+    // -------------------------------------------------------
+    // Step 2: Online softmax + quantize P
+    // -------------------------------------------------------
+    for(int i = 0; i < ATT_S; i++) {
+      float row[BT];
+      float mn = Mr[i];
+
+      // Find max in this row
+      for(int j = 0; j < BT; j++) {
+        uint16_t b = (uint16_t)((S1_hw[i][j / 4] >> ((j % 4) * 16)) & 0xFFFF);
+        row[j] = bf16f(b);
+        if(row[j] > mn) mn = row[j];
+      }
+
+      // Online correction factor
+      float corr = expf2(Mr[i] - mn);
+      float ln = Lr[i] * corr;
+
+      // Compute exp and accumulate normalizer
+      for(int j = 0; j < BT; j++) {
+        row[j] = expf2(row[j] - mn);
+        ln += row[j];
+      }
+
+      // Correct previous O accumulator
+      for(int d = 0; d < ATT_D; d++) O_acc[i][d] *= corr;
+
+      Mr[i] = mn;
+      Lr[i] = ln;
+
+      // Quantize row to FP6 (packed as nibbles in P_hw)
+      for(int g = 0; g < GBT; g++) {
+        float gm = 0.f;
+        for(int j = g * 32; j < g * 32 + 32; j++) {
+          float a = fabsf2(row[j]);
+          if(a > gm) gm = a;
+        }
+        int e = 0;
+        if(gm > 0.f) e = fexp2(gm / 0.5f) + 1;
+        float isc = pow2i(-e);
+        P_scales[g][i] = (uint8_t)(e + 127);
+        for(int j = g * 32; j < g * 32 + 32; j++) {
+          uint8_t idx = enc(row[j] * isc);
+          if((i & 1) == 0)
+            P_hw[i >> 1][j] = (P_hw[i >> 1][j] & 0xF0) | idx;
+          else
+            P_hw[i >> 1][j] = (P_hw[i >> 1][j] & 0x0F) | (idx << 4);
+        }
+      }
+    }
+
+    // -------------------------------------------------------
+    // Step 3: Compute O += P * V
+    // -------------------------------------------------------
+
+    // 3a. Configure execution (FP6 E3M2 format, BF16 output, uselut=1)
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+        1, 1, 0, 0, false,
+        /*act_mx_fmt*/1, /*wgt_mx_fmt*/1, /*out_mx_fmt*/3, /*uselut*/1);
+
+    // 3b. Load scale factors (A=P scales sel=0, B=V scales sel=1)
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+    gemmini_mx_load_scales((uint64_t)&V_scales_col[t * GBT][0], GBT * ATT_D, 1);
+
+    // 3c. Load LUTs (sel 0=B/V LUT, sel 1=A/P LUT)
+    gemmini_mx_load_lut((uint64_t)V_lp, 1, 0);
+    gemmini_mx_load_lut((uint64_t)P_lp, 1, 1);
+
+    // 3d. MVIN P tiles into scratchpad (A operand)
+    gemmini_extended3_config_ld(BT * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+    for(int i = 0; i < ti_pv; i++)
+      for(int k = 0; k < tk_pv; k++)
+        gemmini_extended_mvin(
+            (void*)(((elem_t*)P_hw) + i * DIM * BT + k * DIM),
+            ab_pv + (i * tk_pv + k) * DIM,
+            DIM, DIM);
+
+    // 3e. MVIN V tiles into scratchpad (B operand)
+    gemmini_extended3_config_ld(ATT_D * sizeof(elem_t) / 2, MVIN_SCALE_IDENTITY, false, 1);
+    for(int k = 0; k < tk_pv; k++)
+      for(int j = 0; j < tj_pv; j++)
+        gemmini_extended_mvin2(
+            (void*)(((elem_t*)V_in) + (t * BT + k * DIM) * (ATT_D / 2) + j * DIM),
+            bb_pv + (k * tj_pv + j) * DIM,
+            DIM, DIM);
+
+    // 3f. Configure output stride and requantizer
+    gemmini_extended_config_st((ATT_D / BF16_PER_WORD) * sizeof(out_t), 0, ACC_SCALE_IDENTITY);
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+        ti_pv, tj_pv, tk_pv,
+        /*scale_act_sel*/0, /*scale_w_sel*/0, /*lut_update_granularity*/8);
+
+    // 3g. Compute P * V
+    gemmini_loop_ws_spad(ti_pv, tj_pv, tk_pv, 0, 0, 0,
+        ab_pv, BANK_NUM * BANK_ROWS, 0, 128,
+        false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+    // 3h. Read O tile from smem
+    gemmini_mx_read_smem(&O_hw[0][0], 128 * 16, ATT_S * ATT_D);
+    gemmini_fence();
+
+    // 3i. Accumulate into O_acc
+    for(int i = 0; i < ATT_S; i++)
+      for(int d = 0; d < ATT_D; d++) {
+        uint16_t b = (uint16_t)((O_hw[i][d / 4] >> ((d % 4) * 16)) & 0xFFFF);
+        O_acc[i][d] += bf16f(b);
+      }
+  }
+
+  // Final normalization
+  for(int i = 0; i < ATT_S; i++) {
+    float il = 1.f / Lr[i];
+    for(int d = 0; d < ATT_D; d++) O_acc[i][d] *= il;
+  }
+}

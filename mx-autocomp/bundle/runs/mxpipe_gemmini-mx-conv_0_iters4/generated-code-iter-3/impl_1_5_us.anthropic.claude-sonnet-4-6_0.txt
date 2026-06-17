@@ -1,0 +1,85 @@
+void solution(void) {
+  // Instead of writing all of A_buf (MATMUL_M * MATMUL_K bytes) to DRAM and
+  // then reading it all back, we build each DIM×DIM A-tile on demand into a
+  // small scratch buffer and DMA that directly into the scratchpad.
+  // This eliminates one full DRAM write pass + one full DRAM read pass for A.
+
+  static elem_t a_tile_buf[DIM][DIM];
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Configure port 1 (mvin2) for B: stride = MATMUL_K columns of elem_t
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+  // Configure port 0 (mvin) for A tile buffer: stride = DIM columns of elem_t
+  gemmini_extended3_config_ld(DIM * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+
+  // Load all B tiles first (port 1), interleaved with on-demand A tile construction.
+  // We interleave: for each (i,k) A-tile, build it from X_in then mvin it;
+  // for each (j,k) B-tile, mvin it directly. Both ports stay busy.
+
+  int total_a = tiles_I * tiles_K;
+  int total_b = tiles_J * tiles_K;
+  int max_total = (total_a > total_b) ? total_a : total_b;
+
+  for (int idx = 0; idx < max_total; idx++) {
+    if (idx < total_a) {
+      int i = idx / tiles_K;
+      int k = idx % tiles_K;
+
+      // Build the DIM×DIM A-tile directly from X_in without writing all of A_buf.
+      // Row r of the im2col matrix = patch (pi, pj) where:
+      //   pi = r / PATCHES_X, pj = r % PATCHES_X
+      // Column col of the im2col matrix:
+      //   c   = col / (CONV_KSZ * CONV_KSZ)
+      //   rem = col % (CONV_KSZ * CONV_KSZ)
+      //   dy  = rem / CONV_KSZ
+      //   dx  = rem % CONV_KSZ
+      // X_in[c][pi*CONV_KSZ + dy][pj*CONV_KSZ + dx]
+
+      int row_start = i * DIM;   // first im2col row in this A-tile
+      int col_start = k * DIM;   // first im2col col in this A-tile
+
+      for (int tr = 0; tr < DIM; tr++) {
+        int r   = row_start + tr;
+        int pi  = r / PATCHES_X;
+        int pj  = r % PATCHES_X;
+        for (int tc = 0; tc < DIM; tc++) {
+          int col = col_start + tc;
+          int c   = col / (CONV_KSZ * CONV_KSZ);
+          int rem = col % (CONV_KSZ * CONV_KSZ);
+          int dy  = rem / CONV_KSZ;
+          int dx  = rem % CONV_KSZ;
+          a_tile_buf[tr][tc] = X_in[c][pi * CONV_KSZ + dy][pj * CONV_KSZ + dx];
+        }
+      }
+
+      // DMA the freshly-built tile into the scratchpad via port 0.
+      gemmini_extended_mvin(
+          (void*)a_tile_buf,
+          a_base + (i * tiles_K + k) * DIM,
+          DIM, DIM);
+    }
+
+    if (idx < total_b) {
+      int j = idx / tiles_K;
+      int k = idx % tiles_K;
+      gemmini_extended_mvin2(
+          (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+          b_base + (j * tiles_K + k) * DIM,
+          DIM, DIM);
+    }
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+      tiles_I, tiles_J, tiles_K, 0, 0, tiles_K);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+      a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+      false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}

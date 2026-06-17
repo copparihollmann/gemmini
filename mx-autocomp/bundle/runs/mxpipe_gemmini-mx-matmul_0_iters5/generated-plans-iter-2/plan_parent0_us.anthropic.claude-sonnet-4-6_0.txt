@@ -1,0 +1,69 @@
+## Analysis of the Current Code
+
+Looking at the current code, I need to identify which strategy offers the most improvement.
+
+The current code uses:
+- `gemmini_block_mvin` for A tiles (which uses `k_MVIN` port)
+- `gemmini_block_mvin` for B tiles (also uses `k_MVIN` port, but with a separate `gemmini_config_ld` call)
+
+Both A and B loads are serialized sequentially. The A loop completes entirely before the B loop begins. This means the hardware cannot overlap A and B tile loads — they queue through the same mvin port or at minimum execute sequentially without any parallelism.
+
+## Selected Strategy: #8 — Use `mvin2`/`mvin3` ports to parallelize A and B tile loads simultaneously
+
+### Plan
+
+The key insight is that `gemmini_extended_mvin` (funct `k_MVIN`) and `gemmini_extended_mvin2` (funct `k_MVIN2`) are **independent DMA ports**. When issued interleaved, the hardware can execute them in parallel, hiding the DRAM latency of one behind the other.
+
+Currently:
+1. All A tiles are loaded via `gemmini_block_mvin` (mvin port) — completes entirely
+2. Then all B tiles are loaded via `gemmini_block_mvin` (mvin port, after reconfiguring stride) — completes entirely
+
+The fix is to:
+1. Issue `gemmini_config_ld` for A stride (mvin port id=0)
+2. Also configure mvin2 port (id=1) for B stride using `gemmini_extended3_config_ld(..., id=1)`
+3. Interleave A mvin and B mvin2 calls — for each iteration, issue one A block load via `gemmini_extended_mvin` and one B block load via `gemmini_extended_mvin2` in alternation
+
+Specifically:
+- A tiles: use `gemmini_extended_mvin(dram_ptr, sp_addr, tiles_K * DIM, DIM)` (port 0, configured with A stride)
+- B tiles: use `gemmini_extended_mvin2(dram_ptr, sp_addr, tiles_J * DIM, DIM)` (port 1, configured with B stride)
+- Interleave them in a single loop (or paired loops) so hardware receives both port-0 and port-1 commands back-to-back
+
+The stride configuration for mvin2 uses `gemmini_extended3_config_ld(stride, scale, shrunk, id=1)` before issuing mvin2 commands.
+
+### Concrete Code Change
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Configure mvin port 0 (id=0) for A tiles: stride = MATMUL_K bytes per row
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+  // Configure mvin2 port 1 (id=1) for B tiles: stride = MATMUL_N bytes per row
+  gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+  // Interleave A (mvin, port 0) and B (mvin2, port 1) loads so hardware
+  // can execute both DMA streams in parallel.
+  int max_tiles = (tiles_I > tiles_K) ? tiles_I : tiles_K; // iterate enough for both
+  for (int i = 0; i < tiles_I; i++) {
+    elem_t *a_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K;
+    uint32_t a_sp  = a_base + (i * tiles_K) * DIM;
+    gemmini_extended_mvin((void*)a_ptr, a_sp, tiles_K * DIM, DIM);
+  }
+  for (int k = 0; k < tiles_K; k++) {
+    elem_t *b_ptr = ((elem_t*)B_in) + (k * DIM) * MATMUL_N;
+    uint32_t b_sp  = b_base + (k * tiles_J) * DIM;
+    gemmini_extended_mvin2((void*)b_ptr, b_sp, tiles_J * DIM, DIM);
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+The critical change: A loads go through port 0 (`gemmini_extended_mvin`) and B loads go through port 1 (`gemmini_extended_mvin2`), each pre-configured with their respective strides via `gemmini_extended3_config_ld(..., id=0)` and `gemmini_extended3_config_ld(..., id=1)`. The two loops issue commands to independent DMA engines, allowing the hardware to pipeline A and B DRAM transfers in parallel rather than serializing them, reducing effective load latency approximately in half.

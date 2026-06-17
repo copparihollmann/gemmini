@@ -1,0 +1,83 @@
+Looking at the error, the issue is that B tiles are being loaded with `gemmini_extended_mvin2` (port 1), but the MX `loop_ws_spad` requires all inputs to be loaded via the port-0 scratchpad region using `gemmini_extended_mvin` (single port). I need to change all `mvin2` calls to `mvin` for B tiles.
+
+```c
+void solution(void) {
+    // REAL_M = 8, which fits in exactly 1 DIM=16 tile (pad_i = 8)
+    // Collapse all block loops into a single accelerator invocation
+    int tiles_I = 1;                          // ceil(REAL_M / DIM) = 1
+    int tiles_J = REAL_N / DIM;               // REAL_N must be multiple of DIM
+    int tiles_K = MATMUL_K / DIM;
+
+    int pad_i = DIM - REAL_M;                 // = 16 - 8 = 8
+    int pad_j = 0;                            // REAL_N assumed multiple of DIM
+
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+
+    int SPAD_DEST = 128;
+
+    // Step 1: Configure execution (fp8 E4M3 inputs, BF16 output)
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                /*C_stride*/1, /*A_stride*/1,
+                                /*A_transpose*/0, /*B_transpose*/0,
+                                /*set_only_strides*/false,
+                                /*act_mx_fmt*/0, /*wgt_mx_fmt*/0,
+                                /*out_mx_fmt*/3, /*uselut*/0);
+
+    // Step 2: Load scales directly from DRAM
+    // sel=0: A (activation) scales, sel=1: B (weight) scales
+    gemmini_mx_load_scales((uint64_t)A_scales_row, sizeof(A_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)B_scales_col, sizeof(B_scales_col), 1);
+
+    // Step 3: MVIN A tiles into scratchpad via port 0
+    // A layout: a_base + (i*tiles_K + k)*DIM, stride = MATMUL_K bytes per row
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+        for (int k = 0; k < tiles_K; k++)
+            gemmini_extended_mvin(
+                (void*)(((elem_t*)A_in) + (i * DIM) * MATMUL_K + k * DIM),
+                a_base + (i * tiles_K + k) * DIM,
+                DIM, DIM);
+
+    // Step 4: MVIN B tiles into scratchpad via port 0 (must use mvin, not mvin2)
+    // B in DRAM is [K][N], stride = MATMUL_N bytes per row
+    // b_base grows downward from top of scratchpad
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+    for (int j = 0; j < tiles_J; j++)
+        for (int k = 0; k < tiles_K; k++)
+            gemmini_extended_mvin(
+                (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + j * DIM),
+                b_base + (j * tiles_K + k) * DIM,
+                DIM, DIM);
+
+    // Step 5: Configure output stride and requantizer bounds
+    gemmini_config_st(REAL_N * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                 /*i_bound*/tiles_I,
+                                 /*j_bound*/tiles_J,
+                                 /*k_bound*/tiles_K,
+                                 /*scale_act_sel*/0,
+                                 /*scale_w_sel*/0,
+                                 /*lut_update_granularity*/1);
+
+    // Step 6: Execute fused tiled matmul (one-shot)
+    // B spad end address = BANK_NUM * BANK_ROWS (top of scratchpad)
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K,
+                         pad_i, pad_j, 0,
+                         a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                         false, false,
+                         false, false, false,
+                         NO_ACTIVATION, 0, 0, false, 0x38);
+
+    // Step 7: Drain BF16 results from mx_smem to DRAM
+    // Results are packed 4 BF16 per uint64; read REAL_M rows x REAL_N cols
+    for (int r = 0; r < REAL_M; r++)
+        gemmini_mx_read_smem(
+            &C_hw[r][0],
+            SPAD_DEST * 16 + r * REAL_N,
+            REAL_N);
+
+    gemmini_fence();
+}
+```

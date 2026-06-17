@@ -1,0 +1,95 @@
+An elegant and highly effective optimization plan to address the performance bottlenecks in the provided code.
+
+### Strategy Selection
+We will apply **Strategy 2 ("Other methods not listed here")** to implement **temporal scratchpad reuse** and **eliminate redundant CPU-side data staging**. 
+
+### Analysis of Inefficiencies
+1. **Redundant DRAM and Scale Loading:** The baseline code loads the activation matrix $A$ and its scale factors (`A_scales_row`) inside the inner `j0` loop. Since $A$ is independent of $j0$ (the column/N-dimension of $B$), it is re-loaded from DRAM to the scratchpad $16\times$ too often.
+2. **Useless CPU Staging (`memcpy`):** The baseline copies `A_scales_row` into `A_s_pool` using CPU-side `memcpy` loops. However, because `BLOCKS_M = 1` (since `REAL_M = 1`), the entirety of the $A$ scales are already completely contiguous in DRAM. We can load them directly via `gemmini_mx_load_scales` without any CPU staging overhead.
+
+### Optimization Plan
+1. **Hoist $A$ and A-Scales out of the inner loop:** Load $A$ into the scratchpad at `a_base` and load its scales into `mx_scale_a_mem` once *before* starting the $j0$ loop.
+2. **Preserve $A$ in Scratchpad:** Since $A$ takes up rows `0` to `4095` and $B$ takes up rows `4096` to `8191` (`b_base`), they never overlap. We can safely keep $A$ resident in the scratchpad across all $j0$ iterations.
+3. **Streamline $B$ Scale Staging:** Keep only the staging buffer for $B$ (`B_s_pool`) and reduce its dimensions since we no longer need to stage $A$'s scales.
+
+---
+
+### Optimized Code
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+
+// Optimized Phase 3 Solution
+void solution(void) {
+  // B_s_pool needs to be unique per j0 to avoid write-after-read races when gemmini_fence() is deferred.
+  static uint8_t B_s_pool[BLOCKS_N][MATMUL_K / 32][BLK];
+
+  int tiles = BLK / DIM;
+  int tiles_K = MATMUL_K / DIM;
+  uint32_t a_base = 0;
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+  int SPAD_DEST = 128;
+
+  gemmini_flush(0);
+
+  // 1. Configure execution formats and strides (only once)
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // 2. Load A scales directly from the contiguous DRAM array (0 CPU-staging cost!)
+  gemmini_mx_load_scales((uint64_t)A_scales_row, A_S_BYTES, 0);
+
+  // 3. Hoist the loading of the A matrix from DRAM to scratchpad (runs once instead of 16x)
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i * DIM) * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    }
+  }
+
+  // 4. Process B columns sequentially
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    int ncols = REAL_N - j0 * BLK;
+    if (ncols > BLK) ncols = BLK;
+    if (ncols <= 0) continue;
+
+    int pad_j = BLK - ncols;
+
+    // Stage B scales for the current column block to its unique staging slot
+    for (int g = 0; g < MATMUL_K / 32; g++) {
+      memcpy(&B_s_pool[j0][g][0], &B_scales_col[g][j0 * BLK], BLK);
+    }
+
+    // Load B scales
+    gemmini_mx_load_scales((uint64_t)B_s_pool[j0], B_S_BYTES, 1);
+
+    // Load B data into scratchpad
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+    for (int j = 0; j < tiles; j++) {
+      for (int k = 0; k < tiles_K; k++) {
+        gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                              b_base + (k * tiles + j) * DIM, DIM, DIM);
+      }
+    }
+
+    // Configure the output writer
+    gemmini_config_st(BLK_OUTC * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+
+    // Compute using the persistent A in scratchpad
+    gemmini_loop_ws_spad(tiles, tiles, tiles_K, BLK - REAL_M, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+    // Read out results to DRAM
+    for (int r = 0; r < REAL_M; r++) {
+      gemmini_mx_read_smem(&C_hw[r][(j0 * BLK) / BF16_PER_WORD],
+                           SPAD_DEST * 16 + r * BLK, ncols);
+    }
+  }
+
+  // Defer final synchronization to the very end
+  gemmini_fence();
+}
+```

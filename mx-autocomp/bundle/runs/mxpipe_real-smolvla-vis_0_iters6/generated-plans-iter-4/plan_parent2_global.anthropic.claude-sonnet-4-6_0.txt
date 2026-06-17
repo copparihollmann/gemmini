@@ -1,0 +1,75 @@
+## Analysis of the Current Code
+
+The current code has an outer `i0 × j0` loop where each iteration:
+1. Does `memcpy` to stage scales into `A_s`/`B_s` buffers
+2. Calls `gemmini_flush(0)` (full pipeline flush)
+3. Issues `gemmini_extended3_config_ex` (full reconfiguration)
+4. Loads scales, mvins A and B tiles, configures mvout
+5. Runs `gemmini_loop_ws_spad`
+6. Reads results back
+
+The diagnostic says "CPU/host data staging detected (2 memcpy)" and the feedback confirms the `memcpy` calls for scales are unnecessary overhead. However, looking more carefully, the **dominant inefficiency** the feedback calls out is that scratchpad/accumulator utilization is **0KB out of 256KB/64KB**.
+
+## Identifying the Right Strategy
+
+The current code uses `BLK` tiles at a time. Looking at the problem:
+- `MATMUL_K=256`, so `tiles_K = 256/16 = 16`
+- `BLK` appears to be some block size for M and N tiling
+- The outer loops iterate over `BLOCKS_M × BLOCKS_N` blocks
+
+The scratchpad is 8192 rows × 16 bytes = **128KB**. With `tiles_K=16` and `tiles=BLK/16`, the current scratchpad usage is `(tiles*tiles_K + tiles*tiles_K)*16` rows. If `BLK=16` (1 tile), that's only `(1*16 + 1*16)*16 = 512` rows out of 8192 — only 6.25% utilization!
+
+**Strategy 2 (loop reordering and restructuring)** is the right choice: restructure the outer tiling to increase `tiles_I` and `tiles_J` per invocation, loading more A and B tiles into the scratchpad simultaneously and amortizing the fixed per-invocation overhead (`gemmini_flush`, `config_ex`, `load_scales`) across more compute work.
+
+## Plan: Loop Reordering and Restructuring to Increase Scratchpad Utilization
+
+### Problem
+The current code processes one `BLK×BLK` output tile at a time, where `BLK` appears small relative to the scratchpad capacity. Each outer iteration pays:
+- `gemmini_flush(0)` — full pipeline stall
+- `gemmini_extended3_config_ex` — full reconfiguration
+- 2× `gemmini_mx_load_scales` — scale reload
+- All mvin overhead for A and B
+
+### Scratchpad Capacity Analysis
+With `tiles_K=16` (K=256), the scratchpad constraint is:
+```
+(tiles_I * tiles_K + tiles_J * tiles_K) * DIM ≤ 8192
+(tiles_I + tiles_J) * 16 * 16 ≤ 8192
+(tiles_I + tiles_J) ≤ 32
+```
+So we can fit e.g. `tiles_I=16, tiles_J=16` (i.e., M_block=256, N_block=256 per invocation).
+
+For the full problem (M=113, N=256, K=256):
+- `tiles_K = 16`
+- Maximum `tiles_I` from M: `ceil(113/16) = 8` tiles (with padding)
+- Maximum `tiles_J` from N: `256/16 = 16` tiles
+- Check: `(8 + 16) * 16 = 384 ≤ 8192` ✓
+- Accumulator: `tiles_I * tiles_J * DIM = 8 * 16 * 16 = 2048 ≤ 256`... **2048 > 256** ✗
+
+So we can't do all of M×N at once. Let's find the right split:
+- Accumulator constraint: `tiles_I * tiles_J * 16 ≤ 256` → `tiles_I * tiles_J ≤ 16`
+- With `tiles_J=16` (full N), `tiles_I ≤ 1` — too small
+- With `tiles_J=8` (N_block=128), `tiles_I ≤ 2` (M_block=32)
+- With `tiles_J=4` (N_block=64), `tiles_I ≤ 4` (M_block=64)
+
+Actually re-reading the accumulator section: accumulator rows = 256, each row is DIM wide. C tiles need `tiles_I * tiles_J * DIM` rows. With `tiles_I=4, tiles_J=4`: `4*4*16 = 256` rows — exactly fits!
+
+### Restructured Approach
+
+Instead of iterating over small `BLK×BLK` blocks, restructure to process larger tiles per invocation. Choose `BLOCK_I = 4*DIM = 64` and `BLOCK_J = 4*DIM = 64` so that:
+- `local_tiles_I = 4`, `local_tiles_J = 4`, `tiles_K = 16`
+- Scratchpad: `(4*16 + 4*16)*16 = 2048` rows ≤ 8192 ✓  
+- Accumulator: `4*4*16 = 256` rows ≤ 256 ✓
+
+This reduces the number of outer iterations from `BLOCKS_M * BLOCKS_N` to `ceil(M/64) * ceil(N/64)`, amortizing `gemmini_flush`, `config_ex`, and `load_scales` over 16× more compute per invocation. The `memcpy` for scales also shrinks proportionally to the block size.
+
+The key changes are:
+1. Set `BLOCK_I = 64` and `BLOCK_J = 64` (or the largest values satisfying both scratchpad and accumulator constraints)
+2. The outer loops iterate in steps of `BLOCK_I` and `BLOCK_J` instead of `BLK`
+3. Per iteration: `local_tiles_I = min(ceil((REAL_M - i0*BLOCK_I)/DIM), BLOCK_I/DIM)` and similarly for J
+4. Scale staging copies `local_tiles_I * DIM` rows for A and `local_tiles_J * DIM` cols for B
+5. `b_base` is recalculated per invocation as `BANK_NUM*BANK_ROWS - local_tiles_K * local_tiles_J * DIM`
+6. `gemmini_mxquant_config_mvout` uses `local_tiles_I, local_tiles_J, tiles_K`
+7. The result readout loops over `mrows × ncols` using the new block dimensions
+
+This directly addresses the "0KB scratchpad utilization" feedback by filling the scratchpad to near capacity on each invocation, reducing the total number of expensive per-block setup operations by up to 16×.

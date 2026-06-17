@@ -1,0 +1,44 @@
+## Analysis of the Current Code
+
+The current code processes one (i0, j0) block at a time in a nested loop over `BLOCKS_M × BLOCKS_N`. For each block, it:
+1. Does `memcpy` of scale factors from the full `A_scales_row`/`B_scales_col` arrays into staging buffers `A_s`/`B_s`
+2. Calls `gemmini_flush(0)` every iteration
+3. Loads scales, mvins tiles, and runs the matmul
+
+The key inefficiency I'm targeting is **Strategy 5: assign B tiles to fixed high-address scratchpad region to enable weight-stationary reuse across I tiles**.
+
+## Identifying the Opportunity
+
+Currently, for every `(i0, j0)` pair, B tiles are re-loaded from DRAM. But in weight-stationary dataflow, B (weights) are fixed while A (activations) changes across `i0`. If we **restructure the loop order** so we iterate `j0` in the outer loop and `i0` in the inner loop, the B tiles for a given `j0` can be loaded **once** and reused across all `i0` iterations.
+
+This is exactly Strategy 5: place B tiles at a fixed `b_base` in the scratchpad and reuse them across the I-dimension sweep.
+
+## Concrete Plan
+
+**Restructure the loop order from `(i0, j0)` to `(j0, i0)`:**
+
+1. Move `j0` to the outer loop and `i0` to the inner loop.
+2. Load B tiles for the current `j0` block **once** before the `i0` inner loop (including the scale factors for B).
+3. Inside the `i0` inner loop, only load A tiles and A scale factors, then run compute and readout.
+4. This eliminates `BLOCKS_M - 1` redundant B mvin sequences and B scale loads per `j0` block.
+
+**Scale factor handling:**
+- Load `B_s` (for the current `j0`) **outside** the `i0` loop — call `gemmini_mx_load_scales` for B once per `j0`.
+- Load `A_s` (for the current `i0`) **inside** the `i0` loop — call `gemmini_mx_load_scales` for A each iteration (since A scale blocks change with `i0`).
+- Per rule 6, both A and B scales must be loaded before `gemmini_loop_ws_spad`, so we must still issue both `gemmini_mx_load_scales` calls before each `loop_ws_spad`. However, the B scale data loaded at the start of the `j0` iteration is **already in `mx_scale_b_mem`** — we just need to avoid overwriting it. We can skip re-issuing B scale load each `i0` iteration by recognizing it persists in hardware state (per the architecture doc: "Scale factors persist in hardware state until overwritten").
+- Therefore: issue B scale load once per `j0`, issue A scale load once per `i0`, both satisfy the ordering constraint.
+
+**B tile mvin placement:**
+- B tiles are placed at `b_base = BANK_NUM*BANK_ROWS - tiles_K*tiles_J*DIM` once per `j0` block.
+- The mvin of B happens outside the `i0` loop.
+- `gemmini_flush` is also moved outside the `i0` loop (issued once per `j0` block).
+- `gemmini_extended3_config_ex` is moved outside the `i0` loop as well.
+
+**A tile mvin and readout remain inside `i0` loop:**
+- A tiles change with `i0`, so they must be re-mvin'd each iteration.
+- The `gemmini_config_ld` for A can be issued once per `j0` (before the `i0` loop) since the stride is the same for all `i0`.
+- The memcpy of B scales is removed from the inner loop; memcpy of A scales remains.
+
+**Expected savings:**
+- For a problem with `BLOCKS_N` j-blocks and `BLOCKS_M` i-blocks, this eliminates `(BLOCKS_M - 1)` B-tile mvin sequences and `(BLOCKS_M - 1)` B-scale memcpy+load operations per j-block.
+- Reduces total mvin commands approximately by a factor proportional to `BLOCKS_M`.

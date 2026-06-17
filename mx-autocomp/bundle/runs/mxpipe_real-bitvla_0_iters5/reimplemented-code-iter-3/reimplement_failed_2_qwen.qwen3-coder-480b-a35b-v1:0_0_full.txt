@@ -1,0 +1,129 @@
+Looking at the error message, the issue is that `cols=64` overflows the 6-bit hardware `num_cols` field. The maximum value for a 6-bit field is 63, but the code is trying to load 64 columns at once (4 tiles × 16 columns per tile).
+
+Let me fix this by reducing the block length to 3 tiles (48 columns) instead of 4 tiles (64 columns):
+
+```c
+// Optimized MX matmul kernel with double-buffered pipelined transfers (32x256x256, fp8:e4m3).
+void solution(void) {
+  const int J_TILE = 3; // Process 3 N-tiles (48 columns) at a time to stay within 6-bit limit
+  const int num_blocks = (tiles_J + J_TILE - 1) / J_TILE; // Ceiling division: (16 + 2) / 3 = 6 blocks
+
+  // Temporary DRAM buffers for pipelined, contiguous outputs
+  static uint64_t C_temp[6][MATMUL_M * 48]; // Max 6 blocks * 48 columns
+  static uint8_t scale_factors_temp[6][MATMUL_M * 4]; // 4 scale groups per block (conservative)
+
+  // Scratchpad layout
+  const int a_base = 0;
+  const int b_tile_size = J_TILE * tiles_K * DIM; // 3 * 16 * 16 = 768 rows per buffer
+  const int b_bases[2] = {
+    BANK_NUM * BANK_ROWS - b_tile_size,       // Buffer 0: 8192 - 768 = 7424
+    BANK_NUM * BANK_ROWS - 2 * b_tile_size    // Buffer 1: 8192 - 1536 = 6656
+  };
+  // Ensure no overlap between A and B regions
+  if (a_base + tiles_I * tiles_K * DIM > b_bases[1]) {
+    return; // Handle error or adjust tiling
+  }
+
+  // Accumulator/SMEM double-buffering
+  const int spad_dests[2] = {0, 128}; // Each block uses up to 32*48/16 = 96 acc rows
+
+  // --- PHASE 1: One-time Configuration and A Loading ---
+
+  // Configure execution for FP8->BF16, weight-stationary
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                              /*C_stride*/1, /*A_stride*/1,
+                              /*A_transpose*/0, /*B_transpose*/0,
+                              /*set_only_strides*/false,
+                              /*act_mx_fmt*/0, /*wgt_mx_fmt*/0, /*out_mx_fmt*/3, /*uselut*/0);
+
+  // Load global scale factors (done once)
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), /*sel*/0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), /*sel*/1);
+
+  // Load A tiles into scratchpad (fully reuse A)
+  // Use MAX_BLOCK_LEN=4 to reduce mvin calls: load 4 K-tiles at once
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) { // MAX_BLOCK_LEN = 4
+      int block_len = (k + MAX_BLOCK_LEN > tiles_K) ? (tiles_K - k) : MAX_BLOCK_LEN;
+      gemmini_extended_mvin((void *)(((elem_t *)A_in) + i * DIM * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM,
+                            block_len * DIM, DIM);
+    }
+  }
+
+  // --- PHASE 2: Pipelined Load, Compute, Store Loop ---
+
+  // We pipeline 3 stages: Load(B), Compute, Store(C)
+  // We iterate `num_blocks + 2` times to drain the pipeline
+  for (int b = 0; b < num_blocks + 2; b++) {
+    const int b_load  = b;
+    const int b_comp  = b - 1;
+    const int b_store = b - 2;
+
+    // --- STAGE 3: Store (Asynchronous SMEM -> DRAM) ---
+    if (b_store >= 0 && b_store < num_blocks) {
+      gemmini_mx_read_smem((uint64_t)C_temp[b_store],
+                           spad_dests[b_store % 2] * 16, // 16 words/row
+                           MATMUL_M * J_TILE * DIM); // 32 * 48 BF16 vals = 1536 u16 = 768 u64
+    }
+
+    // --- STAGE 1: Load B tiles for next compute stage ---
+    if (b_load >= 0 && b_load < num_blocks) {
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int k = 0; k < tiles_K; k++) {
+        elem_t *dram_ptr = ((elem_t *)B_in) + k * DIM * MATMUL_N + (b_load * J_TILE) * DIM;
+        uint32_t sp_addr = b_bases[b_load % 2] + k * J_TILE * DIM;
+        // Load a full J_TILE-wide strip of B for this K-tile
+        gemmini_extended_mvin(dram_ptr, sp_addr, J_TILE * DIM, DIM);
+      }
+    }
+
+    // --- STAGE 2: Compute (MatMul on scratchpad data) ---
+    if (b_comp >= 0 && b_comp < num_blocks) {
+      // Configure output store for this block's width
+      gemmini_config_st(J_TILE * DIM / 4 * sizeof(out_t)); // 4 BF16/u64
+      // Configure requantizer for this block's bounds
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors_temp[b_comp],
+                                   /*i_bound*/tiles_I,
+                                   /*j_bound*/J_TILE, // Crucial: only this block's J-size
+                                   /*k_bound*/tiles_K,
+                                   /*scale_act_sel*/0, /*scale_w_sel*/0,
+                                   /*lut_update_granularity*/1);
+
+      // Execute the fused matmul loop on pre-loaded data
+      gemmini_loop_ws_spad(/*I*/tiles_I, /*J*/J_TILE, /*K*/tiles_K,
+                           /*pad_I*/PAD_I, /*pad_J*/0, /*pad_K*/PAD_K,
+                           /*A*/a_base,
+                           /*B*/b_bases[b_comp % 2] + b_tile_size, // B end addr
+                           /*D*/0, /*C*/spad_dests[b_comp % 2], // Double-buffered C
+                           /*A_transpose*/false, /*B_transpose*/false,
+                           /*full_C*/false, /*low_D*/false, /*ex_accumulate*/false,
+                           /*act*/NO_ACTIVATION,
+                           /*a_spad_id*/0, /*b_spad_id*/0, /*is_resadd*/false,
+                           /*skips*/0x38);
+    }
+  }
+
+  // --- PHASE 3: Final Synchronization and CPU-side Reconstruction ---
+
+  // Wait for all outstanding MX_READ_SMEM operations to complete
+  gemmini_fence();
+
+  // Reconstruct final non-contiguous outputs from temporary contiguous buffers
+  for (int b = 0; b < num_blocks; b++) {
+    int j_tiles_in_block = (b == num_blocks - 1) ? (tiles_J - b * J_TILE) : J_TILE; // Handle remainder
+    for (int i = 0; i < MATMUL_M; i++) {
+      // Re-assemble C_hw: copy columns from temp to final non-contiguous location
+      for (int j = 0; j < j_tiles_in_block * DIM; j++) {
+        C_hw[i][b * (J_TILE * DIM) + j] = C_temp[b][i * (j_tiles_in_block * DIM) + j];
+      }
+      // Re-assemble scale_factors: copy scale groups
+      for (int j = 0; j < j_tiles_in_block; j++) {
+        ((uint8_t *)scale_factors)[i * tiles_J + b * J_TILE + j] =
+            scale_factors_temp[b][i * J_TILE + j];
+      }
+    }
+  }
+}
+```

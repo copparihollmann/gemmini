@@ -1,0 +1,54 @@
+## Analysis
+
+Looking at the code, I can identify the key inefficiency to target:
+
+**The second `gemmini_flush(0)` before the P@V matmul is unnecessary.** After the S1 computation, `gemmini_mx_read_smem` is called followed by `gemmini_fence()`. The fence already drains the pipeline completely. The `gemmini_flush(0)` call before the P@V matmul performs a full pipeline reset (clearing all state, flushing the TLB, resetting the systolic array), which is expensive and redundant when the pipeline is already known to be quiescent.
+
+However, looking more carefully at the strategies and the profiling note, I want to apply **strategy 13: use `gemmini_extended_mvin2` for B-tile (KT/V) loads concurrently with `gemmini_extended_mvin` for A-tile (Q/P) loads**.
+
+## Plan: Strategy 13 — Use `gemmini_extended_mvin2` for B-tile loads
+
+### Why this helps
+
+Currently, both kernels (S1 = Q @ K^T and O = P @ V) load A tiles using `gemmini_extended_mvin` (port 0), then load B tiles also using `gemmini_extended_mvin` (port 0) — sequentially. These are issued back-to-back on the same port, so they are fully serialized.
+
+The hardware provides **two independent mvin ports**: `gemmini_extended_mvin` (port 0, for A/activation tiles) and `gemmini_extended_mvin2` (port 1, for B/weight tiles). By issuing A-tile loads on port 0 and B-tile loads on port 1, the DMA engine can pipeline both transfers concurrently, approximately halving the mvin latency.
+
+### Specific changes
+
+**In the S1 = Q @ K^T block:**
+- Keep `gemmini_extended_mvin(...)` for Q (A) tiles — these already use port 0.
+- Change `gemmini_extended_mvin(...)` for KT (B) tiles to `gemmini_extended_mvin2(...)`.
+- This requires a separate `gemmini_config_ld` call for each port before the corresponding mvin loop. Port 0 is configured with stride `ATT_D * sizeof(elem_t)` for Q, and port 1 (via a separate `gemmini_config_ld` with `id=1`) is configured with stride `ATT_S * sizeof(elem_t)` for KT. Use `gemmini_extended3_config_ld(stride, scale, shrunk, id)` where `id=0` for A tiles and `id=1` for B tiles.
+- Interleave the A and B mvin loops so that port 0 and port 1 work simultaneously: issue one A-tile load on mvin, immediately followed by the corresponding B-tile load on mvin2.
+
+**In the O = P @ V block:**
+- Same approach: Q→P uses port 0 (`gemmini_extended_mvin`), V uses port 1 (`gemmini_extended_mvin2`).
+- Configure port 0 with stride `ATT_S * sizeof(elem_t)` for P, port 1 with stride `ATT_D * sizeof(elem_t)` for V.
+- Interleave P and V mvin loops so loads can overlap.
+
+**Second `gemmini_flush(0)` removal (bonus from strategy 12):**
+- Since we're restructuring, also remove the redundant `gemmini_flush(0)` before the P@V block. The `gemmini_fence()` after the S1 `gemmini_mx_read_smem` already ensures the pipeline is drained.
+
+### Concrete loop restructuring
+
+For the S1 block, the interleaved loop structure becomes:
+
+```c
+gemmini_extended3_config_ld(ATT_D * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0); // port 0 for Q
+gemmini_extended3_config_ld(ATT_S * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1); // port 1 for KT
+
+// Interleave A (Q) and B (KT) loads across both ports
+for (int i = 0; i < tiles_I; i++)
+  for (int k = 0; k < tiles_K; k += 2) {
+    int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+    gemmini_extended_mvin(Q_ptr(i,k),  a_base + (i*tiles_K+k)*DIM, bb*DIM, DIM);  // port 0
+  }
+for (int k = 0; k < tiles_K; k++)
+  for (int j = 0; j < tiles_J; j += 2) {
+    int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+    gemmini_extended_mvin2(KT_ptr(k,j), b_base + (k*tiles_J+j)*DIM, bb*DIM, DIM); // port 1
+  }
+```
+
+The key insight is that by using `mvin2` for B tiles after configuring port 1's stride separately, the hardware DMA can process both streams simultaneously. The mvin and mvin2 instruction queues are independent, so the accelerator can overlap data fetches for A and B tiles rather than serializing them. The same applies symmetrically to the P@V block.

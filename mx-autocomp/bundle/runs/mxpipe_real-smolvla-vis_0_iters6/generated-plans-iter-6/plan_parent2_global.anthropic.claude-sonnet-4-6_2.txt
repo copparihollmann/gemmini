@@ -1,0 +1,148 @@
+## Analysis
+
+Looking at the original code, I need to identify which strategy applies best.
+
+**Current code structure:**
+- Outer loop: `j0` (N blocks) — B tiles loaded once per `j0` ✓ (already hoisted)
+- Inner loop: `i0` (M blocks) — A tiles loaded, then compute
+- `gemmini_flush(0)` called inside the inner `i0` loop — this is expensive
+- `skips=0x38` is already set
+- `lut_update_granularity=1` — refreshes every K-step (not relevant for fp8/no-LUT path)
+- `ex_accumulate=false` in `gemmini_loop_ws_spad` — the hardware loop already handles the K reduction internally, so this isn't the issue
+
+**Key inefficiency:** The `gemmini_flush(0)` is called every `i0` iteration (inside both loops). `gemmini_flush` is a full pipeline flush and is very expensive. However, looking at the strategies listed, this isn't one of them.
+
+**Strategy evaluation:**
+
+1. **Double buffering**: Currently B tiles are loaded once per `j0` (correct), A tiles per `i0`. Double buffering A would overlap A mvin with compute from the previous `i0`. This is directly applicable.
+
+2. **Tune `skips` bitmask**: Already set to `0x38`. Let me check — `0x38 = 0b111000`. This skips bits 3,4,5. Could tune further but reference already uses `0x38`.
+
+3. **Raise `lut_update_granularity`**: fp8 path, `uselut=0`. Not applicable.
+
+4. **`ex_accumulate` flag**: The hardware `gemmini_loop_ws_spad` already handles K-reduction internally. `ex_accumulate=false` is correct here since we're not accumulating across separate `loop_ws_spad` calls.
+
+5. **Tile layout for bank conflicts**: Could be relevant but complex.
+
+**Best strategy: Double buffering (Strategy 1)**
+
+The `gemmini_flush(0)` inside the inner loop is extremely costly. But more importantly, the A-tile mvin for the current `i0` block is serialized with the compute of the current block. With double buffering, we can overlap the A mvin for `i0+1` with the compute for `i0`, hiding DMA latency.
+
+Additionally, `gemmini_flush(0)` should be moved outside the loops entirely — it only needs to be called once at startup.
+
+## Plan
+
+**Strategy: Double buffering A tiles to overlap mvin with compute**
+
+**Changes:**
+
+1. **Move `gemmini_flush(0)` outside all loops** — call it once before the `j0` loop. Currently it's called every `i0` iteration, which serializes the pipeline unnecessarily.
+
+2. **Double-buffer A in the scratchpad**: Allocate two A buffers:
+   - `a_base_0 = 0` (first half)
+   - `a_base_1 = tiles * tiles_K * DIM` (second half)
+   
+   Verify scratchpad capacity: `tiles = BLK/DIM`. With `BLK=16, DIM=16`, `tiles=1`. So `tiles_K = MATMUL_K/DIM = 256/16 = 16`. Two A buffers = `2 * 1 * 16 * 16 = 512` rows. B buffer = `1 * 16 * 16 = 256` rows. Total = 768 rows << 8192. Fits.
+
+3. **Prologue**: Before the `i0` loop, mvin A tiles for `i0=0` into `a_base_0`.
+
+4. **Loop body**: For each `i0`, while compute runs on buffer `ping`, mvin A for `i0+1` into buffer `pong`. Since Gemmini's mvin and compute can overlap (mvin issues RoCC instructions that queue independently from compute), issue the next A mvin *before* the `gemmini_loop_ws_spad` for the current tile, so the DMA and systolic array work in parallel.
+
+   Concretely:
+   - Use `a_buf = i0 % 2` to select `a_base_0` or `a_base_1`
+   - Issue mvin for `i0+1` (if it exists) into the other buffer
+   - Then issue `gemmini_loop_ws_spad` using the current buffer
+   - Then drain results
+
+5. **Remove `gemmini_flush(0)` from the inner loop** — only call once before the outer `j0` loop.
+
+6. **Move `gemmini_config_ex`, `gemmini_mx_load_scales` for B** outside the `i0` loop where possible, but note scale loads must precede `loop_ws_spad` — B scales already hoisted to `j0` level and A scales change per `i0`, so A scale load stays in `i0`. Since `gemmini_mx_load_scales` is non-destructive to the other selector's buffer, loading B scales once per `j0` and A scales per `i0` is correct.
+
+7. The `gemmini_extended3_config_ex` call (which doesn't change) can also move outside the `j0` loop entirely since the format never changes.
+
+**Pseudocode sketch:**
+
+```c
+gemmini_flush(0);
+gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                             1, 1, 0, 0, false, 0, 0, 3, 0);
+
+for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    // Stage B scales and mvin B tiles (unchanged)
+    ...
+
+    // Prologue: mvin A for i0=0 into a_base_0
+    int a_base_0 = 0;
+    int a_base_1 = tiles * tiles_K * DIM;
+    
+    // Pre-load first A block
+    {
+        for (int g ...) memcpy A_s for i0=0;
+        gemmini_mx_load_scales(A_s, A_S_BYTES, 0);
+        gemmini_mx_load_scales(B_s, B_S_BYTES, 1);
+        gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+        mvin A[i0=0] into a_base_0;
+    }
+
+    for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+        int cur_a_base = (i0 % 2 == 0) ? a_base_0 : a_base_1;
+        int nxt_a_base = (i0 % 2 == 0) ? a_base_1 : a_base_0;
+        
+        // Prefetch A for i0+1 (overlaps with upcoming compute)
+        if (i0 + 1 < BLOCKS_M) {
+            for (int g ...) memcpy A_s_next for i0+1;
+            // Stage A tiles into nxt_a_base (mvin queues in RoCC, overlaps compute)
+            gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+            mvin A[i0+1] into nxt_a_base;
+        }
+
+        // Compute using cur_a_base (A already loaded in prologue/previous iter)
+        gemmini_config_st(BLK_OUTC * sizeof(out_t));
+        gemmini_mxquant_config_mvout(..., tiles, tiles, tiles_K, 0, 0, 1);
+        gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0,
+                             cur_a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST, ...);
+
+        // Drain results
+        for (int r = 0; r < mrows; r++)
+            gemmini_mx_read_smem(...);
+        gemmini_fence();
+        
+        // Update A scales for the compute we just prefetched
+        // (load A scales for i0+1 must happen before its loop_ws_spad)
+        // Actually: re-load A_s for next iteration before its loop_ws_spad
+    }
+}
+```
+
+**Key ordering constraint**: `gemmini_mx_load_scales` for A (sel=0) must be issued before the `gemmini_loop_ws_spad` that uses those scales. So the double-buffer scheme for A tiles must be paired with loading A scales *for the tile about to compute*, not for the prefetched tile. The mvin (DMA) for the next tile's data can overlap with compute, but scale loads for the next tile should be issued right before the next `gemmini_loop_ws_spad`.
+
+**Revised correct approach:**
+
+Within each `i0` iteration:
+1. Issue mvin for A[i0+1] into `nxt_a_base` — this queues in the RoCC pipeline
+2. Issue `gemmini_loop_ws_spad` for current `i0` using `cur_a_base` — compute starts, mvin for next tile runs in parallel
+3. Drain results, fence
+4. Before next iteration's compute: load A scales for i0+1
+
+But scale loads must precede the `loop_ws_spad` that uses them. So at the top of each `i0` iteration, load A scales for the current tile (before compute), and issue the prefetch mvin for the next tile after that. The mvin overlap happens between mvin[i0+1] and compute[i0].
+
+**Final correct structure per `i0`:**
+```
+// Load A scales for current i0 (before compute)
+load A_s for i0; gemmini_mx_load_scales(A_s, ..., 0);
+gemmini_mx_load_scales(B_s, ..., 1);  // B_s already staged
+
+// Issue prefetch mvin for next A tile (overlaps with compute below)
+if (i0+1 < BLOCKS_M) {
+    mvin A[i0+1] into nxt_a_base;  // queues, overlaps compute
+}
+
+// Configure and compute current tile
+gemmini_mxquant_config_mvout(...);
+gemmini_loop_ws_spad(... cur_a_base ...);
+
+// Drain
+gemmini_mx_read_smem(...); gemmini_fence();
+```
+
+This correctly overlaps the DMA of A[i0+1] with the systolic compute of A[i0].

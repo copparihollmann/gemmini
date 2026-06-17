@@ -1,0 +1,100 @@
+Looking at the error and reviewing the code carefully, I can see several issues that need to be fixed:
+
+1. The `gemmini_mxquant_config_mvout` is being called with `j_bound=block_J` instead of `j_bound=tiles_J` 
+2. The B matrix placement calculation needs to use the full scratchpad size properly
+3. The output draining logic has incorrect addressing
+
+Let me fix these issues:
+
+```c
+#include <stdint.h>
+#include "include/gemmini_testutils.h"
+
+// Optimized MX matmul kernel (32x256x256, fp8:e4m3).
+void solution(void) {
+  // Tile dimensions
+  const int tiles_I = MATMUL_M / DIM; // 32/16 = 2
+  const int tiles_J = MATMUL_N / DIM; // 256/16 = 16
+  const int tiles_K = MATMUL_K / DIM; // 256/16 = 16
+
+  // Apply J-dimension tiling with block_J = 8 to fit accumulator constraint
+  // Accumulator requirement: tiles_I * block_J * DIM = 2 * 8 * 16 = 256 rows (exactly fills single-buffer)
+  const int block_J = 8;
+  const int num_J_blocks = tiles_J / block_J; // 16/8 = 2
+
+  // Calculate scratchpad partition bases
+  const int a_base = 0;
+  // B grows downwards from top of scratchpad, sized for current J block
+  const int b_base = BANK_NUM * BANK_ROWS - block_J * tiles_K * DIM;
+
+  // Verify no overlap between A and B regions
+  const int a_size = tiles_I * tiles_K * DIM; // 2 * 16 * 16 = 512 rows
+  if (a_base + a_size > b_base) {
+    return; // Not enough scratchpad space
+  }
+
+  // 1. Configure execution (FP8 E4M3 formats, BF16 output)
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                              /*C_stride*/1, /*A_stride*/1, /*A_transpose*/0, /*B_transpose*/0,
+                              /*set_only_strides*/false,
+                              /*act_mx_fmt*/0, /*wgt_mx_fmt*/0, /*out_mx_fmt*/3, /*uselut*/0);
+  
+  // 2. Load scale factors (done once, persists in hardware)
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);  // A/activation scales
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);  // B/weight scales
+
+  // 3. Load entire A matrix into scratchpad once (will be reused across all J blocks)
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin(
+        (void *)(((elem_t *)A_in) + i * DIM * MATMUL_K + k * DIM),
+        a_base + (i * tiles_K + k) * DIM,
+        DIM, DIM
+      );
+    }
+  }
+
+  // 4. Process each J block
+  for (int jb = 0; jb < num_J_blocks; jb++) {
+    const int j_start = jb * block_J;  // Starting J tile index for this block
+
+    // Load B tiles for current J block
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+    for (int jj = 0; jj < block_J; jj++) {  // jj is local index within block
+      const int j = j_start + jj;           // j is global J tile index
+      for (int k = 0; k < tiles_K; k++) {
+        gemmini_extended_mvin(
+          (void *)(((elem_t *)B_in) + k * DIM * MATMUL_N + j * DIM),
+          b_base + (jj * tiles_K + k) * DIM,  // Place in B region with local indexing
+          DIM, DIM
+        );
+      }
+    }
+
+    // 5. Configure the requantized mvout for current block
+    // Fix: j_bound should be tiles_J, not block_J, to match the full computation scope
+    gemmini_config_st(MATMUL_N * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                 /*i_bound*/tiles_I, /*j_bound*/tiles_J, /*k_bound*/tiles_K,
+                                 /*scale_act_sel*/0, /*scale_w_sel*/0, /*lut_update_granularity*/1);
+  
+    // 6. Run weight-stationary compute loop for current J block
+    // Fix: B base address should point to the actual B data location for this block
+    gemmini_loop_ws_spad(tiles_I, block_J, tiles_K, 0, 0, 0,
+                         a_base, b_base, 0, SPAD_DEST,
+                         false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+                       
+    // 7. Drain output block from shared memory to DRAM with proper striding
+    // Fix: Correct the destination addressing for the output block
+    gemmini_mx_read_smem(
+      (uint64_t)&C_hw[0][j_start * DIM],  // Destination: start of J block column
+      SPAD_DEST * 16,                     // Source offset in mx_smem
+      tiles_I * block_J * DIM * DIM       // Number of BF16 elements (2 * 8 * 16 * 16 = 4096)
+    );
+  }
+
+  // 8. Synchronize execution
+  gemmini_fence();
+}
+```

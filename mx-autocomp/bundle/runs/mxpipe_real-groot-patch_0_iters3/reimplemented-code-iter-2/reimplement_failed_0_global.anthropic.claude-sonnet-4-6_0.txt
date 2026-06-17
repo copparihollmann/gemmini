@@ -1,0 +1,95 @@
+void solution(void) {
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_config_st(BLK_OUTC * sizeof(out_t));
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      int tiles_I = BLK / DIM;
+      int tiles_J = BLK / DIM;
+      int tiles_K = MATMUL_K / DIM;
+
+      // Gather the per-block scales for this output tile
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+
+      uint32_t a_base = 0;
+      // B placed at top of scratchpad, layout: b_base + (j * tiles_K + k) * DIM
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_J * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows;
+      int pad_j = BLK - ncols;
+
+      // Step 1: Configure execution (format fields for FP8 E4M3 -> BF16 output)
+      // Already set above, no need to re-issue unless format changes
+
+      // Step 2: Load scale factors for this tile's A and B blocks
+      // sel=0 -> A (activation) scales, sel=1 -> B (weight) scales
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      // Step 3: No LUT load needed (uselut=0, fp8 path)
+
+      // Step 4: MVIN tiles of A into scratchpad
+      // A is stored row-major [M][K], stride = MATMUL_K bytes per row
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles_I; i++) {
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM,
+            DIM, DIM);
+        }
+      }
+
+      // Step 4 (continued): MVIN tiles of B into scratchpad
+      // B is stored row-major [K][N], stride = MATMUL_N bytes per row
+      // Layout in spad: b_base + (j * tiles_K + k) * DIM
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int j = 0; j < tiles_J; j++) {
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+            b_base + (j * tiles_K + k) * DIM,
+            DIM, DIM);
+        }
+      }
+
+      // Step 5: Configure requantized mvout
+      // scale_factors is the DRAM address for output requantization scales
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+          tiles_I, tiles_J, tiles_K,
+          /*scale_act_sel*/0, /*scale_w_sel*/0,
+          /*lut_update_granularity*/1);
+
+      // Step 6: Execute tiled weight-stationary matmul over the scratchpad
+      // funct 24 (LOOP_WS_CONFIG_SPAD_AB) is re-issued inside gemmini_loop_ws_spad
+      // B spad end address = BANK_NUM * BANK_ROWS (top of scratchpad)
+      gemmini_loop_ws_spad(
+          tiles_I, tiles_J, tiles_K,
+          pad_i, pad_j, 0,
+          a_base, BANK_NUM * BANK_ROWS,
+          /*D*/0, SPAD_DEST,
+          /*A_transpose*/false, /*B_transpose*/false,
+          /*full_C*/false, /*low_D*/false, /*ex_accumulate*/false,
+          NO_ACTIVATION, /*a_spad_id*/0, /*b_spad_id*/0,
+          /*is_resadd*/false, /*skips*/0x38);
+
+      // Step 7: Drain BF16-packed results from mx_smem to DRAM
+      // BF16 results are packed 4 per uint64 word; read row by row
+      for (int r = 0; r < mrows; r++) {
+        gemmini_mx_read_smem(
+          &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+          SPAD_DEST * 16 + r * BLK,
+          ncols);
+      }
+      gemmini_fence();
+    }
+  }
+}

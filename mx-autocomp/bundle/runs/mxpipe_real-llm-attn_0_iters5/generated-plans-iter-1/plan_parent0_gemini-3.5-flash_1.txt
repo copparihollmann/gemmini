@@ -1,0 +1,91 @@
+### Strategy: Temporal Reuse of Activations and Scale Factors via Outer-Loop Hoisting
+
+#### Explanation
+In the baseline tiled matrix multiplication, the outer loops iterate over $i_0$ (the $M$-dimension blocks) and $j_0$ (the $N$-dimension blocks). For a fixed $i_0$ block of the activation matrix $A$ and its corresponding scale factors `A_scales_row`, the data is completely invariant with respect to the inner loop index $j_0$. 
+
+However, the baseline code redundantly copies `A_scales_row` to the host-staged buffer `A_s`, triggers a DMA transfer to load A's scale factors into the hardware scale memory (`sel=0`), and performs DMA `mvin` instructions to reload the $A$ tiles into the scratchpad for **every single iteration** of the $j_0$ loop. 
+
+Since Gemmini's scale-factor SRAM and scratchpad memory persist until explicitly overwritten, we can hoist these operations from the inner $j_0$ loop into the outer $i_0$ loop:
+1. **Scale Loading Hoisting**: The host-side `memcpy` for `A_scales_row` and the `gemmini_mx_load_scales(..., 0)` instruction are executed once per $i_0$ block, saving $BLOCKS\_N - 1$ redundant scale transfers per $i_0$ iteration.
+2. **Activation Tile Hoisting**: The `gemmini_extended_mvin` loop for the activation tiles is executed once per $i_0$ block, placing the activation data into the bottom of the scratchpad (`a_base`). It is reused across all $j_0$ iterations, reducing the activation DMA overhead by a factor of $BLOCKS\_N$.
+
+---
+
+### Optimized Code
+
+```c
+// AUTO-GENERATED outer-tiled MX matmul optimized via outer-loop hoisting (8x512x512).
+void solution(void) {
+  gemmini_flush(0);
+  
+  // Configure execution format once at the very beginning
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    // Partial last M block: compute only the real rows, pad the rest.
+    int mrows = REAL_M - i0 * BLK; 
+    if (mrows > BLK) mrows = BLK; 
+    if (mrows <= 0) continue;
+
+    int tiles = BLK / DIM;
+    int tiles_K = MATMUL_K / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+
+    // --- HOISTED: Stage and load activation scale factors ---
+    for (int g = 0; g < MATMUL_K / 32; g++) {
+      memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+    }
+    gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+
+    // --- HOISTED: MVIN activation (A) tiles directly to scratchpad ---
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t)); // A rows: stride K
+    for (int i = 0; i < tiles; i++) {
+      for (int k = 0; k < tiles_K; k++) {
+        gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      }
+    }
+
+    // Inner loop over N-dimension blocks
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int ncols = REAL_N - j0 * BLK; 
+      if (ncols > BLK) ncols = BLK; 
+      if (ncols <= 0) continue;
+
+      // Stage and load weight (B) scale factors
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      // MVIN weight (B) tiles to top of scratchpad
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t)); // B rows: stride N
+      for (int j = 0; j < tiles; j++) {
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+        }
+      }
+
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows;
+      int pad_j = BLK - ncols;
+
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+
+      // Execute hardware matrix multiplication using cached A in scratchpad
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Read output results from shared memory
+      for (int r = 0; r < mrows; r++) {
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      }
+      gemmini_fence();
+    }
+  }
+}
+```

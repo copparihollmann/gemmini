@@ -1,0 +1,303 @@
+CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED baseline MX attention kernel (S=128, D=64).
+void solution(void) {
+  // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&Q_scales_row, sizeof(Q_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&KT_scales_col, sizeof(KT_scales_col), 1);
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    gemmini_config_ld(ATT_S * sizeof(elem_t));   // B=KT[D][S] stride N=S -> slot (k*tiles_J+j)
+    for (int j = 0; j < tiles_J; j++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+    gemmini_fence();
+  }
+
+  // ---- 2) P = softmax(S1) rows on CPU; quantize to fp8 + per-32-group scales ----
+  for (int i = 0; i < ATT_S; i++) {
+    float row[ATT_S];
+    float maxv = -1e30f;
+    for (int j = 0; j < ATT_S; j++) {
+      uint16_t b = (uint16_t)((S1_hw[i][j / 4] >> ((j % 4) * 16)) & 0xFFFF);
+      row[j] = bf16_to_f(b);
+      if (row[j] > maxv) maxv = row[j];
+    }
+    float sum = 0.0f;
+    for (int j = 0; j < ATT_S; j++) { row[j] = exp_f(row[j] - maxv); sum += row[j]; }
+    float inv_sum = 1.0f / sum;
+    for (int j = 0; j < ATT_S; j++) row[j] *= inv_sum;
+    // per-32-group power-of-two scale, then fp8 RTZ encode of row[j]/scale
+    for (int g = 0; g < GROUPS_S; g++) {
+      float gmax = 0.0f;
+      for (int j = g * 32; j < (g + 1) * 32; j++)
+        if (f_abs(row[j]) > gmax) gmax = f_abs(row[j]);
+      int e = 0;
+      // Target a MODERATE fp8 magnitude (gmax -> ~16), NOT fp8-max (448): the MX block
+      // accumulator (mx_loop_ws_spad acc_e=4, max ~488) and product format (prod_e=4)
+      // saturate to inf if P_q*V is large. Scaling P to fp8-max made P_q~256 and overflowed
+      // ~half the P@V outputs to inf/nan (masked by golden-check). gmax/16 keeps P_q codes
+      // O(1) like the matmul\'s header operands; the e8m0 group scale (P_scales) carries
+      // magnitude, so the dequantized result is unchanged. Verified: 0 inf, 47%->88% vs fp32.
+      if (gmax > 0.0f) e = f_exp(gmax / 16.0f) + 1;
+      float inv_scale = pow2i(-e);
+      P_scales[g][i] = (uint8_t)(e + 127);
+      for (int j = g * 32; j < (g + 1) * 32; j++)
+        P_q[i][j] = fp8_e4m3_rtz(row[j] * inv_scale);
+    }
+  }
+
+  // ---- 3) O = P @ V on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+    gemmini_mx_load_scales((uint64_t)&V_scales_col, sizeof(V_scales_col), 1);
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    gemmini_config_ld(ATT_D * sizeof(elem_t));   // B=V[S][D] stride N=D -> slot (k*tiles_J+j)
+    for (int j = 0; j < tiles_J; j++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+    gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+    gemmini_fence();
+  }
+}
+''',
+score=824009,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'Accelerator-bound: compute and data-movement look balanced; tune tiling / scratchpad occupancy for more overlap.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''# Optimization Plan: Strategy 12 — Fuse Softmax Passes into Two-Pass Loop
+
+## Analysis of the Current Code
+
+The CPU softmax kernel (step 2) currently makes **four separate passes** over each row of `S1_hw`:
+
+1. **Pass 1**: Iterate over `j=0..ATT_S-1` to unpack BF16 → float and find `maxv`
+2. **Pass 2**: Iterate over `j=0..ATT_S-1` to compute `exp(row[j] - maxv)` and accumulate `sum`
+3. **Pass 3**: Iterate over `j=0..ATT_S-1` to normalize by `inv_sum`
+4. **Pass 4**: Nested `g=0..GROUPS_S-1`, `j=0..31` loops to find per-group `gmax`, then again to quantize
+
+Each pass reads the full `row[ATT_S]` float buffer (ATT_S=128 floats = 512 bytes), and passes 2–4 also read `S1_hw[i]` for the original BF16 unpack. With ATT_S=128 rows, this is substantial repeated memory traffic over the float buffer.
+
+Additionally, the BF16-unpack bit-manipulation `(S1_hw[i][j/4] >> ((j%4)*16)) & 0xFFFF` is **recomputed** inside each of passes 1–3, since `row[j]` is stored in the local float buffer. The buffer acts as a cache but it\'s re-read 3+ times across the passes.
+
+## The Plan: Fuse into Two Passes
+
+**Strategy 12** directly applies here. We restructure the four passes into exactly **two passes** per row:
+
+### Pass 1 (unchanged): Find `maxv`
+- Unpack BF16 → float for each `j`, storing into `row[j]`
+- Track `maxv`
+
+This is kept as-is because `maxv` must be known before we can compute exp().
+
+### Pass 2 (fused): exp + sum + normalize + per-group max + quantize
+
+Instead of separate normalize, group-max-find, and quantize passes, we do:
+
+1. **Sub-pass 2a**: Compute `row[j] = exp(row[j] - maxv)` for all j, accumulate `sum` — **one loop over j**
+2. Apply `inv_sum` to normalize — **one loop over j** (or fold into sub-pass 2a if we store exp values... but sum isn\'t known until the end)
+
+Actually the cleanest two-pass scheme is:
+
+- **Pass 1**: Unpack + find `maxv` (reads `S1_hw`, writes `row[j]`)
+- **Pass 2**: For each j: compute `softmax_j = exp(row[j] - maxv)`; accumulate `sum` → then second sweep normalizes AND finds per-group max → then third sweep quantizes
+
+Wait — "two-pass" here means we collapse the original 4 passes into 2 passes **over the float buffer** (not over `S1_hw`). The key insight is:
+
+- **Pass 1** over `S1_hw`/`row`: unpack BF16 + find `maxv` → store `row[j]`
+- **Pass 2** over `row`: compute exp values into `row[j]`, accumulate `sum`; then normalize in-place in a **second sweep of the same pass** (or inline after sum is known via a second inner loop)
+
+The most impactful fusion combines the normalize + per-group-max + per-group-quantize that currently require **three** separate full-row traversals into a **single** traversal:
+
+After sum is known:
+```
+inv_sum = 1/sum;
+// Single fused loop: normalize + per-group max scan
+for g in 0..GROUPS_S:
+    gmax = 0
+    for j in g*32..(g+1)*32:
+        row[j] *= inv_sum   // normalize in-place
+        if |row[j]| > gmax: gmax = |row[j]|
+    // compute e, inv_scale
+    for j in g*32..(g+1)*32:
+        P_q[i][j] = fp8_e4m3_rtz(row[j] * inv_scale)
+    P_scales[g][i] = e+127
+```
+
+This eliminates one full pass over the 128-float buffer per row. The per-group structure (groups of 32) means we can also **tile the normalization and quantization** at the group granularity: normalize group g, find gmax for group g, then immediately quantize group g — all while row[j] is warm in L1 cache/registers. This **halves** the number of passes over the float row buffer from 4 to effectively **3** (max-find, exp+sum, normalize+quantize-fused), and eliminates the separate group-max scan entirely.
+
+## Concrete Changes to the Code
+
+In the softmax loop body, replace the current 4-pass structure:
+
+```c
+// CURRENT: Pass 3 (normalize) + Pass 4a (group max) + Pass 4b (quantize) = 3 passes
+for (int j = 0; j < ATT_S; j++) row[j] *= inv_sum;
+for (int g = 0; g < GROUPS_S; g++) {
+    float gmax = 0.0f;
+    for (int j = g*32; j < (g+1)*32; j++) if (f_abs(row[j]) > gmax) gmax = f_abs(row[j]);
+    // compute e, inv_scale ...
+    for (int j = g*32; j < (g+1)*32; j++) P_q[i][j] = fp8_e4m3_rtz(row[j] * inv_scale);
+    P_scales[g][i] = e+127;
+}
+```
+
+With a **single fused pass**:
+
+```c
+// FUSED: normalize + group-max + quantize in one structured traversal
+for (int g = 0; g < GROUPS_S; g++) {
+    float gmax = 0.0f;
+    for (int j = g*32; j < (g+1)*32; j++) {
+        row[j] *= inv_sum;                          // normalize
+        float a = f_abs(row[j]);
+        if (a > gmax) gmax = a;
+    }
+    int e = 0;
+    if (gmax > 0.0f) e = f_exp(gmax / 16.0f) + 1;
+    float inv_scale = pow2i(-e);
+    P_scales[g][i] = (uint8_t)(e + 127);
+    for (int j = g*32; j < (g+1)*32; j++)
+        P_q[i][j] = fp8_e4m3_rtz(row[j] * inv_scale);
+}
+```
+
+The per-group inner quantize loop remains separate from the per-group normalize+max loop (because `inv_scale` depends on `gmax` which requires seeing all 32 elements first), but the **separate full-row normalize pass** is eliminated — normalization is now fused into the per-group max-scan loop. This reduces the number of complete traversals of `row[0..ATT_S-1]` from 4 to **3** passes per row.
+
+The Gemmini-accelerated matmul steps (1 and 3) remain **unchanged**. Only the CPU softmax kernel is modified. The output `P_q` and `P_scales` are computed identically, so semantic equivalence is preserved.''',
+code='''void solution(void) {
+  // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&Q_scales_row, sizeof(Q_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&KT_scales_col, sizeof(KT_scales_col), 1);
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int j = 0; j < tiles_J; j++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+    gemmini_fence();
+  }
+
+  // ---- 2) P = softmax(S1) rows on CPU; quantize to fp8 + per-32-group scales ----
+  for (int i = 0; i < ATT_S; i++) {
+    float row[ATT_S];
+
+    // Pass 1: Unpack BF16 -> float, find maxv
+    float maxv = -1e30f;
+    for (int j = 0; j < ATT_S; j++) {
+      uint16_t b = (uint16_t)((S1_hw[i][j / 4] >> ((j % 4) * 16)) & 0xFFFF);
+      row[j] = bf16_to_f(b);
+      if (row[j] > maxv) maxv = row[j];
+    }
+
+    // Pass 2: Compute exp(row[j] - maxv), accumulate sum
+    float sum = 0.0f;
+    for (int j = 0; j < ATT_S; j++) {
+      row[j] = exp_f(row[j] - maxv);
+      sum += row[j];
+    }
+
+    float inv_sum = 1.0f / sum;
+
+    // Pass 3 (fused): normalize + per-group max scan + per-group quantize
+    for (int g = 0; g < GROUPS_S; g++) {
+      // Fused normalize + group max
+      float gmax = 0.0f;
+      for (int j = g * 32; j < (g + 1) * 32; j++) {
+        row[j] *= inv_sum;
+        float a = f_abs(row[j]);
+        if (a > gmax) gmax = a;
+      }
+      // Compute e8m0 scale
+      int e = 0;
+      if (gmax > 0.0f) e = f_exp(gmax / 16.0f) + 1;
+      float inv_scale = pow2i(-e);
+      P_scales[g][i] = (uint8_t)(e + 127);
+      // Quantize group
+      for (int j = g * 32; j < (g + 1) * 32; j++)
+        P_q[i][j] = fp8_e4m3_rtz(row[j] * inv_scale);
+    }
+  }
+
+  // ---- 3) O = P @ V on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+    gemmini_mx_load_scales((uint64_t)&V_scales_col, sizeof(V_scales_col), 1);
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int j = 0; j < tiles_J; j++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+    gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+    gemmini_fence();
+  }
+}
+''',
+score=791113,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'Accelerator-bound: compute and data-movement look balanced; tune tiling / scratchpad occupancy for more overlap.'],
+plan_gen_model='us.anthropic.claude-sonnet-4-6',
+code_gen_model='us.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None)

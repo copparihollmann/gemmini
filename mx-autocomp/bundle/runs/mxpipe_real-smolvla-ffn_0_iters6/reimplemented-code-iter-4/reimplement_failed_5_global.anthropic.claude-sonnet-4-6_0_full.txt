@@ -1,0 +1,182 @@
+Looking at the error, the code produced an incorrect result with only 2 cycles latency, suggesting the computation isn't actually running properly. Let me analyze the requirements and write a correct FP8 matmul implementation.
+
+Key issues to fix:
+1. Must follow the exact programming model sequence
+2. Need proper tiling calculations
+3. B must be placed at top of scratchpad
+4. `gemmini_loop_ws_spad` requires funct 24 (LOOP_WS_CONFIG_SPAD_AB) to be re-issued before every call (it's one-shot via the macro)
+5. Need proper scale loading with correct sel values
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "gemmini.h"
+#include "gemmini_params.h"
+
+// Matrix dimensions must be multiples of DIM=16
+#define MATMUL_M 64
+#define MATMUL_N 64
+#define MATMUL_K 64
+
+#define DIM 16
+#define BANK_NUM 4
+#define BANK_ROWS 2048
+#define ACC_ROWS 256
+#define MAX_BLOCK_LEN 4
+
+// MX block size along K (number of elements sharing one scale)
+#define MX_BLOCK_SIZE 32
+
+// tiles
+#define tiles_I (MATMUL_M / DIM)
+#define tiles_J (MATMUL_N / DIM)
+#define tiles_K (MATMUL_K / DIM)
+
+// Number of scale groups along K
+#define GK ((MATMUL_K + MX_BLOCK_SIZE - 1) / MX_BLOCK_SIZE)
+
+// Scale factors: A_scales_row[GK][tiles_I], B_scales_col[GK][tiles_J]
+// e8m0 scale per MX block
+static uint8_t A_scales_row[GK][tiles_I];
+static uint8_t B_scales_col[GK][tiles_J];
+
+// Input matrices (FP8 E4M3 encoded as uint8_t)
+static uint8_t A[MATMUL_M][MATMUL_K];
+static uint8_t B[MATMUL_K][MATMUL_N];
+
+// Output matrix (BF16 packed - 4 BF16 per uint64)
+// BF16 output: MATMUL_M * MATMUL_N elements
+static uint16_t C_hw[MATMUL_M][MATMUL_N];
+
+// Scratchpad destination word offset for mx_smem
+#define SPAD_DEST 0
+
+void matmul_mx_fp8(
+    uint8_t A_in[MATMUL_M][MATMUL_K],
+    uint8_t B_in[MATMUL_K][MATMUL_N],
+    uint8_t a_scales[GK][tiles_I],
+    uint8_t b_scales[GK][tiles_J],
+    uint16_t C_out[MATMUL_M][MATMUL_N])
+{
+    // Scratchpad layout:
+    // A tiles at a_base, growing upward
+    // B tiles at b_base = BANK_NUM*BANK_ROWS - tiles_K*tiles_J*DIM, growing down from top
+    const int a_base = 0;
+    const int b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+
+    // Verify no overlap
+    // A needs tiles_I * tiles_K * DIM rows
+    // a_base + tiles_I*tiles_K*DIM <= b_base  => should be satisfied for small tiles
+
+    // Step 1: Configure execution - FP8 E4M3 input, BF16 output
+    // act_mx_fmt=0 (FP8 E4M3), wgt_mx_fmt=0 (FP8 E4M3), out_mx_fmt=3 (BF16), uselut=0
+    gemmini_extended3_config_ex(
+        WEIGHT_STATIONARY,
+        /*sys_act*/0,
+        /*sys_shift*/0,
+        /*sys_acc_scale*/ACC_SCALE_IDENTITY,
+        /*C_stride*/1,
+        /*A_stride*/MATMUL_K,
+        /*A_transpose*/0,
+        /*B_transpose*/0,
+        /*set_only_strides*/0,
+        /*act_mx_fmt*/0,
+        /*wgt_mx_fmt*/0,
+        /*out_mx_fmt*/3,
+        /*uselut*/0);
+
+    // Step 2: Load scale factors
+    // sel=0 for A (activation) scales, sel=1 for B (weight) scales
+    gemmini_mx_load_scales((uint64_t)a_scales, GK * tiles_I * sizeof(uint8_t), 0);
+    gemmini_mx_load_scales((uint64_t)b_scales, GK * tiles_J * sizeof(uint8_t), 1);
+
+    // Step 3: No LUT needed for FP8 (uselut=0)
+
+    // Step 4: MVIN tiles of A and B into scratchpad
+    // Configure load for A matrix: stride = MATMUL_K bytes (row stride of A)
+    gemmini_extended3_config_ld(MATMUL_K * sizeof(uint8_t), MVIN_SCALE_IDENTITY, false, 0);
+
+    // Load A tiles: a_base + (i*tiles_K + k)*DIM
+    for (int i = 0; i < tiles_I; i++) {
+        for (int k = 0; k < tiles_K; k++) {
+            uint8_t *a_ptr = &A_in[i * DIM][k * DIM];
+            uint32_t spad_addr = a_base + (i * tiles_K + k) * DIM;
+            gemmini_extended_mvin(
+                (uint64_t)a_ptr,
+                spad_addr,
+                DIM,
+                DIM);
+        }
+    }
+
+    // Configure load for B matrix: stride = MATMUL_N bytes (row stride of B)
+    gemmini_extended3_config_ld(MATMUL_N * sizeof(uint8_t), MVIN_SCALE_IDENTITY, false, 1);
+
+    // Load B tiles: b_base + (j*tiles_K + k)*DIM
+    for (int j = 0; j < tiles_J; j++) {
+        for (int k = 0; k < tiles_K; k++) {
+            uint8_t *b_ptr = &B_in[k * DIM][j * DIM];
+            uint32_t spad_addr = b_base + (j * tiles_K + k) * DIM;
+            gemmini_extended_mvin2(
+                (uint64_t)b_ptr,
+                spad_addr,
+                DIM,
+                DIM);
+        }
+    }
+
+    // Step 5: Configure requantized mvout
+    // Output stride in bytes
+    gemmini_extended_config_st(MATMUL_N * sizeof(uint16_t), 0, ACC_SCALE_IDENTITY);
+
+    gemmini_mxquant_config_mvout(
+        (uint64_t)0,          // scale_dram (not used for BF16 output in this path, set to 0)
+        /*i_bound*/tiles_I,
+        /*j_bound*/tiles_J,
+        /*k_bound*/tiles_K,
+        /*scale_act_sel*/0,
+        /*scale_w_sel*/0,
+        /*lut_update_granularity*/1);
+
+    // Step 6: Compute - gemmini_loop_ws_spad issues funct 24 then funct 8
+    // The macro gemmini_loop_ws_spad internally issues LOOP_WS_CONFIG_SPAD_AB (funct 24)
+    // followed by LOOP_WS (funct 8), so the one-shot marker is handled by the macro.
+    gemmini_loop_ws_spad(
+        tiles_I, tiles_J, tiles_K,
+        /*pad_I*/0, /*pad_J*/0, /*pad_K*/0,
+        /*A spad base*/a_base,
+        /*B spad end = BANK_NUM*BANK_ROWS*/BANK_NUM * BANK_ROWS,
+        /*D*/0,
+        /*C/SPAD_DEST*/SPAD_DEST,
+        /*A_transpose*/0,
+        /*B_transpose*/0,
+        /*full_C*/0,
+        /*low_D*/0,
+        /*ex_accumulate*/0,
+        /*act*/NO_ACTIVATION,
+        /*a_spad_id*/0,
+        /*b_spad_id*/0,
+        /*is_resadd*/0,
+        /*skips*/0x38);
+
+    // Step 7: Read results from mx_smem to DRAM
+    // Results are packed 4 BF16 per uint64 word
+    // smem_off_bf16 = SPAD_DEST * 16
+    gemmini_mx_read_smem(
+        (uint64_t)C_out,
+        SPAD_DEST * 16,
+        MATMUL_M * MATMUL_N);
+
+    gemmini_fence();
+}
+
+void matmul_tiled_fp8(
+    uint8_t A_in[MATMUL_M][MATMUL_K],
+    uint8_t B_in[MATMUL_K][MATMUL_N],
+    uint8_t a_scales[GK][tiles_I],
+    uint8_t b_scales[GK][tiles_J],
+    uint16_t C_out[MATMUL_M][MATMUL_N])
+{
+    matmul_mx_fp8(A_in, B_in, a_scales, b_scales, C_out);
+}
+```

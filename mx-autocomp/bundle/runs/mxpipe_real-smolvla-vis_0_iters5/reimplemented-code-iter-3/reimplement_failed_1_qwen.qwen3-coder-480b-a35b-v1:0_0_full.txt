@@ -1,0 +1,149 @@
+Looking at the code and error message, there are several issues that need to be fixed. Let me analyze the problems:
+
+1. The scratchpad layout calculation appears correct, but there might be issues with the B matrix placement
+2. The scale handling logic has potential issues with indexing
+3. The memory layout and addressing might not be correctly aligned
+4. The boundary handling logic needs verification
+
+Let me provide a corrected version:
+
+```c
+void solution(void) {
+  int tiles   = BLK / DIM;
+  int tiles_K = MATMUL_K / DIM;
+  int GK      = MATMUL_K / 32;
+
+  // Correct B base calculation - place B at the top of scratchpad
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+  uint32_t a_base = 0;
+  int SPAD_DEST = 128;
+
+  static uint8_t A_scales_T[BLOCKS_M][A_S_BYTES];
+  static uint8_t B_scales_T[BLOCKS_N][B_S_BYTES];
+  
+  // Temporary buffer to stage contiguous SMEM reads (in packed format)
+  static uint64_t temp_buf_packed[BLK * BLK / 4]; // 4 BF16 per uint64
+
+  // Transpose A scales
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int g = 0; g < GK; g++) {
+      for (int i = 0; i < BLK; i++) {
+        A_scales_T[i0][g * BLK + i] = A_scales_row[g][i0 * BLK + i];
+      }
+    }
+  }
+
+  // Transpose B scales
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    for (int g = 0; g < GK; g++) {
+      for (int j = 0; j < BLK; j++) {
+        B_scales_T[j0][g * BLK + j] = B_scales_col[g][j0 * BLK + j];
+      }
+    }
+  }
+
+  // Hoist the configuration outside all loops as the parameters are invariant
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                              1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    int ncols = REAL_N - j0 * BLK;
+    if (ncols > BLK) ncols = BLK;
+    if (ncols <= 0) continue;
+
+    // Mvin B tiles once per j0
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+    for (int j = 0; j < tiles; j++) {
+      for (int k = 0; k < tiles_K; k++) {
+        gemmini_extended_mvin2(
+          (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+          b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+      }
+    }
+
+    for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+
+      gemmini_flush(0);
+
+      // Load A and B scales
+      gemmini_mx_load_scales((uint64_t)A_scales_T[i0], A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_scales_T[j0], B_S_BYTES, 1);
+
+      // Mvin A tiles
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++) {
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+        }
+      }
+
+      // Configure requantized mvout
+      gemmini_config_st(BLK * sizeof(out_t) / 4); // 4 BF16 per word
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                   tiles, tiles, tiles_K, 0, 1, 1); // scale_w_sel=1 for B
+
+      // Dispatch: fast interior path vs slow boundary path
+      if ((i0 < BLOCKS_M - 1 || mrows == BLK) && (j0 < BLOCKS_N - 1 || ncols == BLK)) {
+        // Fast interior: no padding needed
+        gemmini_loop_ws_spad(tiles, tiles, tiles_K, 0, 0, 0,
+                             a_base, b_base, 0, SPAD_DEST,
+                             false, false, false, false, false,
+                             NO_ACTIVATION, 0, 0, false, 0x38);
+
+        // Read the entire tile contiguously in one transaction
+        gemmini_mx_read_smem(temp_buf_packed, SPAD_DEST * 16, BLK * BLK);
+        gemmini_fence();
+
+        // CPU unpacks the contiguous buffer into the strided C_hw
+        for (int r = 0; r < BLK; r++) {
+          for (int c = 0; c < BLK; c += 4) {
+            uint64_t packed_word = temp_buf_packed[r * (BLK / 4) + (c / 4)];
+            out_t *bf16_vals = (out_t*)&packed_word;
+            for (int w = 0; w < 4 && (c + w) < BLK; w++) {
+              int col_word_idx = (j0 * BLK + c + w) / 4;
+              int word_offset = (j0 * BLK + c + w) % 4;
+              if (i0 * BLK + r < REAL_M && (j0 * BLK + c + w) < REAL_N) {
+                *((out_t*)((uint64_t*)C_hw + (i0 * BLK + r) * (MATMUL_N/4) + col_word_idx) + word_offset) = bf16_vals[w];
+              }
+            }
+          }
+        }
+      } else {
+        // Slow boundary path: handle partial tiles
+        int pad_i = BLK - mrows;
+        int pad_j = BLK - ncols;
+
+        gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0,
+                             a_base, b_base, 0, SPAD_DEST,
+                             false, false, false, false, false,
+                             NO_ACTIVATION, 0, 0, false, 0x38);
+
+        // Read the exact active block height (mrows * BLK) contiguously
+        gemmini_mx_read_smem(temp_buf_packed, SPAD_DEST * 16, mrows * BLK);
+        gemmini_fence();
+
+        // CPU unpacks the active boundaries into C_hw
+        for (int r = 0; r < mrows; r++) {
+          for (int c = 0; c < ncols; c += 4) {
+            uint64_t packed_word = temp_buf_packed[r * (BLK / 4) + (c / 4)];
+            out_t *bf16_vals = (out_t*)&packed_word;
+            for (int w = 0; w < 4 && (c + w) < ncols; w++) {
+              int global_c = j0 * BLK + c + w;
+              int col_word_idx = global_c / 4;
+              int word_offset = global_c % 4;
+              if ((i0 * BLK + r) < REAL_M && global_c < REAL_N) {
+                *((out_t*)((uint64_t*)C_hw + (i0 * BLK + r) * (MATMUL_N/4) + col_word_idx) + word_offset) = bf16_vals[w];
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```

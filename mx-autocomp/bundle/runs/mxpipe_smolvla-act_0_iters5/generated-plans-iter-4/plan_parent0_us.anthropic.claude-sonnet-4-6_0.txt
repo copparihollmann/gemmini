@@ -1,0 +1,105 @@
+## Analysis
+
+Looking at the original code, the inner loops load A and B tiles sequentially:
+
+```c
+// A tiles first (all of them)
+for (int i = 0; i < tiles; i++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(...);  // mvin port
+
+// B tiles second (all of them)
+for (int j = 0; j < tiles; j++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(...);  // same mvin port
+```
+
+Both A and B loads use `gemmini_extended_mvin` (the same port), so they execute serially. The hardware has two independent load ports: `mvin` (port 0, funct k_MVIN) for A tiles and `mvin2` (port 1, funct k_MVIN2) for B tiles. By interleaving A and B tile loads across the two ports, both sets of transfers can proceed in parallel.
+
+## Plan: Apply Strategy 6 — Use `mvin2` for B tiles, interleaved with `mvin` for A tiles
+
+**What to change:**
+
+1. **Use `gemmini_extended_mvin2` for all B tile loads** instead of `gemmini_extended_mvin`. B tiles go to the same scratchpad addresses as before (same `b_base` formula), only the instruction port changes.
+
+2. **Restructure the load loops to interleave A and B issues.** Instead of two separate nested loops (all A then all B), iterate over the K dimension in the outer loop and issue one A tile (`mvin`) immediately followed by one B tile (`mvin2`) for the same `k`. This ensures the two independent DMA engines are both active simultaneously rather than running back-to-back.
+
+3. **Adjust `gemmini_config_ld` calls** to use separate IDs if needed. Looking at the macros: `gemmini_extended4_config_ld` takes an `id` parameter (0 = mvin, 1 = mvin2 … based on `id` field in CONFIG_LD RS1 bits `[4:3]`). We need a separate `config_ld` for port 1 (mvin2) to set the correct stride for B. Use `gemmini_extended3_config_ld(stride, scale, shrunk, 1)` to configure port 1's stride independently from port 0.
+
+**Concrete restructuring:**
+
+```
+// Configure port 0 (mvin) for A: stride = MATMUL_K bytes per row
+gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+// Configure port 1 (mvin2) for B: stride = MATMUL_N bytes per row  
+gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+// Interleaved issue: for each k, load all i's A tiles on port 0
+// and all j's B tiles on port 1
+for (int k = 0; k < tiles_K; k++) {
+  for (int i = 0; i < tiles; i++)
+    gemmini_extended_mvin(A_ptr(i,k), a_base + (i*tiles_K+k)*DIM, DIM, DIM);
+  for (int j = 0; j < tiles; j++)
+    gemmini_extended_mvin2(B_ptr(k,j), b_base + (k*tiles+j)*DIM, DIM, DIM);
+}
+```
+
+This way both engines are fed commands that can execute concurrently: while port 0 is transferring A tile `(i, k)`, port 1 can simultaneously transfer B tile `(k, j)`, halving the effective mvin latency for the combined A+B transfer phase.
+
+The `b_base`, address formulas, `gemmini_loop_ws_spad` call, `gemmini_mxquant_config_mvout`, scale loads, and `gemmini_mx_read_smem` all remain unchanged. The only changes are (a) replacing `gemmini_extended_mvin` with `gemmini_extended_mvin2` for B tiles, (b) adding a port-1 `config_ld`, and (c) restructuring the two serial tile-load loops into one interleaved loop over k.
+
+## Rewritten Code
+
+```c
+// AUTO-GENERATED outer-tiled MX matmul baseline (128x320x320).
+void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+   for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // PROF cpu_stage
+      // Stage only the tiny per-32-group scales; A/B data is mvin'd DIRECTLY
+      // from DRAM (no host-side block memcpy — that was 98% of the cycles).
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      // PROF accel
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      // Configure port 0 (mvin) for A tiles: row stride = MATMUL_K bytes
+      gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+      // Configure port 1 (mvin2) for B tiles: row stride = MATMUL_N bytes
+      gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+      // Interleave A (port 0) and B (port 1) tile loads so both DMA engines
+      // run concurrently, overlapping A and B DRAM-to-scratchpad transfers.
+      for (int k = 0; k < tiles_K; k++) {
+        for (int i = 0; i < tiles; i++)
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+        for (int j = 0; j < tiles; j++)
+          gemmini_extended_mvin2(
+            (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+            b_base + (k * tiles + j) * DIM, DIM, DIM);
+      }
+
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      // Accelerator-centric readout: per-row hardware DMA from smem straight into the
+      // bf16-packed row-major output.
+      for (int r = 0; r < BLK; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, BLK);
+      gemmini_fence();
+    }
+}
+```

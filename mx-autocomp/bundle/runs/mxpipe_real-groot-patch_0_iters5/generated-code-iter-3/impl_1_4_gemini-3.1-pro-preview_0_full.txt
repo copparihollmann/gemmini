@@ -1,0 +1,78 @@
+```c
+// Optimized MX matmul: Zero-Host-Staging via K-Group Tiling (41x512x512)
+void solution(void) {
+    // Tile dimensions optimally sized to fit the accumulator (max 256 rows) and avoid memcpy
+    int M_BLK = 48; // REAL_M=41 padded to multiple of 16
+    int N_BLK = 64;
+    int K_BLK = 32; // Exactly 1 MX Scale Group
+    
+    int tiles_I = M_BLK / DIM; // 3
+    int tiles_J = N_BLK / DIM; // 4
+    int tiles_K = K_BLK / DIM; // 2
+
+    uint32_t a_base = 0;
+    // B tiles are anchored to the top of the scratchpad memory
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM; 
+    int SPAD_DEST = 0; // Accumulator output offset
+
+    int num_blocks_n = (REAL_N + N_BLK - 1) / N_BLK;
+
+    for (int j0 = 0; j0 < num_blocks_n; j0++) {
+        int ncols = REAL_N - j0 * N_BLK;
+        if (ncols > N_BLK) ncols = N_BLK;
+        if (ncols <= 0) continue;
+        
+        int pad_i = M_BLK - REAL_M;
+        if (pad_i < 0) pad_i = 0; 
+        int pad_j = N_BLK - ncols;
+
+        gemmini_flush(0);
+        gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+        
+        // Configure requantizer output shape and scales once per N block to prevent redundant configurations
+        gemmini_config_st(N_BLK * sizeof(out_t)); 
+        gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+        for (int g = 0; g < MATMUL_K / K_BLK; g++) {
+            // DIRECT DRAM-to-Accelerator Scale DMA. 
+            // Because we process exactly 1 K-group, the needed scales are strictly contiguous in memory.
+            gemmini_mx_load_scales((uint64_t)&A_scales_row[g][0], M_BLK, 0);
+            gemmini_mx_load_scales((uint64_t)&B_scales_col[g][j0 * N_BLK], N_BLK, 1);
+
+            // Load A tiles (Batched loading along the K-dimension)
+            gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+            for (int i = 0; i < tiles_I; i++) {
+                elem_t *dram_ptr = ((elem_t*)A_in) + (i * DIM) * MATMUL_K + (g * K_BLK);
+                uint32_t sp_addr = a_base + (i * tiles_K) * DIM;
+                gemmini_extended_mvin((void*)dram_ptr, sp_addr, K_BLK, DIM);
+            }
+
+            // Load B tiles
+            // B cannot be batched in memory without transposing the DRAM pointer because the matrix 
+            // is row-major but must be populated sequentially down columns in the scratchpad layouts.
+            gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+            for (int j = 0; j < tiles_J; j++) {
+                for (int k = 0; k < tiles_K; k++) {
+                    elem_t *dram_ptr = ((elem_t*)B_in) + (g * K_BLK + k * DIM) * MATMUL_N + (j0 * N_BLK + j * DIM);
+                    uint32_t sp_addr = b_base + (j * tiles_K + k) * DIM;
+                    gemmini_extended_mvin((void*)dram_ptr, sp_addr, DIM, DIM);
+                }
+            }
+
+            // Execute the fused hardware matmul
+            // On g == 0, ex_accumulate is false, clearing the previous accumulator state
+            // On g > 0, hardware native accumulation is enabled across the K sweeps
+            bool ex_accumulate = (g != 0);
+            gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                                 SPAD_DEST, false, false, false, false, ex_accumulate, NO_ACTIVATION, 0, 0, false, 0x38);
+        }
+
+        // Accelerator-centric readout: drain finalized BF16 block sum from MX smem straight to DRAM 
+        for (int r = 0; r < REAL_M; r++) {
+            gemmini_mx_read_smem(&C_hw[r][(j0 * N_BLK) / BF16_PER_WORD],
+                                 SPAD_DEST * 16 + r * N_BLK, ncols);
+        }
+        gemmini_fence();
+    }
+}
+```

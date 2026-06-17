@@ -1,0 +1,65 @@
+## Analysis of the Original Code
+
+Looking at the original code, the mvin loops are:
+```c
+gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+for (int i = 0; i < tiles_I; i++)
+    gemmini_block_mvin(...A..., a_base + i * tiles_K * DIM, tiles_K);
+for (int j = 0; j < tiles_J; j++)
+    gemmini_block_mvin(...B..., b_base + j * tiles_K * DIM, tiles_K);
+```
+
+All A tiles are loaded sequentially via `mvin`, then all B tiles via the same `mvin` port (using `gemmini_block_mvin` which calls `gemmini_extended_mvin`). This serializes A and B loads through a single DMA channel, leaving the mvin2 channel (dedicated to B) completely idle.
+
+## Selected Strategy: #14 — Interleave A-row mvin and B-column mvin calls
+
+**Plan:**
+
+The hardware has two independent DMA channels: `mvin` (port 0, for A) and `mvin2` (port 1, for B). By issuing them in an alternating/interleaved fashion within a single merged loop, the hardware can pipeline both transfers simultaneously, reducing the total load time.
+
+**Specific changes:**
+
+1. Keep a single `gemmini_config_ld` with the appropriate stride.
+2. Replace the two separate loops with one merged loop that iterates over `max(tiles_I, tiles_J)` iterations, issuing `gemmini_extended_mvin` (A) and `gemmini_extended_mvin2` (B) in each iteration when the respective tile index is valid.
+3. This requires configuring mvin2 separately — use `gemmini_extended3_config_ld` with `id=1` for the B port and `id=0` for A, setting stride to `MATMUL_K * sizeof(elem_t)` for both.
+4. Each A tile uses `gemmini_extended_mvin` and each B tile uses `gemmini_extended_mvin2`, interleaved in the same loop.
+
+Here is the rewritten code:
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Configure both DMA channels with the same stride
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0); // id=0: A
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1); // id=1: B
+
+  // Interleave A (mvin) and B (mvin2) loads to exploit both DMA channels in parallel
+  int max_tiles = tiles_I > tiles_J ? tiles_I : tiles_J;
+  for (int t = 0; t < max_tiles; t++) {
+    if (t < tiles_I) {
+      elem_t *A_row = (elem_t*)A_in + t * DIM * MATMUL_K;
+      gemmini_extended_mvin((void*)A_row,
+                            a_base + t * tiles_K * DIM,
+                            DIM * tiles_K, DIM);
+    }
+    if (t < tiles_J) {
+      elem_t *B_row = (elem_t*)B_in + t * DIM * MATMUL_K;
+      gemmini_extended_mvin2((void*)B_row,
+                             b_base + t * tiles_K * DIM,
+                             DIM * tiles_K, DIM);
+    }
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       0, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], 0, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+**Why this works:** The A and B DMA channels are independent; by interleaving `mvin` and `mvin2` instructions, the hardware can issue and complete both transfers in parallel rather than sequentially, reducing the total mvin latency by up to ~2×. The `gemmini_block_mvin` calls in the original code all used the same port; now each port handles its dedicated matrix. The rest of the sequence (scale loads, compute, readout) is unchanged.

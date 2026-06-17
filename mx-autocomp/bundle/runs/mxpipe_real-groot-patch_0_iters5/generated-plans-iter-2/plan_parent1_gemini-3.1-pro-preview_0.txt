@@ -1,0 +1,29 @@
+To significantly improve the performance of the accelerator, we will apply **Strategy 3**: pipeline `gemmini_mx_read_smem` reads with the next-tile `mvin` to overlap output transfer and input loading. 
+
+Currently, the code issues a `gemmini_fence()` at the end of every block iteration. This forces the CPU to wait until the current block is entirely computed and drained to DRAM before it can begin queueing the DMA loads (`mvin`) for the next block, leaving the hardware's DMA engines idle during computation and output transfer. By removing the inner-loop fence, double-buffering the scratchpad allocations, and double-buffering the host-side scale arrays, we can allow the RoCC queue to automatically pipeline the next iteration's `mvin`s alongside the current iteration's `mx_read_smem` output transfer.
+
+### Optimization Plan
+
+1.  **Double-Buffer the Scratchpad (A and B bases)**:
+    *   Introduce a toggle variable `db` (`0` or `1`) that flips every block iteration.
+    *   Since a single block (M=64, N=64, K=512) requires 2048 rows for A and 2048 rows for B, the total footprint is 4096 rows. Because the scratchpad holds 8192 rows, we can perfectly divide it into two halves.
+    *   Set `a_base = db * tiles * tiles_K * DIM`.
+    *   Set the B sentinel (end address) to `b_sentinel = BANK_NUM * BANK_ROWS - db * tiles * tiles_K * DIM`.
+    *   Set `b_base = b_sentinel - tiles * tiles_K * DIM`.
+    *   Pass `b_sentinel` as the `B` scratchpad end address to `gemmini_loop_ws_spad`.
+
+2.  **Double-Buffer the Host Scale Arrays**:
+    *   Since `gemmini_mx_load_scales` initiates an asynchronous DMA read from host memory, the CPU moving onto the next iteration and performing `memcpy` into `A_s` and `B_s` without a fence would cause a race condition, corrupting the scales.
+    *   Allocate local double-buffered arrays: `uint8_t local_A_s[2][MATMUL_K / 32][BLK]` and `uint8_t local_B_s[2][MATMUL_K / 32][BLK]`.
+    *   `memcpy` into `local_A_s[db]` and `local_B_s[db]`, preventing the CPU from overwriting the scales currently being read by the accelerator.
+
+3.  **Pipeline via Fence Deferral**:
+    *   Remove the `gemmini_fence()` from the end of the nested loops.
+    *   Place a single `gemmini_fence()` at the very end of the `solution` function.
+    *   The hardware will resolve the structural hazard on the accumulator (which cannot be double-buffered because it spans exactly 256 rows), meaning `loop_ws_spad` will correctly stall until `read_smem` finishes, while the next block's `mvin` will seamlessly execute concurrently with the `read_smem`.
+
+4.  **Fix B-Matrix Scratchpad Indexing (Rule 12)**:
+    *   The original code incorrectly indexes the B tiles in row-major order: `b_base + (k * tiles + j) * DIM`. Fix this to the mandatory hardware-expected column-major layout: `b_base + (j * tiles_K + k) * DIM`.
+
+5.  **Hoist Static Configuration**:
+    *   Move `gemmini_flush(0)` and `gemmini_extended3_config_ex(...)` entirely outside the loop. These configure persistent hardware state and do not need to be re-issued, minimizing RoCC queue bloat.

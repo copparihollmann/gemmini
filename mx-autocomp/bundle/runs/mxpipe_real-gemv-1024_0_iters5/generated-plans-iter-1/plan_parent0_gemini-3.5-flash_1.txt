@@ -1,0 +1,52 @@
+An elegant and highly effective optimization plan to improve the performance of this MX-Gemmini kernel is **Pipelined Double-Buffering of Inputs and Direct Scale Loading**.
+
+### How the Strategy Improves Performance
+
+1. **Elimination of Host CPU Overhead (98% of baseline cycles):**
+   The baseline code copies scale factors from the main multi-dimensional arrays `A_scales_row` and `B_scales_col` into temporary host buffers `A_s` and `B_s` using `memcpy` on the host CPU. This halts the accelerator and wastes massive CPU clock cycles. By calculating the exact DRAM address of each group's scale block and issuing `gemmini_mx_load_scales` directly on those DRAM addresses, we completely eliminate the host-side `memcpy` overhead.
+
+2. **Hiding DMA Latency via Scratchpad Double-Buffering:**
+   Currently, the accelerator sits idle while `gemmini_extended_mvin` loads activation and weight tiles into the scratchpad, and again during `gemmini_mx_read_smem` readout. 
+   Since our tile size requirement (`BLK=64`, meaning $4 \times 4 \times 16 = 256$ scratchpad rows per operand) is extremely small compared to the $8192$-row scratchpad, we can split the scratchpad into two halves (logical Ping and Pong buffers of 4096 rows each). This allows us to overlap the compute of the current tile in Buffer 0 (Ping) with the DMA loading of the next tile's data into Buffer 1 (Pong).
+
+3. **Overlapping Output Drain (`gemmini_mx_read_smem`) with Next-Tile Load:**
+   We can pipeline the output phase. While the systolic array is busy calculating block $(i, j)$, we can simultaneously issue the `gemmini_mx_read_smem` DMA command for the *previous* block's results and start pre-fetching the inputs for the *next* block.
+
+---
+
+### Phase 1 Optimization Plan
+
+#### 1. Scratchpad Memory Allocation (Ping-Pong Buffers)
+Divide the 8192-row scratchpad into two symmetric halves of 4096 rows each:
+* **Ping Space (0 to 4095):**
+  * `a_base_ping = 0`
+  * `b_base_ping = 4096 - (tiles_K * tiles_J * DIM)`
+* **Pong Space (4096 to 8191):**
+  * `a_base_pong = 4096`
+  * `b_base_pong = 8192 - (tiles_K * tiles_J * DIM)`
+
+#### 2. Direct Scale Loading from DRAM
+Instead of host-side `memcpy`, compute the DRAM address of each scale group directly:
+* Loop through the scale groups ($g \in [0, \text{MATMUL\_K}/32)$).
+* Directly call:
+  ```c
+  gemmini_mx_load_scales((uint64_t)&A_scales_row[g][i0 * BLK], BLK, 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col[g][j0 * BLK], BLK, 1);
+  ```
+  This streams scale values via hardware DMA straight into the scale memory banks without host intervention.
+
+#### 3. Pipelined Loop Structure
+Transform the nested outer loops into a software pipeline with three stages: **Prefetch (Prologue) $\rightarrow$ Execute/Load (Steady State) $\rightarrow$ Drain (Epilogue)**.
+
+1. **Prologue (First Tile `block = 0`):**
+   * Load activations and weights into `Ping` scratchpad bases.
+   * Load scales for `block = 0`.
+2. **Steady State Loop (`block = 1` to `N - 1`):**
+   * Trigger `gemmini_loop_ws_spad` on the current buffer (`Ping` or `Pong`).
+   * *In parallel*, issue `gemmini_extended_mvin` and scale loads for the next block into the opposite buffer.
+   * *In parallel*, issue `gemmini_mx_read_smem` to write back the previously computed block's output from the shared memory (`SPAD_DEST`) to `C_hw` in DRAM.
+   * Swap buffer pointers (`Ping` $\leftrightarrow$ `Pong`).
+3. **Epilogue (Last Tile):**
+   * Execute the final computation.
+   * Drain the final results to DRAM.
+   * Issue a single `gemmini_fence()` at the very end to guarantee all memory transactions are complete before host readout.

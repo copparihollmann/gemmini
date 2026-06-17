@@ -1,0 +1,120 @@
+## Analysis
+
+Looking at the original code, I need to identify which strategy offers the most impact.
+
+**Current structure:**
+- All B tiles loaded first (all j, all k) — good, amortized over I
+- All A tiles loaded next (all i, all k) — sequential, not overlapped
+- Single `gemmini_loop_ws_spad` over all tiles_I × tiles_J × tiles_K
+- Single `gemmini_mx_read_smem` drain
+
+**Key observation:** The scratchpad constraint is `(tiles_I*tiles_K + tiles_J*tiles_K)*DIM ≤ 8192`. With the im2col convolution workload, `MATMUL_K = CONV_C * CONV_KSZ * CONV_KSZ` and `MATMUL_M = PATCHES_X * PATCHES_X`, `MATMUL_N = CONV_F`. The A tiles occupy `tiles_I*tiles_K*DIM` rows and B tiles occupy `tiles_J*tiles_K*DIM` rows.
+
+**Strategy 8: Reorder I/J/K loop nest to maximize weight-stationary B-tile reuse across I iterations** is already partially done (B loaded once, A loaded per-i). However, the **loading is fully sequential** — all B loaded, then all A loaded, then compute. There's no pipelining.
+
+**Strategy 9: Pipeline `gemmini_mx_read_smem` reads with next-tile mvin** — there's only one compute call, so not directly applicable.
+
+**Strategy 4: Eliminate redundant computation** — the im2col inner loop computes `pi` and `pj` for every `li` inside the `i` loop, but the patches mapping is invariant. The im2col itself runs on the CPU and is O(M*K) work before any DMA.
+
+**Most impactful: Strategy 3 (hoist redundant operations) + Strategy 4** — specifically, the im2col can be computed **entirely upfront** before loading B, and currently the `gemmini_extended3_config_ld` for port 0 is re-set once, but the per-i loop re-configures nothing (it's already hoisted). However, the **A-tile mvin loop issues a new `gemmini_extended3_config_ld` once** for port 0 — that's fine.
+
+Actually the **biggest inefficiency**: all B tiles are loaded first, then A is loaded **while B is idle in scratchpad**, then compute. The im2col is interleaved with A loading inside the i-loop. The im2col CPU work **blocks** the DMA pipeline. 
+
+**Selected strategy: Strategy 3 — Hoist redundant operations out of loops**
+
+**Plan:** Hoist the entire im2col computation out of the mvin loop. Currently, for each `i`, the code computes im2col for `DIM` rows then immediately issues mvins. If we precompute the entire `A_buf` before issuing any mvins, we can then batch all A mvins together with MAX_BLOCK_LEN=4 blocking, and the CPU im2col doesn't interleave with/stall the DMA pipeline. This separates CPU work from accelerator DMA commands, allowing the RoCC command queue to fill more efficiently without CPU stalls between commands.
+
+Additionally, the `gemmini_extended3_config_ld` for port 0 is currently issued between the B-mvin loop and the A-mvin loop — this is fine. But we can also **combine the im2col into a single upfront pass** and then issue all A mvins in one tight loop.
+
+Here is the rewritten code:
+
+```c
+void solution(void) {
+  // Tile counts
+  const int tiles_I = MATMUL_M / DIM;
+  const int tiles_J = MATMUL_N / DIM;
+  const int tiles_K = MATMUL_K / DIM;
+
+  // Scratchpad base addresses
+  const int a_base = 0;
+  const int b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+  const int SPAD_DEST = 0;
+
+  // Step 1: Configure execution (MX FP8 -> BF16, weight-stationary)
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // Step 2: Load scale factors (A=sel 0, B=sel 1)
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // === HOISTED: Compute entire im2col A_buf upfront, before any DMA ===
+  // Previously interleaved with mvin inside the i-loop; now fully separated
+  // so DMA commands can be issued in a tight loop without CPU stalls.
+  for (int i = 0; i < tiles_I; i++) {
+    for (int li = 0; li < DIM; li++) {
+      int patch_idx = i * DIM + li;
+      int pi = patch_idx / PATCHES_X;
+      int pj = patch_idx % PATCHES_X;
+      for (int c = 0; c < CONV_C; c++)
+        for (int dy = 0; dy < CONV_KSZ; dy++)
+          for (int dx = 0; dx < CONV_KSZ; dx++)
+            A_buf[patch_idx][c * CONV_KSZ * CONV_KSZ + dy * CONV_KSZ + dx] =
+                X_in[c][pi * CONV_KSZ + dy][pj * CONV_KSZ + dx];
+    }
+  }
+
+  // Step 3: Load B tiles using mvin2 (port 1) — done once, amortized over all I tiles
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+  for (int j = 0; j < tiles_J; j++) {
+    int k = 0;
+    for (; k + 4 <= tiles_K; k += 4) {
+      gemmini_extended_mvin2(
+          (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+          b_base + (j * tiles_K + k) * DIM,
+          4 * DIM, DIM);
+    }
+    for (; k < tiles_K; k++) {
+      gemmini_extended_mvin2(
+          (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+          b_base + (j * tiles_K + k) * DIM,
+          DIM, DIM);
+    }
+  }
+
+  // Step 4: Configure mvin port 0 for A tiles, then load all A tiles in a tight DMA loop.
+  // im2col is already complete; no CPU work interleaves with these DMA commands.
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+  for (int i = 0; i < tiles_I; i++) {
+    int k = 0;
+    for (; k + 4 <= tiles_K; k += 4) {
+      gemmini_extended_mvin(
+          (void*)(((elem_t*)A_buf) + i * DIM * MATMUL_K + k * DIM),
+          a_base + (i * tiles_K + k) * DIM,
+          4 * DIM, DIM);
+    }
+    for (; k < tiles_K; k++) {
+      gemmini_extended_mvin(
+          (void*)(((elem_t*)A_buf) + i * DIM * MATMUL_K + k * DIM),
+          a_base + (i * tiles_K + k) * DIM,
+          DIM, DIM);
+    }
+  }
+
+  // Step 5: Configure output stride and requantizer.
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+      tiles_I, tiles_J, tiles_K, 0, 0, tiles_K);
+
+  // Step 6: Execute fused tiled weight-stationary matmul over scratchpad.
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+      a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+      false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // Step 7: Drain BF16 results from mx_smem to DRAM, then fence.
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+**Why this helps:** The original code interleaved CPU im2col computation with RoCC mvin commands inside the `i` loop. Each iteration: (a) CPU computes `DIM` rows of im2col (memory-intensive scatter-gather), then (b) issues DMA commands. The CPU im2col stalls the RoCC command queue between batches of mvin commands, creating pipeline bubbles where the accelerator's DMA engine is idle waiting for the next command. By hoisting all im2col computation before any DMA, the A-mvin loop becomes a tight command-issue loop with no intervening CPU memory work, allowing the RoCC command queue to stay full and the DMA engine to operate continuously without stalls.

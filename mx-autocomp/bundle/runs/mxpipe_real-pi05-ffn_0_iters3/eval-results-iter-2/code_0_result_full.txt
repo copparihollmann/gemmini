@@ -1,0 +1,242 @@
+{'correct': True, 'test_results': {0: True}, 'compiled': True, 'latency_spike_raw': 31829, 'latency': 31829}
+Prev latency: 43239
+New latency: 31829
+Plan: ## Performance Analysis
+
+Looking at the original code, the inner mvin loops issue individual `gemmini_extended_mvin` calls with `cols=DIM=16` per call:
+
+```c
+for (int i = 0; i < tiles; i++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(..., a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+```
+
+For a 256×256×512 matmul with `BLK=256`, `DIM=16`: `tiles = 16`, `tiles_K = 32`, so **512 individual mvin commands for A** and **512 for B** per outer block — 1024 total mvin instructions per `(i0, j0)` iteration. Each command has instruction-issue overhead and causes the DMA queue to fragment with 16-column (16-byte) requests.
+
+## Selected Strategy: Batch the mvin (Strategy 2)
+
+**Batch size = 2 (cols = 32)** is the validated sweet spot per the strategy description.
+
+## Plan
+
+### For A tiles:
+The A layout is `a_base + (i * tiles_K + k) * DIM`. For a fixed `i`, successive `k` values produce **contiguous scratchpad addresses** (`...*DIM, ...*DIM+16, ...*DIM+32, ...`). We can batch pairs of consecutive `k` values:
+
+```c
+for (int i = 0; i < tiles; i++)
+  for (int k = 0; k < tiles_K; k += 2)
+    gemmini_extended_mvin(
+      (void*)(((elem_t*)A_in) + (i0*BLK + i*DIM)*MATMUL_K + k*DIM),
+      a_base + (i * tiles_K + k) * DIM,
+      2 * DIM,   // cols = 32
+      DIM);
+```
+
+The DRAM pointer advances by `k*DIM` along a row of length `MATMUL_K`, so two adjacent `k` tiles are indeed contiguous in DRAM (stride is already `MATMUL_K` bytes per row). The scratchpad address `a_base + (i*tiles_K + k)*DIM` is the start of two consecutive DIM-row slots. `cols=32 ≤ 48`, satisfying the safety constraint.
+
+Since `tiles_K = 32` is divisible by 2, no remainder handling is needed.
+
+### For B tiles:
+The B layout is `b_base + (k * tiles + j) * DIM`. For a fixed `j`, varying `k` gives non-contiguous scratchpad slots (stride = `tiles*DIM`). However, for a fixed `k`, varying `j` gives contiguous slots. We should restructure the B loop to iterate `k` in the outer loop and `j` in the inner loop, then batch on `j`:
+
+```c
+for (int k = 0; k < tiles_K; k++)
+  for (int j = 0; j < tiles; j += 2)
+    gemmini_extended_mvin(
+      (void*)(((elem_t*)B_in) + k*DIM*MATMUL_N + (j0*BLK + j*DIM)),
+      b_base + (k * tiles + j) * DIM,
+      2 * DIM,   // cols = 32
+      DIM);
+```
+
+For fixed `k`, adjacent `j` values: DRAM address `B_in + k*DIM*MATMUL_N + j0*BLK + j*DIM` — increasing `j` by 1 advances by `DIM` bytes, so two consecutive `j` tiles are contiguous in DRAM. Scratchpad address `b_base + (k*tiles + j)*DIM` — increasing `j` by 1 advances by `DIM`, so two consecutive `j` slots are also contiguous. `cols=32 ≤ 48`, safe.
+
+Since `tiles = BLK/DIM = 16` is divisible by 2, no remainder is needed.
+
+### Net effect:
+- A mvins reduced from 512 → **256** commands
+- B mvins reduced from 512 → **256** commands  
+- Total mvin instructions per outer block: 1024 → **512** (50% reduction)
+- Each command transfers 32 bytes instead of 16, improving DMA burst efficiency
+- No change to scratchpad layout, tile indexing, scale loading, compute, or readout — all other code remains identical
+
+CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED outer-tiled MX matmul baseline (256x256x512).
+void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+   for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Partial last M/N block: compute only the real rows/cols, pad the rest.
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+      // PROF cpu_stage
+      // Stage only the tiny per-32-group scales; A/B data is mvin\'d DIRECTLY
+      // from DRAM (no host-side block memcpy — that was 98% of the cycles).
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+      // PROF accel
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K (full block-aligned tiles)
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+      for (int j = 0; j < tiles; j++)                    // B[k][j0*BLK+j] -> slot (k*tiles + j)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      // Accelerator-centric readout: per-row hardware DMA from smem straight into the
+      // bf16-packed row-major output (block-internal smem row stride is BLK).
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+}
+''',
+score=43239,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'CPU/host data staging detected (2 memcpy, ~0 scalar copy loops). Host staging is typically the dominant cost on this accelerator and autocomp cannot speed it up directly: mvin tiles STRIDED straight from the source DRAM arrays instead of copying through a host buffer, and keep partial sums in shared memory (bf16 accumulate) rather than accumulating on the CPU.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''## Performance Analysis
+
+Looking at the original code, the inner mvin loops issue individual `gemmini_extended_mvin` calls with `cols=DIM=16` per call:
+
+```c
+for (int i = 0; i < tiles; i++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(..., a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+```
+
+For a 256×256×512 matmul with `BLK=256`, `DIM=16`: `tiles = 16`, `tiles_K = 32`, so **512 individual mvin commands for A** and **512 for B** per outer block — 1024 total mvin instructions per `(i0, j0)` iteration. Each command has instruction-issue overhead and causes the DMA queue to fragment with 16-column (16-byte) requests.
+
+## Selected Strategy: Batch the mvin (Strategy 2)
+
+**Batch size = 2 (cols = 32)** is the validated sweet spot per the strategy description.
+
+## Plan
+
+### For A tiles:
+The A layout is `a_base + (i * tiles_K + k) * DIM`. For a fixed `i`, successive `k` values produce **contiguous scratchpad addresses** (`...*DIM, ...*DIM+16, ...*DIM+32, ...`). We can batch pairs of consecutive `k` values:
+
+```c
+for (int i = 0; i < tiles; i++)
+  for (int k = 0; k < tiles_K; k += 2)
+    gemmini_extended_mvin(
+      (void*)(((elem_t*)A_in) + (i0*BLK + i*DIM)*MATMUL_K + k*DIM),
+      a_base + (i * tiles_K + k) * DIM,
+      2 * DIM,   // cols = 32
+      DIM);
+```
+
+The DRAM pointer advances by `k*DIM` along a row of length `MATMUL_K`, so two adjacent `k` tiles are indeed contiguous in DRAM (stride is already `MATMUL_K` bytes per row). The scratchpad address `a_base + (i*tiles_K + k)*DIM` is the start of two consecutive DIM-row slots. `cols=32 ≤ 48`, satisfying the safety constraint.
+
+Since `tiles_K = 32` is divisible by 2, no remainder handling is needed.
+
+### For B tiles:
+The B layout is `b_base + (k * tiles + j) * DIM`. For a fixed `j`, varying `k` gives non-contiguous scratchpad slots (stride = `tiles*DIM`). However, for a fixed `k`, varying `j` gives contiguous slots. We should restructure the B loop to iterate `k` in the outer loop and `j` in the inner loop, then batch on `j`:
+
+```c
+for (int k = 0; k < tiles_K; k++)
+  for (int j = 0; j < tiles; j += 2)
+    gemmini_extended_mvin(
+      (void*)(((elem_t*)B_in) + k*DIM*MATMUL_N + (j0*BLK + j*DIM)),
+      b_base + (k * tiles + j) * DIM,
+      2 * DIM,   // cols = 32
+      DIM);
+```
+
+For fixed `k`, adjacent `j` values: DRAM address `B_in + k*DIM*MATMUL_N + j0*BLK + j*DIM` — increasing `j` by 1 advances by `DIM` bytes, so two consecutive `j` tiles are contiguous in DRAM. Scratchpad address `b_base + (k*tiles + j)*DIM` — increasing `j` by 1 advances by `DIM`, so two consecutive `j` slots are also contiguous. `cols=32 ≤ 48`, safe.
+
+Since `tiles = BLK/DIM = 16` is divisible by 2, no remainder is needed.
+
+### Net effect:
+- A mvins reduced from 512 → **256** commands
+- B mvins reduced from 512 → **256** commands  
+- Total mvin instructions per outer block: 1024 → **512** (50% reduction)
+- Each command transfers 32 bytes instead of 16, improving DMA burst efficiency
+- No change to scratchpad layout, tile indexing, scale loading, compute, or readout — all other code remains identical''',
+code='''void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+   for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Partial last M/N block: compute only the real rows/cols, pad the rest.
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+      // PROF cpu_stage
+      // Stage only the tiny per-32-group scales; A/B data is mvin\'d DIRECTLY
+      // from DRAM (no host-side block memcpy — that was 98% of the cycles).
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+      // PROF accel
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      // Batch A mvins: for fixed i, consecutive k tiles are contiguous in both
+      // DRAM (stride MATMUL_K) and scratchpad, so batch pairs of k (cols=2*DIM=32).
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K (full block-aligned tiles)
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k += 2)
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM,
+            2 * DIM,   // cols = 32
+            DIM);
+
+      // Batch B mvins: for fixed k, consecutive j tiles are contiguous in both
+      // DRAM (stride 1 along N) and scratchpad (stride DIM), so batch pairs of j (cols=2*DIM=32).
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+      for (int k = 0; k < tiles_K; k++)
+        for (int j = 0; j < tiles; j += 2)
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+            b_base + (k * tiles + j) * DIM,
+            2 * DIM,   // cols = 32
+            DIM);
+
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      // Accelerator-centric readout: per-row hardware DMA from smem straight into the
+      // bf16-packed row-major output (block-internal smem row stride is BLK).
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+}
+''',
+score=None,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='global.anthropic.claude-sonnet-4-6',
+code_gen_model='global.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None)

@@ -1,0 +1,134 @@
+## Strategy: Batch All A and B mvin Commands Using `gemmini_block_mvin` to Reduce Instruction Dispatch Overhead
+
+### Analysis of the Baseline
+
+In the baseline code, A and B tiles are loaded with individual `gemmini_extended_mvin` calls in nested loops:
+
+```c
+for (int i = 0; i < tiles_I; i++)       // tiles_I = 64/16 = 4
+  for (int k = 0; k < tiles_K; k++)     // tiles_K = 128/16 = 8
+    gemmini_extended_mvin(..., DIM, DIM);  // 32 separate mvin calls for A
+
+for (int j = 0; j < tiles_J; j++)       // tiles_J = 128/16 = 8
+  for (int k = 0; k < tiles_K; k++)     // tiles_K = 8
+    gemmini_extended_mvin(..., DIM, DIM);  // 64 separate mvin calls for B
+```
+
+This issues **96 individual mvin instructions**, each dispatching a 16×16 tile (16 rows × 16 bytes = 256 bytes). Each RoCC instruction has non-trivial dispatch overhead.
+
+### Key Observation: Tiles Are Contiguous in DRAM and Scratchpad Along the K-dimension
+
+For A: with stride `MATMUL_K * sizeof(elem_t)` = 128 bytes/row, within a fixed `i`, successive k-tiles are **not** contiguous in DRAM (each tile row is offset by 128 bytes but the tile is 16 bytes wide — they are strided). However, looking at the **scratchpad layout**: for a fixed `i`, the tiles `a_base + (i*tiles_K + 0)*DIM` through `a_base + (i*tiles_K + tiles_K-1)*DIM` are **contiguous in scratchpad** (back-to-back 16-row blocks). Along K for a fixed `i`, the DRAM source addresses `A_in + i*DIM*MATMUL_K + k*DIM` step by `DIM` bytes as k increments — meaning successive k-tiles for fixed `i` **are contiguous in DRAM** (each k-step advances by exactly 16 bytes = DIM × 1 byte). So for fixed `i`, the entire row of K-tiles for A is one contiguous block of `tiles_K * DIM` bytes in DRAM and `tiles_K * DIM` scratchpad rows.
+
+Similarly for B: with stride `MATMUL_K * sizeof(elem_t)` and fixed `j`, successive k-tiles step by `DIM` bytes in DRAM and are contiguous in scratchpad.
+
+`MAX_BLOCK_LEN = 4`, meaning `gemmini_block_mvin(addr, spad, len)` can transfer `len * DIM` columns and `DIM` rows — i.e., up to 4 tiles (cols = `len*DIM`, rows = `DIM`) in one instruction, transferring a block of `len` consecutive DIM-wide tiles. Actually, looking at the definition:
+
+```c
+#define gemmini_block_mvin(dram_addr, spad_addr, len) \
+  gemmini_extended_mvin(dram_addr, spad_addr, (len) * DIM, DIM)
+```
+
+This sends `cols = len*DIM, rows = DIM` — which loads `len` horizontally adjacent DIM-column blocks in one row. **But our tiles are arranged along K**: each tile is DIM rows × DIM cols. For a fixed `i`, k-tiles in scratchpad are stacked vertically (successive 16-row blocks), not horizontally.
+
+Re-examining: `gemmini_extended_mvin` with `cols=DIM, rows=n*DIM` loads an `n*DIM`-row × `DIM`-col block — i.e., `n` vertically stacked tiles. This is the right shape for batching along K. We can use:
+
+```c
+gemmini_extended_mvin(dram_ptr, spad_addr, DIM, tiles_K * DIM);
+```
+
+to load all K tiles for a given `i` (or `j`) in **one instruction**, provided `tiles_K * DIM ≤ MAX_BLOCK_LEN * DIM` — i.e., `tiles_K ≤ 4`. Here `tiles_K = 8 > 4`, so we must split into chunks of 4.
+
+With `tiles_K = 8` and `MAX_BLOCK_LEN = 4`, we issue **2 mvin calls per i-row** (each loading 4 tiles = `rows = 4*DIM = 64`) instead of 8, reducing A mvins from 32 → **8 calls**. Similarly B mvins go from 64 → **16 calls**. Total: **24 calls** instead of 96 — a **4× reduction** in mvin instruction count.
+
+### Concrete Plan
+
+**For A**: For each `i`, load all `tiles_K` tiles in chunks of `MAX_BLOCK_LEN=4`:
+
+```c
+gemmini_config_ld(MATMUL_K * sizeof(elem_t));  // stride = 128, unchanged
+for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+        int chunk = (tiles_K - k < MAX_BLOCK_LEN) ? (tiles_K - k) : MAX_BLOCK_LEN;
+        gemmini_extended_mvin(
+            (void*)((elem_t*)A_in + i * DIM * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM,
+            DIM,
+            chunk * DIM);  // rows = chunk*DIM, cols = DIM
+    }
+}
+```
+
+**For B** (using `gemmini_extended_mvin2` on port 2 for overlap potential, but correctness is maintained on port 1 too):
+
+```c
+for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+        int chunk = (tiles_K - k < MAX_BLOCK_LEN) ? (tiles_K - k) : MAX_BLOCK_LEN;
+        gemmini_extended_mvin(
+            (void*)((elem_t*)B_in + j * DIM * MATMUL_K + k * DIM),
+            b_base + (j * tiles_K + k) * DIM,
+            DIM,
+            chunk * DIM);
+    }
+}
+```
+
+This batches 4 vertically consecutive tiles (same DIM-wide column strip, 4×16=64 rows) per mvin, cutting instruction count by 4×.
+
+### Why DRAM and Scratchpad Are Contiguous for This Batching
+
+- **DRAM**: For fixed `i`, the pointer `A_in + i*DIM*MATMUL_K + k*DIM` advances by `DIM * sizeof(elem_t) = 16` bytes per k-step. But with `rows = chunk*DIM`, `cols = DIM`, the DMA engine reads `chunk*DIM` rows of width `DIM` from DRAM with row-stride = `MATMUL_K * sizeof(elem_t) = 128` bytes (set via `gemmini_config_ld`). This correctly picks up the `chunk` consecutive k-tiles for row `i`.
+- **Scratchpad**: `a_base + (i*tiles_K + k)*DIM` is the start of tile (i,k); requesting `chunk*DIM` rows fills tiles (i,k), (i,k+1), ..., (i,k+chunk-1) contiguously — matching the layout `a_base + (i*tiles_K + k)*DIM` exactly.
+
+The same argument applies to B tiles.
+
+### Resulting Code
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+
+  // Load A tiles: batch MAX_BLOCK_LEN=4 k-tiles per mvin (rows=chunk*DIM, cols=DIM)
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+      int chunk = ((tiles_K - k) < MAX_BLOCK_LEN) ? (tiles_K - k) : MAX_BLOCK_LEN;
+      gemmini_extended_mvin(
+          (void*)((elem_t*)A_in + i * DIM * MATMUL_K + k * DIM),
+          a_base + (i * tiles_K + k) * DIM,
+          DIM,
+          chunk * DIM);
+    }
+  }
+
+  // Load B tiles: batch MAX_BLOCK_LEN=4 k-tiles per mvin (rows=chunk*DIM, cols=DIM)
+  for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k += MAX_BLOCK_LEN) {
+      int chunk = ((tiles_K - k) < MAX_BLOCK_LEN) ? (tiles_K - k) : MAX_BLOCK_LEN;
+      gemmini_extended_mvin(
+          (void*)((elem_t*)B_in + j * DIM * MATMUL_K + k * DIM),
+          b_base + (j * tiles_K + k) * DIM,
+          DIM,
+          chunk * DIM);
+    }
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+### Expected Performance Improvement
+
+- **Instruction count reduced 4×**: 96 individual mvin calls → 24 batched mvin calls. Each RoCC instruction has dispatch latency (encoding, decode, queue entry). Fewer instructions means less CPU→accelerator instruction-feed overhead.
+- **DMA engine efficiency**: A single mvin transferring 64 rows (1024 bytes) keeps the DMA engine busy longer per command, reducing per-transfer setup amortization cost vs. 4 separate 16-row transfers.
+- **No semantic change**: The scratchpad layout is identical — tiles land at exactly the same addresses as before. The `gemmini_loop_ws_spad` and all subsequent operations are unchanged.
+- Since `tiles_K = 8` divides evenly into two chunks of 4, no boundary-check branching is needed at runtime (the `min` just evaluates to 4 both times), making this zero-overhead.

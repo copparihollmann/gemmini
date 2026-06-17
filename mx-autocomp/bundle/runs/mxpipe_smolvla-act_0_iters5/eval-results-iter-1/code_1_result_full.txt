@@ -1,0 +1,162 @@
+{'correct': False, 'test_results': {0: False}, 'compiled': True}
+Prev latency: 15922
+New latency: N/A
+Plan: ## Analysis
+
+Looking at the original code, I can identify the key inefficiency targeted by **strategy 11**:
+
+Inside the double loop over `i0` and `j0`, the code does:
+```c
+for (int g = 0; g < MATMUL_K / 32; g++) {
+    memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+    memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+}
+```
+This copies a sub-array of scales into staging buffers `A_s` and `B_s` before passing them to `gemmini_mx_load_scales`. This CPU-side memcpy is entirely unnecessary because `gemmini_mx_load_scales` just takes a DRAM address and byte length — we can pass a pointer directly into the original `A_scales_row` and `B_scales_col` arrays at the correct offset, eliminating all host-side data movement for scales.
+
+## Plan: Apply Strategy 11
+
+**What to change:**
+
+1. **Remove the `A_s` and `B_s` staging buffers** (and their associated `memcpy` loops entirely). These exist solely to create a contiguous sub-array for each (i0, j0) block, but direct pointer arithmetic into the source arrays achieves the same thing.
+
+2. **Replace `gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0)`** with a direct pointer into `A_scales_row`: the sub-array for block `i0` starts at `&A_scales_row[0][i0 * BLK]`. Since `A_scales_row` is laid out as `[MATMUL_K/32][MATMUL_M]`, the stride between rows is `MATMUL_M` bytes, so the data for a single i0-block is **not** contiguous across `g` groups. However, `gemmini_mx_load_scales` loads `len` bytes from a flat address — so we must pass each group row separately, or verify the layout.
+
+   The original `A_scales_row` has shape `[GK][M]` (row-major), so `A_scales_row[g][i0*BLK]` gives the correct pointer per-group. The `A_s` buffer was concatenating these into a flat `[GK][BLK]` layout. Since `gemmini_mx_load_scales` reads `A_S_BYTES = (MATMUL_K/32)*BLK` bytes flat, and the original `A_scales_row[g]` rows are each `MATMUL_M` bytes wide (not `BLK`), the staging was needed to repack the sub-columns.
+
+   **However**: if `i0==0` and there's only one block (i.e., `BLK==MATMUL_M`), or if `MATMUL_M==BLK`, we can pass directly. For the general case where `BLK < MATMUL_M`, the memcpy is doing column-extraction repacking. In that case, we can eliminate the staging by **issuing one `gemmini_mx_load_scales` call per K-group** with a direct pointer, rather than one call for the whole repacked buffer.
+
+3. **Specifically**: replace the `memcpy` loop + single `gemmini_mx_load_scales` call with a loop over `g` that calls `gemmini_mx_load_scales` directly with `&A_scales_row[g][i0 * BLK]` (length `BLK`) and similarly for B. This eliminates all CPU memcpy work while keeping the same scales loaded into hardware. The total bytes loaded per `gemmini_mx_load_scales` call is `BLK` instead of `(MATMUL_K/32)*BLK`, but the same total data is transferred — just in `MATMUL_K/32` separate calls instead of one, with zero CPU copying.
+
+4. **Remove** `A_s`, `B_s`, `A_S_BYTES`, `B_S_BYTES` from the code entirely.
+
+This is a pure CPU-side optimization: it eliminates the `(MATMUL_K/32) * 2` memcpy calls per outer iteration (each copying `BLK` bytes) which the profiler identified as consuming ~98% of CPU cycles.
+
+CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED outer-tiled MX matmul baseline (128x320x320).
+void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+   for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // PROF cpu_stage
+      // Stage only the tiny per-32-group scales; A/B data is mvin\'d DIRECTLY
+      // from DRAM (no host-side block memcpy — that was 98% of the cycles).
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      // PROF accel
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+      for (int j = 0; j < tiles; j++)                    // B[k][j0*BLK+j] -> slot (k*tiles + j)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      // Accelerator-centric readout: per-row hardware DMA from smem straight into the
+      // bf16-packed row-major output. The old CPU bf16->fp32 assembly was ~99% of cycles
+      // (gemmini was ~1%); this DMA path is ~74x faster on 256x256x512 and exposes the
+      // accelerator work for autocomp to optimize.
+      for (int r = 0; r < BLK; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, BLK);
+      gemmini_fence();
+    }
+}
+''',
+score=15922,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'CPU/host data staging detected (2 memcpy, ~0 scalar copy loops). Host staging is typically the dominant cost on this accelerator and autocomp cannot speed it up directly: mvin tiles STRIDED straight from the source DRAM arrays instead of copying through a host buffer, and keep partial sums in shared memory (bf16 accumulate) rather than accumulating on the CPU.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''## Analysis
+
+Looking at the original code, I can identify the key inefficiency targeted by **strategy 11**:
+
+Inside the double loop over `i0` and `j0`, the code does:
+```c
+for (int g = 0; g < MATMUL_K / 32; g++) {
+    memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+    memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+}
+```
+This copies a sub-array of scales into staging buffers `A_s` and `B_s` before passing them to `gemmini_mx_load_scales`. This CPU-side memcpy is entirely unnecessary because `gemmini_mx_load_scales` just takes a DRAM address and byte length — we can pass a pointer directly into the original `A_scales_row` and `B_scales_col` arrays at the correct offset, eliminating all host-side data movement for scales.
+
+## Plan: Apply Strategy 11
+
+**What to change:**
+
+1. **Remove the `A_s` and `B_s` staging buffers** (and their associated `memcpy` loops entirely). These exist solely to create a contiguous sub-array for each (i0, j0) block, but direct pointer arithmetic into the source arrays achieves the same thing.
+
+2. **Replace `gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0)`** with a direct pointer into `A_scales_row`: the sub-array for block `i0` starts at `&A_scales_row[0][i0 * BLK]`. Since `A_scales_row` is laid out as `[MATMUL_K/32][MATMUL_M]`, the stride between rows is `MATMUL_M` bytes, so the data for a single i0-block is **not** contiguous across `g` groups. However, `gemmini_mx_load_scales` loads `len` bytes from a flat address — so we must pass each group row separately, or verify the layout.
+
+   The original `A_scales_row` has shape `[GK][M]` (row-major), so `A_scales_row[g][i0*BLK]` gives the correct pointer per-group. The `A_s` buffer was concatenating these into a flat `[GK][BLK]` layout. Since `gemmini_mx_load_scales` reads `A_S_BYTES = (MATMUL_K/32)*BLK` bytes flat, and the original `A_scales_row[g]` rows are each `MATMUL_M` bytes wide (not `BLK`), the staging was needed to repack the sub-columns.
+
+   **However**: if `i0==0` and there\'s only one block (i.e., `BLK==MATMUL_M`), or if `MATMUL_M==BLK`, we can pass directly. For the general case where `BLK < MATMUL_M`, the memcpy is doing column-extraction repacking. In that case, we can eliminate the staging by **issuing one `gemmini_mx_load_scales` call per K-group** with a direct pointer, rather than one call for the whole repacked buffer.
+
+3. **Specifically**: replace the `memcpy` loop + single `gemmini_mx_load_scales` call with a loop over `g` that calls `gemmini_mx_load_scales` directly with `&A_scales_row[g][i0 * BLK]` (length `BLK`) and similarly for B. This eliminates all CPU memcpy work while keeping the same scales loaded into hardware. The total bytes loaded per `gemmini_mx_load_scales` call is `BLK` instead of `(MATMUL_K/32)*BLK`, but the same total data is transferred — just in `MATMUL_K/32` separate calls instead of one, with zero CPU copying.
+
+4. **Remove** `A_s`, `B_s`, `A_S_BYTES`, `B_S_BYTES` from the code entirely.
+
+This is a pure CPU-side optimization: it eliminates the `(MATMUL_K/32) * 2` memcpy calls per outer iteration (each copying `BLK` bytes) which the profiler identified as consuming ~98% of CPU cycles.''',
+code='''void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      // PROF accel
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      // Load A scales directly from source array, one K-group at a time, no memcpy staging
+      for (int g = 0; g < MATMUL_K / 32; g++)
+        gemmini_mx_load_scales((uint64_t)&A_scales_row[g][i0 * BLK], BLK, 0);
+      // Load B scales directly from source array, one K-group at a time, no memcpy staging
+      for (int g = 0; g < MATMUL_K / 32; g++)
+        gemmini_mx_load_scales((uint64_t)&B_scales_col[g][j0 * BLK], BLK, 1);
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+      for (int j = 0; j < tiles; j++)                    // B[k][j0*BLK+j] -> slot (k*tiles + j)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin2((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                 b_base + (k * tiles + j) * DIM, DIM, DIM);
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      for (int r = 0; r < BLK; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, BLK);
+      gemmini_fence();
+    }
+}
+''',
+score=None,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='us.anthropic.claude-sonnet-4-6',
+code_gen_model='us.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None)

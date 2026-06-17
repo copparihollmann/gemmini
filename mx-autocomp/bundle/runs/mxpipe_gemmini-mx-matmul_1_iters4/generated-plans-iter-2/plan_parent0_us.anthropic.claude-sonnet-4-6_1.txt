@@ -1,0 +1,80 @@
+## Analysis of the Baseline Code
+
+Looking at the baseline code for a 32×32×32 FP8 matmul:
+
+```c
+gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+for (int i = 0; i < tiles_I; i++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(...);  // Load A tiles
+
+for (int j = 0; j < tiles_J; j++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(...);  // Load B tiles
+```
+
+**Key inefficiency**: Both A and B tile loops use `gemmini_extended_mvin` with the same config (same DRAM row stride = `MATMUL_K * sizeof(elem_t)`). However, the code issues a single `gemmini_config_ld` before the A loop, which correctly applies to both loops since the stride is the same. The real issue is that two separate loops are used, but more importantly, the **B tiles are loaded with `gemmini_extended_mvin` (port 0, same as A)**, rather than `gemmini_extended_mvin2` (port 1), meaning A and B loads cannot overlap with each other or with compute.
+
+## Selected Strategy: Strategy 14 — Replace separate `gemmini_config_ld` and unify mvin ports
+
+Actually, re-reading more carefully: the most impactful single change here is **Strategy 8: reuse loaded B (weight) tiles across multiple I-tile iterations without re-mvin**.
+
+For a 32×32×32 matmul: `tiles_I=2, tiles_J=2, tiles_K=2`. The B tiles are loaded once for the full loop, and `gemmini_loop_ws_spad` handles the tiled compute. B tiles are already loaded once — so this is already happening.
+
+## Correct Selection: Strategy 14
+
+The baseline uses one `gemmini_config_ld` for **both** A and B mvin loops. But B tiles in FP8 have the **same stride** as A tiles (`MATMUL_K * sizeof(elem_t)`), so no re-config is needed. However, the two loops both use `mvin` (port 0) sequentially. By switching B loads to `gemmini_extended_mvin2` (port 1), A and B loads can be **issued to independent DMA ports**, allowing them to proceed in parallel, eliminating the serialization between A and B loading phases.
+
+## Plan
+
+**Apply Strategy 14**: Use `gemmini_extended_mvin2` for B-tile loads so that the single `gemmini_config_ld` (which configures the shared stride for both mvin ports since the stride is identical) covers both, and the two mvin loops can proceed through independent DMA channels without serializing on a single port.
+
+Concretely:
+1. Keep the single `gemmini_config_ld(MATMUL_K * sizeof(elem_t))` — it sets the stride used by both port 0 (mvin) and port 1 (mvin2).
+2. Change the B-tile inner loop from `gemmini_extended_mvin` to `gemmini_extended_mvin2`.
+3. Interleave the A and B mvin calls: issue one A-tile mvin followed immediately by the corresponding B-tile mvin2 in the same loop iteration, so the hardware DMA controller sees both ports active simultaneously.
+
+The interleaved loop structure will be:
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+
+  // Interleave A (mvin, port 0) and B (mvin2, port 1) loads
+  // so both DMA ports are active simultaneously.
+  int max_ik = tiles_I * tiles_K;
+  int max_jk = tiles_J * tiles_K;
+  int max_iter = (max_ik > max_jk) ? max_ik : max_jk;
+
+  for (int iter = 0; iter < max_iter; iter++) {
+    if (iter < max_ik) {
+      int i = iter / tiles_K, k = iter % tiles_K;
+      gemmini_extended_mvin(
+          (void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+          a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    }
+    if (iter < max_jk) {
+      int j = iter / tiles_K, k = iter % tiles_K;
+      gemmini_extended_mvin2(
+          (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+          b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+    }
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+      tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+      a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+      false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+This interleaves the two independent DMA streams — A via `mvin` and B via `mvin2` — into a single loop, allowing the hardware to overlap both transfers, reducing the effective load latency from `latency(A) + latency(B)` to `max(latency(A), latency(B))`.

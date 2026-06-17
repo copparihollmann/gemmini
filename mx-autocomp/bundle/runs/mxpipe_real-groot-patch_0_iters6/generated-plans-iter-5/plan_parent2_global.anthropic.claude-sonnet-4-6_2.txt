@@ -1,0 +1,68 @@
+## Analysis of the Original Code
+
+The original code has two `gemmini_config_ld` calls — one for A tiles and one for B tiles — followed by their respective mvin loops sequentially:
+
+```c
+gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A config
+for (int i = 0; i < tiles; i++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(...);                     // All A mvins
+
+gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B config
+for (int j = 0; j < tiles; j++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin(...);                     // All B mvins
+```
+
+This is purely sequential: all A tiles are loaded, then all B tiles are loaded, then compute begins. The DMA latency for loading one operand type is not overlapped with configuration or loading of the other operand type.
+
+## Plan: Apply Strategy 2 — Interleave A and B mvins with separate config_ld calls
+
+**Strategy 2** says: issue A-tile mvins and B-tile mvins with separate `gemmini_config_ld` calls bracketing each group (A-config then all A mvins, B-config then all B mvins) and **interleave them with compute setup instructions** to overlap DMA latency with configuration.
+
+### Specific Changes
+
+The key insight is that after issuing the A-side `gemmini_config_ld` and dispatching all A mvin instructions (which are queued to the DMA engine), we can immediately issue the B-side `gemmini_config_ld` and B mvin instructions. Since mvin commands are queued asynchronously in Gemmini's instruction queue, the B-side DMA setup and mvin dispatch can proceed while A-side DMAs are still in flight. We further interleave the `gemmini_config_st` and `gemmini_mxquant_config_mvout` configuration instructions between the A and B mvin batches, so those configuration writes overlap with DMA transfer time.
+
+**Revised ordering within the inner block:**
+
+1. Issue `gemmini_config_ld(MATMUL_K * sizeof(elem_t))` for A stride.
+2. Dispatch all A mvin instructions (loop over i, k).
+3. Immediately issue `gemmini_config_ld(MATMUL_N * sizeof(elem_t))` for B stride — this changes the LD config for the next mvin batch while A DMAs are still in flight.
+4. Dispatch all B mvin instructions (loop over j, k) — these queue behind A mvins but the config is already set.
+5. Issue `gemmini_config_st` and `gemmini_mxquant_config_mvout` — these are configuration-only instructions that complete quickly and can be pipelined while DMA completes.
+6. Issue `gemmini_loop_ws_spad` — hardware waits for all queued mvins to complete before starting compute, so correctness is preserved.
+7. Issue `gemmini_mx_read_smem` and `gemmini_fence()`.
+
+Critically, **remove the `gemmini_fence()` calls between individual mvin instructions** (which the original code did not have in the loop but which might be implied by excessive synchronization). The mvin instructions themselves are in-order in the queue; no fence is needed between A mvins and B mvins since `gemmini_loop_ws_spad` already acts as a barrier. The `gemmini_config_ld` change between the A and B mvin batches is safe because Gemmini's config-ld applies to subsequent mvin instructions in the queue, not to already-dispatched ones.
+
+**No structural change to scale loading, LUT loading, tile layout, scratchpad addressing, or the loop_ws_spad call is needed** — only the ordering of config_ld and mvin groups relative to each other and the placement of config_st/mxquant_config_mvout instructions.
+
+### Resulting Code Structure
+
+```c
+// A config + all A mvins (DMA starts)
+gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+for (int i = 0; i < tiles; i++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0*BLK + i*DIM)*MATMUL_K + k*DIM),
+                          a_base + (i*tiles_K + k)*DIM, DIM, DIM);
+
+// B config + all B mvins (DMA queued, overlaps with A DMA completion)
+gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+for (int j = 0; j < tiles; j++)
+  for (int k = 0; k < tiles_K; k++)
+    gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k*DIM)*MATMUL_N + (j0*BLK + j*DIM)),
+                          b_base + (k*tiles + j)*DIM, DIM, DIM);
+
+// Config-st and mxquant config issued while DMA is still in flight
+gemmini_config_st(BLK_OUTC * sizeof(out_t));
+gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+
+// Compute: hardware stalls until all mvins complete, then executes
+gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base,
+                     BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                     false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+```
+
+This ensures DMA for B tiles is dispatched without waiting for A DMA to finish, and the output configuration instructions are pipelined while both DMA streams complete — reducing the total wall-clock time before compute can begin. The programming model order (config_ex → load_scales → mvin → mxquant_config_mvout → loop_ws_spad → read_smem → fence) is fully preserved.

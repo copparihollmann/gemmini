@@ -1,0 +1,60 @@
+## Analysis of the Current Code
+
+Looking at the original code, I need to identify the key inefficiency to target.
+
+The current mvin loop structure is:
+```c
+for (int k = 0; k < tiles_K; k++) {
+  for (int i = 0; i < tiles_I; i++) {
+    gemmini_extended_mvin(...)   // A tile via port 0
+  }
+  for (int j = 0; j < tiles_J; j++) {
+    gemmini_extended_mvin2(...)  // B tile via port 1
+  }
+}
+```
+
+The critical observation is about the B-tile stride configuration. The code configures:
+```c
+gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+```
+
+But for B, the tiles are laid out as `B_in[j * DIM * MATMUL_K + k * DIM]` — meaning the stride across the K dimension in DRAM is `MATMUL_K` bytes. However, looking at the reference pattern `matmul_ws_mx_generic.c`, the B matrix is stored as `B_in[MATMUL_K][MATMUL_N/VALUES_PER_BYTE]` (K-major order), with stride `MATMUL_N/VALUES_PER_BYTE` per row. The current code uses stride `MATMUL_K` for B tiles via port 1, but this is for A-format layout — B in the canonical layout has stride `MATMUL_N` bytes (full row width of B).
+
+More importantly, strategy **7** is clearly applicable: `b_base`, `a_base`, and `SPAD_DEST` are computed at runtime from `tiles_K`, `tiles_J`, etc., but since `MATMUL_M`, `MATMUL_N`, `MATMUL_K`, and `DIM` are all compile-time constants, these values can be computed as compile-time constants, eliminating runtime address arithmetic inside the mvin loops.
+
+## Selected Strategy: Strategy 7 — Compute addresses as compile-time constants
+
+### Plan
+
+**Problem:** In the current code, `tiles_I`, `tiles_J`, `tiles_K`, `a_base`, `b_base`, `SPAD_DEST`, and `OUT_COLS` are all computed at runtime via integer division/subtraction, and the loop index expressions `a_base + (i * tiles_K + k) * DIM` and `b_base + (j * tiles_K + k) * DIM` perform multiplications and additions per iteration. Since all of `MATMUL_M`, `MATMUL_N`, `MATMUL_K`, and `DIM=16` are compile-time constants (from the header), the compiler can evaluate everything statically.
+
+**Change:** Replace the runtime computations with `#define` constants:
+
+```c
+#define TILES_I  (MATMUL_M / DIM)
+#define TILES_J  (MATMUL_N / DIM)
+#define TILES_K  (MATMUL_K / DIM)
+#define A_BASE   0
+#define B_BASE   (BANK_NUM * BANK_ROWS - TILES_K * TILES_J * DIM)
+#define SPAD_DEST_ADDR  128
+#define OUT_COLS_CONST  (MATMUL_N / BF16_PER_WORD)
+```
+
+Then replace all uses of runtime variables with these constants. The loop bodies become:
+
+```c
+// A mvin: address is now a compile-time-reducible expression
+uint32_t sp_addr = A_BASE + (i * TILES_K + k) * DIM;
+// B mvin:
+uint32_t sp_addr = B_BASE + (j * TILES_K + k) * DIM;
+```
+
+With `TILES_K`, `DIM`, `A_BASE`, and `B_BASE` as compile-time constants, the compiler can:
+1. Precompute the stride `TILES_K * DIM` as a constant multiplier
+2. Convert the inner-loop address update into a simple add of a constant increment
+3. Eliminate the runtime variables entirely from register pressure
+
+This also allows the `gemmini_config_st(OUT_COLS_CONST * sizeof(out_t))` and `gemmini_mxquant_config_mvout(...)` arguments to be constant-folded at compile time, reducing instruction overhead in the setup sequence. The `gemmini_mx_read_smem` call similarly benefits from constant `SPAD_DEST_ADDR * 16` being resolved at compile time.
+
+No semantic change occurs — all values are identical to the runtime-computed ones, just resolved earlier. The programming model sequence is preserved exactly.

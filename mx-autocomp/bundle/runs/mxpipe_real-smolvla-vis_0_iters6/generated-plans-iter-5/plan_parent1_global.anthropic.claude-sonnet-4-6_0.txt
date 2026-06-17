@@ -1,0 +1,62 @@
+## Strategy: Eliminate Host-Side Scale-Factor Staging Buffers and Load Directly from Source Arrays
+
+### Identification of the Inefficiency
+
+The current code maintains two intermediate CPU-side staging buffers, `A_s` and `B_s`, and fills them with `memcpy` before each `gemmini_mx_load_scales` call:
+
+```c
+// Per j0: stage B scales
+for (int g = 0; g < MATMUL_K / 32; g++)
+    memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+
+// Per (i0, j0): stage A scales  
+for (int g = 0; g < MATMUL_K / 32; g++)
+    memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+```
+
+These `memcpy` calls copy slices of `B_scales_col` and `A_scales_row` into contiguous scratch buffers (`B_s`, `A_s`) solely because `gemmini_mx_load_scales` is called with a single base address and length, and the hardware DMA expects the scale data to be laid out contiguously starting at that address. However, this CPU-side staging is unnecessary overhead: the host CPU performs redundant memory writes on every iteration, polluting caches and adding latency before the accelerator can start.
+
+The key observation is that `A_scales_row` and `B_scales_col` are laid out as 2D arrays `[MATMUL_K/32][MATMUL_N_or_M]`, and each tile block's scale slice is a **row-contiguous sub-region** — specifically, `&A_scales_row[g][i0 * BLK]` for group `g` and block `i0`. Since `gemmini_mx_load_scales` expects the data to be packed as `MATMUL_K/32` groups of `BLK` e8m0 bytes, and the source array stores them interleaved with full-width rows, we cannot pass a single pointer to `A_scales_row[0][i0*BLK]` directly — unless we restructure the inner loop to issue **one `gemmini_mx_load_scales` per group**, pointing directly into the source array.
+
+### The Fix
+
+Instead of `memcpy`-ing into staging buffers and then doing a single bulk `gemmini_mx_load_scales`, issue one `gemmini_mx_load_scales` call per K-group directly from the source arrays. Since `A_scales_row[g]` is a contiguous row and `A_scales_row[g][i0 * BLK]` is a valid pointer into it with `BLK` bytes available contiguously, we load `BLK` bytes per group call. This eliminates all `memcpy` host writes entirely.
+
+**For B (hoisted to j0 level):**
+```c
+// Before: memcpy into B_s then one load
+// After: one load per K-group directly from source
+for (int g = 0; g < MATMUL_K / 32; g++)
+    gemmini_mx_load_scales(
+        (uint64_t)(&B_scales_col[g][j0 * BLK]),
+        BLK,
+        1);  // sel=1 → B
+```
+
+**For A (at i0 level):**
+```c
+// Before: memcpy into A_s then one load
+// After: one load per K-group directly from source
+for (int g = 0; g < MATMUL_K / 32; g++)
+    gemmini_mx_load_scales(
+        (uint64_t)(&A_scales_row[g][i0 * BLK]),
+        BLK,
+        0);  // sel=0 → A
+```
+
+### Why This Improves Performance
+
+1. **Eliminates all host `memcpy` traffic**: The CPU no longer writes `BLK` bytes per K-group into staging buffers. For `MATMUL_K/32` groups and `BLOCKS_M × BLOCKS_N` outer tile iterations, this removes a significant number of cache-polluting stores and frees the CPU to issue accelerator instructions earlier.
+
+2. **Reduces instruction latency to first accelerator operation**: The `memcpy` loops are on the critical path before `gemmini_mx_load_scales`. By removing them, the accelerator's DMA load of scales begins sooner, overlapping better with preceding B-tile mvin traffic.
+
+3. **No correctness risk**: The hardware documentation states that `gemmini_mx_load_scales` streams `len` e8m0 codes sequentially from `dram_addr`. Issuing multiple calls with `sel=1` (or `sel=0`) loads them **sequentially into the same scale memory buffer**, exactly as if a single contiguous region were loaded. The hardware accumulates them in order, so `g=0` fills positions `[0..BLK-1]`, `g=1` fills `[BLK..2*BLK-1]`, etc., which is identical to the staging-buffer approach. Scale ordering and tile mapping are preserved exactly.
+
+4. **Staging buffers `A_s` and `B_s` can be removed entirely**, reducing stack/BSS pressure.
+
+### Summary of Changes
+
+- Remove the `memcpy` loops for `B_s` at the `j0` level and `A_s` at the `i0` level.
+- Replace each bulk `gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0)` with a loop of per-group calls loading `BLK` bytes directly from `A_scales_row[g][i0 * BLK]`.
+- Replace each bulk `gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1)` with a loop of per-group calls loading `BLK` bytes directly from `B_scales_col[g][j0 * BLK]`.
+- Remove declarations of `A_s` and `B_s` staging arrays.

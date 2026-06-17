@@ -1,0 +1,172 @@
+{'correct': False, 'test_results': {0: False}, 'compiled': True}
+Prev latency: 7098437
+New latency: N/A
+Plan: # Optimization Plan: Hoist Redundant Operations Out of Loops
+
+## Strategy: #2 — Hoist redundant operations out of loops
+
+## Analysis of the Current Code
+
+Looking at the baseline code, the outer loop is `for(int t=0; t<NT; t++)`, and inside this loop there are **two hardware matmul blocks** (QK^T and PV). Each iteration performs:
+
+### Block 1 (QK^T: Q × KT → S1):
+- `gemmini_flush(0)` — **unnecessarily called every iteration**
+- `gemmini_extended3_config_ex(...)` — **same arguments every iteration**
+- `gemmini_mx_load_scales(...Q_scales_row..., 0)` — **Q scales never change across `t`**; Q is fixed, yet it's reloaded every iteration of the `t` loop
+
+### Block 2 (PV: P × V → O):
+- `gemmini_flush(0)` — **unnecessarily called every iteration**
+- `gemmini_extended3_config_ex(...)` — **same arguments every iteration**
+- `gemmini_config_st(...)` — **same stride every iteration**
+
+## Specific Changes
+
+### 1. Hoist `gemmini_flush(0)` before the `t` loop
+Both blocks call `gemmini_flush(0)` on every iteration. A flush only needs to happen once at initialization to clear stale state. Move both `gemmini_flush(0)` calls to before the `for(int t=0; t<NT; t++)` loop, and remove them from inside the loop. This eliminates `2*NT` flush operations down to 2.
+
+### 2. Hoist `gemmini_extended3_config_ex(...)` before the `t` loop
+Both calls to `gemmini_extended3_config_ex` use **identical arguments** (`WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 1, 1, 3, 1`) and never change across iterations. These configure persistent hardware state (format, dataflow, strides). Issue them once before the `t` loop. This eliminates `2*NT` config instructions down to 2.
+
+### 3. Hoist `gemmini_mx_load_scales(...Q_scales_row..., 0)` for Block 1
+Q is the query matrix — it is **fixed across all `t` iterations** (the `t` loop iterates over KV sequence blocks, not Q). The Q scale factors `Q_scales_row` never change. Move this single `gemmini_mx_load_scales` call to before the `t` loop. This eliminates `NT-1` redundant scale-load operations. **Important:** The KT scales (`KTsc`) do change each `t` iteration and must remain inside the loop.
+
+### 4. Hoist `gemmini_config_st(...)` calls where stride is constant
+- Block 1: `gemmini_config_st((BT/BF16_PER_WORD)*sizeof(out_t))` — same every `t`; hoist before the loop
+- Block 2: `gemmini_config_st((ATT_D/BF16_PER_WORD)*sizeof(out_t))` — same every `t`; these two have different strides so they cannot both be hoisted to one place before the loop, but Block 2's can be noted as invariant. Since Block 1 and Block 2 alternate within the loop and use different strides, hoist Block 1's config_st before the loop and re-issue Block 2's config_st once per iteration just before Block 2 begins (it was already there — but Block 1's re-issue is the redundant one to eliminate).
+
+### 5. Hoist Q MVIN before the `t` loop
+Q tiles are loaded in Block 1's mvin loops (`gemmini_extended_mvin` over `i,k` for Q_hw`). Since Q never changes across `t`, these mvin operations load the **same data to the same scratchpad addresses** every iteration. Hoist the Q mvin loop (including its `gemmini_config_ld`) to before the `t` loop so Q tiles are loaded once into scratchpad at `a_base=0` and remain there. **Constraint check:** the scratchpad layout for Block 1 uses `ab=0` (A tiles) and `bb=BANK_NUM*BANK_ROWS - tk*tj*DIM` (B tiles for KT). With `ti=ATT_S/DIM/2=4`, `tk=ATT_D/DIM=4`, `tj=BT/DIM/2`, Q occupies `ti*tk*DIM = 4*4*16 = 256` rows at the bottom. KT tiles sit at the top. As long as `256 + tk*tj*DIM ≤ 8192`, the layout is valid. After hoisting Q mvin, Block 1 inside the loop only needs to mvin KT tiles (which change every `t`).
+
+## Summary of Changes
+
+| Operation | Before | After |
+|-----------|--------|-------|
+| `gemmini_flush` | 2×NT calls | 2 calls (before loop) |
+| `gemmini_extended3_config_ex` (Block 1) | NT calls | 1 call (before loop) |
+| `gemmini_extended3_config_ex` (Block 2) | NT calls | 1 call (before loop) |
+| `gemmini_mx_load_scales(Q_scales_row, -, 0)` | NT calls | 1 call (before loop) |
+| `gemmini_config_st` (Block 1) | NT calls | 1 call (before loop) |
+| Q tile mvin loop | NT × ti×tk mvin calls | 1× ti×tk mvin calls (before loop) |
+| KT scale build + load | NT calls (unchanged) | NT calls (must remain) |
+| KT tile mvin | NT calls (unchanged) | NT calls (must remain) |
+
+The `gemmini_mxquant_config_mvout` calls **cannot** be hoisted because they reference tile-count-specific bounds and `scale_factors` that are consumed per-iteration — they remain inside the loop. Similarly, KT and V scale loads change per-`t` and must stay inside.
+
+This plan focuses purely on hoisting redundant, iteration-invariant setup operations out of the `t` loop, directly reducing instruction count and accelerator stall cycles by eliminating `O(NT)` redundant configuration and data-load instructions.
+
+CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED baseline MX FLASH attention kernel (S=128, D=64, fp6:e3m2).
+void solution(void) {
+  for(int i=0;i<ATT_S;i++){Mr[i]=-1e30f;Lr[i]=0.f;for(int d=0;d<ATT_D;d++)O_acc[i][d]=0.f;}
+  for(int t=0;t<NT;t++){
+    { int ti=ATT_S/DIM/2, tj=BT/DIM/2, tk=ATT_D/DIM; uint32_t ab=0,bb=BANK_NUM*BANK_ROWS-tk*tj*DIM;
+      for(int g=0;g<ATT_D/32;g++)for(int n=0;n<BT;n++)KTsc[g*BT+n]=KT_scales_col[g][t*BT+n];
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY,0,0,ACC_SCALE_IDENTITY,1,1,0,0,false,1,1,3,1);
+      gemmini_mx_load_scales((uint64_t)&Q_scales_row,sizeof(Q_scales_row),0);
+      gemmini_mx_load_scales((uint64_t)KTsc,(ATT_D/32)*BT,1);
+      gemmini_config_st((BT/BF16_PER_WORD)*sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,ti,tj,tk,0,0,8);
+      gemmini_mx_load_lut((uint64_t)KT_lp,1,0); gemmini_mx_load_lut((uint64_t)Q_lp,1,1);
+      gemmini_config_ld(ATT_D*sizeof(elem_t));
+      for(int i=0;i<ti;i++)for(int k=0;k<tk;k++) gemmini_extended_mvin((void*)(((elem_t*)Q_hw)+i*DIM*ATT_D+k*DIM),ab+(i*tk+k)*DIM,DIM,DIM);
+      gemmini_config_ld(ATT_S*sizeof(elem_t)/2);
+      for(int k=0;k<tk;k++)for(int j=0;j<tj;j++) gemmini_extended_mvin((void*)(((elem_t*)KT_in)+k*DIM*(ATT_S/2)+(t*BT)/2+j*DIM),bb+(k*tj+j)*DIM,DIM,DIM);
+      gemmini_loop_ws_spad(ti,tj,tk,0,0,0,ab,BANK_NUM*BANK_ROWS,0,128,false,false,false,false,false,NO_ACTIVATION,0,0,false,0x38);
+      gemmini_mx_read_smem(&S1_hw[0][0],128*16,ATT_S*BT); gemmini_fence(); }
+    for(int i=0;i<ATT_S;i++){
+      float row[BT], mn=Mr[i];
+      for(int j=0;j<BT;j++){uint16_t b=(uint16_t)((S1_hw[i][j/4]>>((j%4)*16))&0xFFFF);row[j]=bf16f(b);if(row[j]>mn)mn=row[j];}
+      float corr=expf2(Mr[i]-mn), ln=Lr[i]*corr;
+      for(int j=0;j<BT;j++){row[j]=expf2(row[j]-mn);ln+=row[j];}
+      for(int d=0;d<ATT_D;d++)O_acc[i][d]*=corr; Mr[i]=mn; Lr[i]=ln;
+      for(int g=0;g<GBT;g++){float gm=0.f;for(int j=g*32;j<g*32+32;j++){float a=fabsf2(row[j]);if(a>gm)gm=a;}
+        int e=0;if(gm>0.f)e=fexp2(gm/0.5f)+1;float isc=pow2i(-e);P_scales[g][i]=(uint8_t)(e+127);
+        for(int j=g*32;j<g*32+32;j++){uint8_t idx=enc(row[j]*isc);
+          if((i&1)==0)P_hw[i>>1][j]=(P_hw[i>>1][j]&0xF0)|idx; else P_hw[i>>1][j]=(P_hw[i>>1][j]&0x0F)|(idx<<4);}}}
+    { int ti=ATT_S/DIM/2, tj=ATT_D/DIM/2, tk=BT/DIM; uint32_t ab=0,bb=BANK_NUM*BANK_ROWS-tk*tj*DIM;
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY,0,0,ACC_SCALE_IDENTITY,1,1,0,0,false,1,1,3,1);
+      gemmini_mx_load_scales((uint64_t)&P_scales,sizeof(P_scales),0);
+      gemmini_mx_load_scales((uint64_t)&V_scales_col[t*GBT][0],GBT*ATT_D,1);
+      gemmini_config_st((ATT_D/BF16_PER_WORD)*sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,ti,tj,tk,0,0,8);
+      gemmini_mx_load_lut((uint64_t)V_lp,1,0); gemmini_mx_load_lut((uint64_t)P_lp,1,1);
+      gemmini_config_ld(BT*sizeof(elem_t));
+      for(int i=0;i<ti;i++)for(int k=0;k<tk;k++) gemmini_extended_mvin((void*)(((elem_t*)P_hw)+i*DIM*BT+k*DIM),ab+(i*tk+k)*DIM,DIM,DIM);
+      gemmini_config_ld(ATT_D*sizeof(elem_t)/2);
+      for(int k=0;k<tk;k++)for(int j=0;j<tj;j++) gemmini_extended_mvin((void*)(((elem_t*)V_in)+(t*BT+k*DIM)*(ATT_D/2)+j*DIM),bb+(k*tj+j)*DIM,DIM,DIM);
+      gemmini_loop_ws_spad(ti,tj,tk,0,0,0,ab,BANK_NUM*BANK_ROWS,0,128,false,false,false,false,false,NO_ACTIVATION,0,0,false,0x38);
+      gemmini_mx_read_smem(&O_hw[0][0],128*16,ATT_S*ATT_D); gemmini_fence();
+      for(int i=0;i<ATT_S;i++)for(int d=0;d<ATT_D;d++){uint16_t b=(uint16_t)((O_hw[i][d/4]>>((d%4)*16))&0xFFFF);O_acc[i][d]+=bf16f(b);} } }
+  for(int i=0;i<ATT_S;i++){float il=1.f/Lr[i];for(int d=0;d<ATT_D;d++)O_acc[i][d]*=il;}
+}
+''',
+score=7098437,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'CPU/host data staging detected (0 memcpy, ~4 scalar copy loops). Host staging is typically the dominant cost on this accelerator and autocomp cannot speed it up directly: mvin tiles STRIDED straight from the source DRAM arrays instead of copying through a host buffer, and keep partial sums in shared memory (bf16 accumulate) rather than accumulating on the CPU.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''# Optimization Plan: Hoist Redundant Operations Out of Loops
+
+## Strategy: #2 — Hoist redundant operations out of loops
+
+## Analysis of the Current Code
+
+Looking at the baseline code, the outer loop is `for(int t=0; t<NT; t++)`, and inside this loop there are **two hardware matmul blocks** (QK^T and PV). Each iteration performs:
+
+### Block 1 (QK^T: Q × KT → S1):
+- `gemmini_flush(0)` — **unnecessarily called every iteration**
+- `gemmini_extended3_config_ex(...)` — **same arguments every iteration**
+- `gemmini_mx_load_scales(...Q_scales_row..., 0)` — **Q scales never change across `t`**; Q is fixed, yet it\'s reloaded every iteration of the `t` loop
+
+### Block 2 (PV: P × V → O):
+- `gemmini_flush(0)` — **unnecessarily called every iteration**
+- `gemmini_extended3_config_ex(...)` — **same arguments every iteration**
+- `gemmini_config_st(...)` — **same stride every iteration**
+
+## Specific Changes
+
+### 1. Hoist `gemmini_flush(0)` before the `t` loop
+Both blocks call `gemmini_flush(0)` on every iteration. A flush only needs to happen once at initialization to clear stale state. Move both `gemmini_flush(0)` calls to before the `for(int t=0; t<NT; t++)` loop, and remove them from inside the loop. This eliminates `2*NT` flush operations down to 2.
+
+### 2. Hoist `gemmini_extended3_config_ex(...)` before the `t` loop
+Both calls to `gemmini_extended3_config_ex` use **identical arguments** (`WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 1, 1, 3, 1`) and never change across iterations. These configure persistent hardware state (format, dataflow, strides). Issue them once before the `t` loop. This eliminates `2*NT` config instructions down to 2.
+
+### 3. Hoist `gemmini_mx_load_scales(...Q_scales_row..., 0)` for Block 1
+Q is the query matrix — it is **fixed across all `t` iterations** (the `t` loop iterates over KV sequence blocks, not Q). The Q scale factors `Q_scales_row` never change. Move this single `gemmini_mx_load_scales` call to before the `t` loop. This eliminates `NT-1` redundant scale-load operations. **Important:** The KT scales (`KTsc`) do change each `t` iteration and must remain inside the loop.
+
+### 4. Hoist `gemmini_config_st(...)` calls where stride is constant
+- Block 1: `gemmini_config_st((BT/BF16_PER_WORD)*sizeof(out_t))` — same every `t`; hoist before the loop
+- Block 2: `gemmini_config_st((ATT_D/BF16_PER_WORD)*sizeof(out_t))` — same every `t`; these two have different strides so they cannot both be hoisted to one place before the loop, but Block 2\'s can be noted as invariant. Since Block 1 and Block 2 alternate within the loop and use different strides, hoist Block 1\'s config_st before the loop and re-issue Block 2\'s config_st once per iteration just before Block 2 begins (it was already there — but Block 1\'s re-issue is the redundant one to eliminate).
+
+### 5. Hoist Q MVIN before the `t` loop
+Q tiles are loaded in Block 1\'s mvin loops (`gemmini_extended_mvin` over `i,k` for Q_hw`). Since Q never changes across `t`, these mvin operations load the **same data to the same scratchpad addresses** every iteration. Hoist the Q mvin loop (including its `gemmini_config_ld`) to before the `t` loop so Q tiles are loaded once into scratchpad at `a_base=0` and remain there. **Constraint check:** the scratchpad layout for Block 1 uses `ab=0` (A tiles) and `bb=BANK_NUM*BANK_ROWS - tk*tj*DIM` (B tiles for KT). With `ti=ATT_S/DIM/2=4`, `tk=ATT_D/DIM=4`, `tj=BT/DIM/2`, Q occupies `ti*tk*DIM = 4*4*16 = 256` rows at the bottom. KT tiles sit at the top. As long as `256 + tk*tj*DIM ≤ 8192`, the layout is valid. After hoisting Q mvin, Block 1 inside the loop only needs to mvin KT tiles (which change every `t`).
+
+## Summary of Changes
+
+| Operation | Before | After |
+|-----------|--------|-------|
+| `gemmini_flush` | 2×NT calls | 2 calls (before loop) |
+| `gemmini_extended3_config_ex` (Block 1) | NT calls | 1 call (before loop) |
+| `gemmini_extended3_config_ex` (Block 2) | NT calls | 1 call (before loop) |
+| `gemmini_mx_load_scales(Q_scales_row, -, 0)` | NT calls | 1 call (before loop) |
+| `gemmini_config_st` (Block 1) | NT calls | 1 call (before loop) |
+| Q tile mvin loop | NT × ti×tk mvin calls | 1× ti×tk mvin calls (before loop) |
+| KT scale build + load | NT calls (unchanged) | NT calls (must remain) |
+| KT tile mvin | NT calls (unchanged) | NT calls (must remain) |
+
+The `gemmini_mxquant_config_mvout` calls **cannot** be hoisted because they reference tile-count-specific bounds and `scale_factors` that are consumed per-iteration — they remain inside the loop. Similarly, KT and V scale loads change per-`t` and must stay inside.
+
+This plan focuses purely on hoisting redundant, iteration-invariant setup operations out of the `t` loop, directly reducing instruction count and accelerator stall cycles by eliminating `O(NT)` redundant configuration and data-load instructions.''',
+code='''Error: max retries reached''',
+score=None,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='us.anthropic.claude-sonnet-4-6',
+code_gen_model='us.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None)

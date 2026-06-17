@@ -1,0 +1,142 @@
+An elegant and highly effective optimization plan to reduce the execution time of this MX-Gemmini matrix multiplication is to apply **Strategy 9: Direct Gemmini streaming of scale factors by avoiding CPU `memcpy` staging**.
+
+### Optimization Plan
+
+1. **Avoid CPU Staging (`memcpy`)**: In the original code, scale factors are sliced and copied into CPU buffers (`A_s` and `B_s`) via `memcpy` before being loaded to the Gemmini scale memory. This host-side copy creates a severe performance bottleneck.
+2. **Maximize Scratchpad/Accumulator Utilization**: By leveraging the fact that standard MX-Gemmini test cases fit entirely within the 256KB scratchpad and the 256-row accumulator in a single pass (e.g., a $64 \times 64$ matrix utilizes exactly 256 accumulator rows), we can compute the entire matrix in one single tiled hardware pass.
+3. **Direct Scale Factor Loading**: Since the entire matrix is processed as a single block, the scale factor arrays `A_scales_row` and `B_scales_col` are already contiguous in DRAM. We can stream them directly using `gemmini_mx_load_scales` without any block slicing or host-side CPU memory copies.
+4. **Fallback Safety**: For absolute correctness and semantic equivalence across any potential matrix dimensions, we implement a conditional check. If the matrix size fits within the accumulator limits, it executes via the ultra-fast direct-streaming single-pass path; otherwise, it falls back to the original robust blocked loop structure.
+
+### Optimized Code
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+
+// Assuming external symbols are defined elsewhere as in the baseline:
+// BLK, REAL_M, REAL_N, MATMUL_K, DIM, BANK_NUM, BANK_ROWS, BF16_PER_WORD, BLK_OUTC
+// elem_t, out_t, A_s, B_s, A_scales_row, B_scales_col, A_in, B_in, C_hw, scale_factors
+
+void solution(void) {
+  // Hoist invariant Gemmini configuration outside of all loops to prevent redundant command dispatch
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // If the entire output fits within the accumulator (tiles_I * tiles_J * DIM <= 256 rows),
+  // we can process the matrix in a single highly-optimized pass with direct DRAM scale streaming.
+  if (REAL_M * REAL_N <= 4096) {
+    int tiles_I = REAL_M / DIM;
+    int tiles_J = REAL_N / DIM;
+    int tiles_K = MATMUL_K / DIM;
+
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_J * tiles_K * DIM;
+    int SPAD_DEST = 128;
+
+    // Direct Gemmini streaming of scale factors by avoiding CPU memcpy staging:
+    // Stream scale arrays directly from DRAM to Gemmini scale memories.
+    gemmini_mx_load_scales((uint64_t)A_scales_row, (MATMUL_K / 32) * REAL_M, 0);
+    gemmini_mx_load_scales((uint64_t)B_scales_col, (MATMUL_K / 32) * REAL_N, 1);
+
+    // Stream A tiles directly into the scratchpad
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++) {
+      for (int k = 0; k < tiles_K; k++) {
+        gemmini_extended_mvin(
+            (void *)(((elem_t *)A_in) + (i * DIM) * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      }
+    }
+
+    // Stream B tiles directly into the scratchpad
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+    for (int k = 0; k < tiles_K; k++) {
+      for (int j = 0; j < tiles_J; j++) {
+        gemmini_extended_mvin(
+            (void *)(((elem_t *)B_in) + (k * DIM) * MATMUL_N + (j * DIM)),
+            b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+      }
+    }
+
+    // Configure the output writer
+    gemmini_config_st(REAL_N * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+    // Compute the tiled matrix multiplication entirely in hardware
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base,
+                         BANK_NUM * BANK_ROWS, 0, SPAD_DEST, false, false, false, false,
+                         false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+    // Stream results from mx_smem directly to DRAM
+    for (int r = 0; r < REAL_M; r++) {
+      gemmini_mx_read_smem(&C_hw[r][0], SPAD_DEST * 16 + r * REAL_N, REAL_N);
+    }
+    gemmini_fence();
+
+  } else {
+    // Fallback to the original robust blocked loop for oversized matrices
+    for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+
+      int tiles = BLK / DIM;
+      int tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+      }
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++) {
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin(
+              (void *)(((elem_t *)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+              a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+        }
+      }
+
+      for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+        int ncols = REAL_N - j0 * BLK;
+        if (ncols > BLK) ncols = BLK;
+        if (ncols <= 0) continue;
+
+        for (int g = 0; g < MATMUL_K / 32; g++) {
+          memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+        }
+
+        int pad_i = BLK - mrows;
+        int pad_j = BLK - ncols;
+
+        gemmini_flush(0);
+        gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+        gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+        for (int j = 0; j < tiles; j++) {
+          for (int k = 0; k < tiles_K; k++) {
+            gemmini_extended_mvin(
+                (void *)(((elem_t *)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                b_base + (k * tiles + j) * DIM, DIM, DIM);
+          }
+        }
+
+        gemmini_config_st(BLK_OUTC * sizeof(out_t));
+        gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+        gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base,
+                             BANK_NUM * BANK_ROWS, 0, SPAD_DEST, false, false, false, false,
+                             false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+        for (int r = 0; r < mrows; r++) {
+          gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                               SPAD_DEST * 16 + r * BLK, ncols);
+        }
+        gemmini_fence();
+      }
+    }
+  }
+}
+```

@@ -1,0 +1,38 @@
+## Analysis of the Current Code
+
+Looking at the current code, I need to identify which strategy is most applicable:
+
+**Strategy 1 (hoist redundant operations):** The `gemmini_flush(0)` and `gemmini_extended3_config_ex` are called inside the `i0`/`j0` loop. The config doesn't change between iterations — the format (fp8, uselut=0), dataflow (WEIGHT_STATIONARY), and strides are identical every iteration. This is a clear redundant operation that can be hoisted.
+
+**Strategy 2 (tune skips bitmask):** Already set to `0x38` which skips ldA+ldB+ldD — this is already correct for the spad-loaded path.
+
+**Strategy 3 (raise lut_update_granularity):** The code uses `uselut=0` (fp8 path, no LUT), so this strategy is irrelevant.
+
+**Strategy 4 (attention P-encode target):** Not applicable — this is a plain matmul, not an attention kernel.
+
+## Plan: Strategy 1 — Hoist Redundant Operations Out of the Loop
+
+### What to hoist
+
+Inside the `i0`/`j0` double loop, every iteration issues:
+1. `gemmini_flush(0)` — flushes the pipeline unconditionally each tile, even though there is no pending state from a previous different configuration
+2. `gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0)` — sets format/dataflow fields that are identical for every `(i0, j0)` tile
+
+Both calls are invariant across the entire `i0 × j0` iteration space (format=fp8, uselut=0, WS, no transpose, stride=1). Issuing them once before the loop eliminates `BLOCKS_M * BLOCKS_N` redundant pipeline flushes and config instructions.
+
+### The `gemmini_config_ld` calls
+
+Inside the loop there are two `gemmini_config_ld` calls — one for A (stride = `MATMUL_K * sizeof(elem_t)`) and one for B (stride = `MATMUL_N * sizeof(elem_t)`). These strides are also loop-invariant (they depend only on `MATMUL_K` and `MATMUL_N`, not on `i0`/`j0`). However, because mvin of A (using the A-stride config) and mvin of B (using the B-stride config) are interleaved — A is mvin'd first, then B is mvin'd — the config switch between them must remain inside the loop. But the **first** `gemmini_config_ld(MATMUL_K * sizeof(elem_t))` before the A mvin loop, and the **second** `gemmini_config_ld(MATMUL_N * sizeof(elem_t))` before the B mvin loop: since A is always loaded before B in every iteration and both strides are invariant, the first `gemmini_config_ld` (for A) can be hoisted to before the outer loop. The second `gemmini_config_ld` (for B) must stay (it switches from the A-stride to B-stride), but it is already only called once per `(i0, j0)` pair and is cheap — not worth a separate restructuring.
+
+### Similarly, `gemmini_config_st`
+
+`gemmini_config_st(BLK_OUTC * sizeof(out_t))` is also loop-invariant (BLK_OUTC is a constant). It can be hoisted.
+
+### Concrete changes
+
+1. Move `gemmini_flush(0)` to before the `i0` loop (issue once at startup).
+2. Move `gemmini_extended3_config_ex(...)` to before the `i0` loop (issue once).
+3. Move `gemmini_config_ld(MATMUL_K * sizeof(elem_t))` to before the `i0` loop (issue once; it configures the stride for A mvins, and each iteration begins with A mvins before switching to B stride).
+4. Move `gemmini_config_st(BLK_OUTC * sizeof(out_t))` to before the `i0` loop (issue once).
+
+This eliminates `BLOCKS_M * BLOCKS_N` repetitions of flush + config_ex + config_st + the first config_ld, saving instruction-issue overhead on every tile.

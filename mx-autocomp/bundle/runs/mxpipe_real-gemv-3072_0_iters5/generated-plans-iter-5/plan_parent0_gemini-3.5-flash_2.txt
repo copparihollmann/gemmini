@@ -1,0 +1,154 @@
+An elegant and highly effective optimization strategy for this hardware is to **implement chunked-K accumulation using the `ex_accumulate` flag inside `gemmini_loop_ws_spad`**.
+
+### Optimization Strategy: Chunked-K Accumulation with Maximized Accumulator Tiling
+
+1. **Why the Baseline is Inefficient:**
+   The baseline uses a small tile block size `BLK`, which fails to utilize the capacity of the accumulator (using 0KB out of 64KB) and scratchpad. This leads to a massive number of outer loop iterations (`i0`, `j0`), incurring high host-side CPU overhead and redundant scale factor DRAM transfers.
+
+2. **The New Strategy (Chunked-K Accumulation):**
+   * **Maximize `BLK` to 64:** We increase the block size `BLK` to 64, which corresponds to `tiles_I = 4` and `tiles_J = 4`. This fully utilizes the maximum capacity of the accumulator ($4 \times 4 \times 16 = 256$ rows, or exactly 100% of the 256 accumulator rows).
+   * **Chunking K-dimension:** Because a large `BLK=64` along with the full $K$-dimension would overflow the scratchpad memory, we split the $K$-dimension into manageable chunks (e.g., `chunk_K_tiles = 16`, representing 256 elements along $K$).
+   * **In-Accumulator Accumulation (`ex_accumulate`):** We execute the hardware gemm loop for each $K$-chunk sequentially. By setting the `ex_accumulate` flag to `true` for all chunks after the first, the hardware systolic array accumulates the intermediate floating-point results directly in the accumulator. 
+   * **Conditional Write-Back (Skipping Stores):** We set the skip-mask `skips` to `0xB8` (which includes bit 7 to skip storing to SMEM) for all chunks except the final one. For the final chunk, we clear bit 7 (`skips = 0x38`) to write the fully accumulated results into the output SMEM.
+   * **Minimized Scale Staging:** By chunking $K$, we copy and load only the scale factors relevant to the active $K$-chunk, drastically reducing the CPU staging overhead.
+
+---
+
+### Rewritten Optimized Code
+
+```c
+#include <stdint.h>
+#include <string.h>
+
+#define TILE 16
+#define VALUES_PER_BYTE 2
+#define USE_LUT 1
+#define QUANT_LUT_UPDATE_GRANULARITY 1
+#define DIM 16
+#define ADDR_LEN 32
+#define BF16_PER_WORD 4
+
+#define GEMMINI_CTRL      0x40084000
+#define GEMMINI_RS1_ADDR  (GEMMINI_CTRL + 0x10)
+#define GEMMINI_RS2_ADDR  (GEMMINI_CTRL + 0x18)
+#define GEMMINI_INST_ADDR (GEMMINI_CTRL + 0x0)
+#define GEMMINI_SF_MEM    0x40088000
+#define GEMMINI_SF_MEM_A  (GEMMINI_SF_MEM + 0x2000)
+#define GEMMINI_SF_MEM_B  GEMMINI_SF_MEM
+#define SMEM              0x40000000
+
+#undef GEMMINI_BUSY_ADDR
+#define GEMMINI_BUSY_ADDR (GEMMINI_CTRL + 0x20)
+
+#undef gemmini_fence
+#define gemmini_fence() { while (*((volatile uint32_t *) GEMMINI_BUSY_ADDR)) asm volatile ("nop"); }
+
+typedef uint8_t elem_t;
+typedef uint8_t out_t;
+
+void solution(void) {
+  // Use a highly optimized block size of 64 to fully utilize the 256 accumulator rows
+  const int BLK = 64; 
+  const int BLOCKS_M = (REAL_M + BLK - 1) / BLK;
+  const int BLOCKS_N = (REAL_N + BLK - 1) / BLK;
+
+  gemmini_flush(0);
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      int tiles_I = (mrows + DIM - 1) / DIM;
+      int tiles_J = (ncols + DIM - 1) / DIM;
+      int tiles_K_total = MATMUL_K / DIM;
+
+      // Define K chunk size (16 tiles = 256 elements of K)
+      const int chunk_K_tiles = 16; 
+
+      int pad_i = tiles_I * DIM - mrows;
+      int pad_j = tiles_J * DIM - ncols;
+      
+      // We map the destination block to start at accumulator row 0
+      const int spad_dest = 0; 
+
+      // Configure persistent execution format once per block
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+      for (int k_start_tile = 0; k_start_tile < tiles_K_total; k_start_tile += chunk_K_tiles) {
+        int k_tiles = tiles_K_total - k_start_tile;
+        if (k_tiles > chunk_K_tiles) k_tiles = chunk_K_tiles;
+
+        int g_start = k_start_tile / 2;
+        int g_count = k_tiles / 2;
+
+        // 1. Stage and load only the scale factors for the current K chunk
+        static uint8_t chunk_A_s[32 * 64] __attribute__((aligned(32)));
+        static uint8_t chunk_B_s[32 * 64] __attribute__((aligned(32)));
+        for (int g = 0; g < g_count; g++) {
+          memcpy(&chunk_A_s[g * BLK], &A_scales_row[g_start + g][i0 * BLK], mrows);
+          memcpy(&chunk_B_s[g * BLK], &B_scales_col[g_start + g][j0 * BLK], ncols);
+        }
+        gemmini_mx_load_scales((uint64_t)chunk_A_s, g_count * BLK, 0);
+        gemmini_mx_load_scales((uint64_t)chunk_B_s, g_count * BLK, 1);
+
+        // 2. MVIN A chunk into scratchpad
+        uint32_t a_base = 0;
+        gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+        for (int i = 0; i < tiles_I; i++) {
+          for (int k = 0; k < k_tiles; k++) {
+            gemmini_extended_mvin(
+              (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + (k_start_tile + k) * DIM),
+              a_base + (i * k_tiles + k) * DIM,
+              DIM, DIM
+            );
+          }
+        }
+
+        // 3. MVIN B chunk into scratchpad (allocated at the top, growing downward)
+        uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_J * k_tiles * DIM;
+        gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+        for (int j = 0; j < tiles_J; j++) {
+          for (int k = 0; k < k_tiles; k++) {
+            gemmini_extended_mvin(
+              (void*)(((elem_t*)B_in) + ((k_start_tile + k) * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+              b_base + (k * tiles_J + j) * DIM,
+              DIM, DIM
+            );
+          }
+        }
+
+        // 4. Configure requantizer parameters for writeback
+        gemmini_config_st(BLK * sizeof(out_t));
+        gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, k_tiles, 0, 0, 1);
+
+        // 5. Execute WS hardware loop with in-accumulator accumulation
+        bool is_first = (k_start_tile == 0);
+        bool is_last = (k_start_tile + k_tiles >= tiles_K_total);
+
+        bool ex_accumulate = !is_first;
+        int skips = is_last ? 0x38 : 0xB8; // 0xB8 skips store (bit 7 set) to keep results in the accumulator
+
+        gemmini_loop_ws_spad(
+          tiles_I, tiles_J, k_tiles,
+          pad_i, pad_j, 0,
+          a_base, BANK_NUM * BANK_ROWS, 0,
+          spad_dest,
+          false, false, false, false, ex_accumulate,
+          NO_ACTIVATION, 0, 0, false, skips
+        );
+      }
+
+      // 6. Read final accumulated BF16-packed results from SMEM to DRAM
+      for (int r = 0; r < mrows; r++) {
+        gemmini_mx_read_smem(
+          &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+          spad_dest * 16 + r * BLK,
+          ncols
+        );
+      }
+      gemmini_fence();
+    }
+  }
+}
+```

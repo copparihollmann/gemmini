@@ -1,0 +1,46 @@
+## Analysis of the Current Code
+
+Looking at the code, I need to identify which strategy applies most directly.
+
+The current code has:
+```c
+gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+```
+
+The last argument `1` is `lut_update_granularity`. This is **strategy 3**: raise `lut_update_granularity` so the output LUT is refreshed once per output (i,j) tile rather than every K-step.
+
+However, this code uses FP8 (`act_mx_fmt=0, wgt_mx_fmt=0, out_mx_fmt=3`), not FP6. Let me check the other strategies more carefully.
+
+**Strategy 1 (hoist redundant operations):** `gemmini_flush(0)` and `gemmini_extended3_config_ex(...)` are inside the `i0/j0` outer loop but these configurations **never change** across iterations — the format, dataflow, and scale-identity settings are identical every iteration. These can be hoisted outside the loop.
+
+**Strategy 2 (tune `skips`):** Currently uses `0x38`. This is already set to a non-trivial value.
+
+**Strategy 3:** Not applicable here since FP8 path doesn't use a LUT (`uselut=0`).
+
+**Strategy 1 is the clear winner**: `gemmini_flush(0)` and `gemmini_extended3_config_ex(...)` are both inside the outer `i0/j0` block loop but are invariant across all iterations. `gemmini_flush` in particular resets the pipeline and is expensive. These should be hoisted to execute once before the loop.
+
+## Plan: Hoist Invariant `gemmini_flush` and `gemmini_extended3_config_ex` Outside the Outer Loop
+
+### What to change
+
+**Currently** (inside both `i0` and `j0` loops):
+```c
+gemmini_flush(0);
+gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+```
+
+These are called once per `(i0, j0)` block pair. For a 113×256×256 problem with `BLK` tiles, this means `BLOCKS_M * BLOCKS_N` redundant flush+config pairs.
+
+**What to do:**
+1. Move `gemmini_flush(0)` to execute **once** before the `i0` loop begins.
+2. Move `gemmini_extended3_config_ex(...)` to execute **once** before the `i0` loop begins.
+
+The format fields (`act_mx_fmt=0`, `wgt_mx_fmt=0`, `out_mx_fmt=3`, `uselut=0`), dataflow (`WEIGHT_STATIONARY`), strides, and transposes are **identical for every block iteration** — they depend only on the fixed matrix format, not on `i0` or `j0`. Moving them out eliminates `BLOCKS_M * BLOCKS_N - 1` redundant flush+config pairs.
+
+`gemmini_flush` is especially expensive as it drains the entire pipeline. Calling it once at the start (to initialize a clean state) is sufficient; the subsequent iterations start from a known-good configured state and do not need a fresh flush.
+
+The scale loads, mvin operations, `gemmini_mxquant_config_mvout`, `gemmini_loop_ws_spad`, `gemmini_mx_read_smem`, and `gemmini_fence` **must remain inside the loop** because they depend on `i0`/`j0` (different scale subsets, different DRAM pointers, different output addresses per block).
+
+### Expected benefit
+
+Eliminates `BLOCKS_M * BLOCKS_N - 1` pipeline flushes (each a full drain barrier) and the same number of redundant `config_ex` instructions, reducing per-block overhead significantly without altering correctness.

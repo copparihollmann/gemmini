@@ -1,0 +1,112 @@
+Looking at the failing code, I need to identify the bugs:
+
+1. **Scale loading convention is wrong**: `sel=0` is A (activation) scales, `sel=1` is B (weight) scales. The code has this backwards - it passes `sel=0` for A and `sel=1` for B which is actually correct per rule 11. Let me re-read... Rule 11 says sel=0 for A, sel=1 for B. The code has `gemmini_mx_load_scales(...A_scales_T[i0], A_S_BYTES, 0)` and `gemmini_mx_load_scales(...B_scales_T[j0], B_S_BYTES, 1)`. That looks correct.
+
+2. **The B scratchpad addressing is likely wrong**. The `gemmini_loop_ws_spad` passes `BANK_NUM*BANK_ROWS` as B endpoint, but we're passing `b_end_j0` which shifts per `j0`. The hardware computes `b_base = B_end - tiles_J * tiles_K * DIM`. We want tiles for that specific `j0` block, so `tiles_J = tiles` for that block.
+
+3. **The `gemmini_config_ld` must be set before each set of mvins**, and the stride must match the source matrix stride correctly.
+
+4. **The `scale_factors` pointer in `gemmini_mxquant_config_mvout`** - this should be the output scale DRAM address. Looking at the description, scale_dram is for output requantization scales. This might be causing issues if `scale_factors` doesn't exist.
+
+5. The key bug: B tiles are loaded globally but then only a subset is used per `j0`. The `b_end_j0` calculation needs to correctly point to the end of just the `j0` block's tiles. Let me recalculate: tiles for j0 start at `b_base_global + j0*tiles*tiles_K*DIM`, so end = `b_base_global + (j0+1)*tiles*tiles_K*DIM`. That seems right.
+
+6. **`gemmini_config_ld` for B is set to `MATMUL_N * sizeof(elem_t)` but then re-set for A** - the config persists, so A's mvin uses K stride which is correct.
+
+The main issue is likely the `scale_factors` variable which may not be defined, and the output smem read indexing. Let me write a corrected version:
+
+```c
+void solution(void) {
+  int tiles         = BLK / DIM;
+  int tiles_K       = MATMUL_K / DIM;
+  int tiles_J_total = MATMUL_N / DIM;
+  int GK            = MATMUL_K / 32;
+
+  uint32_t b_base_global = BANK_NUM * BANK_ROWS - tiles_K * tiles_J_total * DIM;
+  uint32_t a_base        = 0;
+  int SPAD_DEST          = 128;
+
+  // Pre-transpose scale arrays into block-contiguous layout
+  static uint8_t A_scales_T[BLOCKS_M][A_S_BYTES];
+  static uint8_t B_scales_T[BLOCKS_N][B_S_BYTES];
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+    for (int g = 0; g < GK; g++)
+      memcpy(&A_scales_T[i0][g * BLK], &A_scales_row[g][i0 * BLK], BLK);
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++)
+    for (int g = 0; g < GK; g++)
+      memcpy(&B_scales_T[j0][g * BLK], &B_scales_col[g][j0 * BLK], BLK);
+
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                              1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // Load ALL B tiles into scratchpad once
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    for (int j = 0; j < tiles; j++) {
+      int global_j = j0 * tiles + j;
+      for (int k = 0; k < tiles_K; k++) {
+        gemmini_extended_mvin2(
+          (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+          b_base_global + (global_j * tiles_K + k) * DIM,
+          DIM, DIM);
+      }
+    }
+  }
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    int mrows = REAL_M - i0 * BLK;
+    if (mrows > BLK) mrows = BLK;
+    if (mrows <= 0) continue;
+
+    // Load A tiles for this i0 block
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i = 0; i < tiles; i++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin(
+          (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+          a_base + (i * tiles_K + k) * DIM,
+          DIM, DIM);
+
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int ncols = REAL_N - j0 * BLK;
+      if (ncols > BLK) ncols = BLK;
+      if (ncols <= 0) continue;
+
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      // B end address: hardware computes b_base = b_end - tiles_J*tiles_K*DIM
+      // We want b_base for this j0 = b_base_global + j0*tiles*tiles_K*DIM
+      uint32_t b_end_j0 = b_base_global + (uint32_t)(j0 + 1) * tiles * tiles_K * DIM;
+
+      // Load scales for this (i0, j0) pair
+      // sel=0: A (activation) scales, sel=1: B (weight) scales
+      gemmini_mx_load_scales((uint64_t)A_scales_T[i0], A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_scales_T[j0], B_S_BYTES, 1);
+
+      // Configure requantized mvout
+      // scale_dram: output e8m0 scale factors stored in DRAM
+      // i_bound=tiles, j_bound=tiles, k_bound=tiles_K must match loop below
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                   tiles, tiles, tiles_K,
+                                   0, 0, 1);
+
+      // Fused hardware matmul
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0,
+                           a_base, b_end_j0, 0, SPAD_DEST,
+                           false, false, false, false, false,
+                           NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Drain BF16 results from mx_smem to DRAM, row by row
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(
+          &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+          SPAD_DEST * 16 + r * BLK, ncols);
+
+      gemmini_fence();
+    }
+  }
+}
+```

@@ -1,0 +1,129 @@
+An elegant and highly effective strategy to optimize this program is **Loop Reordering and Restructuring** of the DMA memory-in (`mvin`) operations.
+
+### Inefficiency Analysis
+In the original implementation, the loading of both $A$ and $B$ tiles into the scratchpad is performed via a double loop:
+* For matrix $B$, the code iterates over both `j` and `k` to dispatch a separate $16 \times 16$ tile load (`gemmini_extended_mvin`) instruction each time. For a $4 \times 4$ block tiling configuration, this results in $4 \times 4 = 16$ individual DMA commands.
+* For matrix $A$, it similarly loops over both `i` and `k`, dispatching 16 individual DMA commands.
+
+This high instruction count causes non-trivial CPU instruction dispatch overhead and stalls the Gemmini command queue with fine-grained requests.
+
+### Optimization Plan
+Since the memory layouts of $A$ and $B$ in DRAM are row-major, we can restructure the loop and exploit spatial contiguity to merge multiple individual tile loads into a single, contiguous multi-tile `mvin` transfer.
+
+1. **Restructuring $A$ Loads:**
+   For a fixed row block index `i`, the columns of $A$ along the reduction dimension `k` are entirely contiguous in DRAM. Furthermore, they are laid out contiguously starting from `a_base + i * tiles_K * DIM` in the scratchpad. We can collapse the `k` loop and load all `tiles_K * DIM` columns (which is `MATMUL_K` elements) and `DIM` rows in a single contiguous `gemmini_extended_mvin` call. This reduces the number of $A$ loading instructions from `tiles * tiles_K` (16) down to just `tiles` (4).
+
+2. **Restructuring $B$ Loads:**
+   For a fixed reduction block index `k`, the columns of $B$ along the `j` dimension are contiguous in DRAM. They are also mapped contiguously starting from `b_base + k * tiles * DIM` in the scratchpad. By switching the loop ordering so that `k` is the outer loop and collapsing the `j` loop, we can load all `tiles * DIM` columns and `DIM` rows in a single contiguous `gemmini_extended_mvin` call. This reduces the number of $B$ loading instructions from `tiles * tiles_K` (16) down to just `tiles_K` (4).
+
+This restructuring reduces the total number of DMA loading instructions by **75%** (from 32 down to 8), greatly accelerating data movement and improving overall hardware utilization.
+
+### Optimized Code
+
+```c
+void solution(void) {
+  int tiles   = BLK / DIM;
+  int tiles_K = MATMUL_K / DIM;
+  int GK      = MATMUL_K / 32;
+
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+  uint32_t a_base = 0;
+  int SPAD_DEST = 128;
+
+  static uint8_t A_scales_T[BLOCKS_M][A_S_BYTES];
+  static uint8_t B_scales_T[BLOCKS_N][B_S_BYTES];
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int g = 0; g < GK; g++) {
+      memcpy(&A_scales_T[i0][g * BLK],
+             &A_scales_row[g][i0 * BLK],
+             BLK);
+    }
+  }
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    for (int g = 0; g < GK; g++) {
+      memcpy(&B_scales_T[j0][g * BLK],
+             &B_scales_col[g][j0 * BLK],
+             BLK);
+    }
+  }
+
+  // Hoist the configuration outside all loops as the parameters are invariant
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                              1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    int ncols = REAL_N - j0 * BLK;
+    if (ncols > BLK) ncols = BLK;
+    if (ncols <= 0) continue;
+
+    // Load B scales once per j0
+    gemmini_mx_load_scales((uint64_t)B_scales_T[j0], B_S_BYTES, 1);
+
+    // Mvin B tiles: restructured to load all columns contiguously per row of tiles
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin(
+        (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + j0 * BLK),
+        b_base + k * tiles * DIM,
+        tiles * DIM, DIM);
+    }
+
+    for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+
+      gemmini_flush(0);
+
+      // Load A scales for current i0 block
+      gemmini_mx_load_scales((uint64_t)A_scales_T[i0], A_S_BYTES, 0);
+
+      // Mvin A tiles: restructured to load all columns contiguously per row of tiles
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++) {
+        gemmini_extended_mvin(
+          (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K),
+          a_base + i * tiles_K * DIM,
+          tiles_K * DIM, DIM);
+      }
+
+      // Configure requantized mvout
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                   tiles, tiles, tiles_K, 0, 0, 1);
+
+      // Dispatch: fast interior path vs slow boundary path
+      if (i0 < BLOCKS_M - 1 && j0 < BLOCKS_N - 1) {
+        gemmini_loop_ws_spad(tiles, tiles, tiles_K, 0, 0, 0,
+                             a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                             false, false, false, false, false,
+                             NO_ACTIVATION, 0, 0, false, 0x38);
+
+        for (int r = 0; r < BLK; r++)
+          gemmini_mx_read_smem(
+            &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+            SPAD_DEST * 16 + r * BLK, BLK);
+
+        gemmini_fence();
+      } else {
+        int pad_i = BLK - mrows;
+        int pad_j = BLK - ncols;
+
+        gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0,
+                             a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+                             false, false, false, false, false,
+                             NO_ACTIVATION, 0, 0, false, 0x38);
+
+        for (int r = 0; r < mrows; r++)
+          gemmini_mx_read_smem(
+            &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+            SPAD_DEST * 16 + r * BLK, ncols);
+
+        gemmini_fence();
+      }
+    }
+  }
+}
+```

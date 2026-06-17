@@ -1,0 +1,109 @@
+An elegant and highly effective optimization strategy to reduce the latency of this kernel is **One-Time Pre-Packaging of Scale Factors** combined with **Optimal Rectangular Tiling**.
+
+### New Optimization Strategy: One-Time Pre-Packaging of Scale Factors & Optimal Rectangular Tiling
+
+1. **One-Time Pre-Packaging of Scale Factors (Host CPU Bottleneck Elimination)**:
+   In the baseline implementation, the host CPU performs multiple strided `memcpy` calls inside the nested loops to copy non-contiguous slices of `A_scales_row` and `B_scales_col` into temporary contiguous buffers (`A_s` and `B_s`). Because CPU-to-CPU data movement and staging are not accelerated by Gemmini, this CPU-bound overhead dominates the execution time. 
+   
+   To eliminate this bottleneck, we pre-package the scale factors into contiguous block-major buffers (`A_scales_packaged` and `B_scales_packaged`) **exactly once** at the very beginning of the `solution()` function. During the main execution loop, `gemmini_mx_load_scales` streams these scales directly from our pre-packaged contiguous buffers using a single high-bandwidth DMA transfer. This completely removes CPU copying from the critical compute path.
+
+2. **Optimal Rectangular Tiling (128x32)**:
+   By transitioning from symmetric square blocks (64x64) to rectangular block tiling (`BLK_M = 128`, `BLK_N = 32`), we achieve:
+   - **100% Accumulator Utilization**: The accumulator footprint becomes exactly $tiles_I \times tiles_J \times \text{DIM} = 8 \times 2 \times 16 = 256$ rows, fully utilizing the 256-row capacity without overflowing.
+   - **Reduced Launch Overhead**: Doubling the block size in the $M$ dimension halves the number of outer loop iterations, reducing configuration re-issues and synchronizations.
+
+---
+
+### Optimized C Implementation
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+
+// Ensure correct parameters based on the architecture summary
+#define DIM 16
+#define BF16_PER_WORD 4
+
+void solution(void) {
+  // Pre-allocated packaged scale buffers
+  // BLK_M = 128, BLK_N = 32
+  // BLOCKS_M = 2, BLOCKS_N = 8
+  // GK = MATMUL_K / 32 = 16
+  static uint8_t A_scales_packaged[2][16][128];
+  static uint8_t B_scales_packaged[8][16][32];
+
+  // 1. Pre-package scale factors once to eliminate CPU-bound copying in the outer loop
+  for (int i0 = 0; i0 < 2; i0++) {
+    for (int g = 0; g < 16; g++) {
+      memcpy(&A_scales_packaged[i0][g][0], &A_scales_row[g][i0 * 128], 128);
+    }
+  }
+  for (int j0 = 0; j0 < 8; j0++) {
+    for (int g = 0; g < 16; g++) {
+      memcpy(&B_scales_packaged[j0][g][0], &B_scales_col[g][j0 * 32], 32);
+    }
+  }
+
+  int tiles_I = 8;   // 128 / DIM
+  int tiles_J = 2;   // 32 / DIM
+  int tiles_K = 32;  // 512 / DIM
+
+  uint32_t a_base = 0;
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM; // 8192 - 32 * 2 * 16 = 7168
+  int SPAD_DEST = 128;
+
+  int A_S_BYTES = 16 * 128;
+  int B_S_BYTES = 16 * 32;
+
+  gemmini_flush(0);
+
+  // Configure weight-stationary MX execution format once
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 
+                              1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  for (int i0 = 0; i0 < 2; i0++) {
+    for (int j0 = 0; j0 < 8; j0++) {
+      int mrows = 128;
+      int ncols = 32;
+
+      // 2. Load pre-packaged scale factors directly from contiguous memory
+      gemmini_mx_load_scales((uint64_t)&A_scales_packaged[i0][0][0], A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)&B_scales_packaged[j0][0][0], B_S_BYTES, 1);
+
+      // 3. MVIN Matrix A
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles_I; i++) {
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * 128 + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+        }
+      }
+
+      // 4. MVIN Matrix B
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int j = 0; j < tiles_J; j++) {
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * 32 + j * DIM)),
+                                b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+        }
+      }
+
+      // 5. Configure store and requantizer
+      gemmini_config_st((32 / BF16_PER_WORD) * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+      // 6. Compute fused WS tiled matmul
+      gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // 7. Drain SMEM directly to output
+      for (int r = 0; r < mrows; r++) {
+        gemmini_mx_read_smem(&C_hw[i0 * 128 + r][(j0 * 32) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * 32, ncols);
+      }
+      gemmini_fence();
+    }
+  }
+}
+```

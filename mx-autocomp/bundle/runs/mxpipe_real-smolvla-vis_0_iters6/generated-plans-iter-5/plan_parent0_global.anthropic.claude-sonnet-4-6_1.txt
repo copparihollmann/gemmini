@@ -1,0 +1,50 @@
+## Analysis
+
+Looking at the code, I need to identify which strategy provides the most benefit.
+
+**Current structure:**
+- Outer loop: `j0` (B blocks)
+- Inner loop: `i0` (A blocks)
+- B tiles are loaded once per `j0` (already hoisted)
+- After `gemmini_loop_ws_spad`, we do `gemmini_mx_read_smem` row by row, then `gemmini_fence()`
+- Then the next `i0` iteration starts with `gemmini_flush`, config, scale loads, A mvin, etc.
+
+**Strategy 4: Pipeline B-tile mvin for next j0 with current j0 compute**
+
+Currently, after `gemmini_loop_ws_spad` completes for all `i0` iterations of a given `j0`, the next `j0` iteration starts by loading B tiles. During the output drain (`gemmini_mx_read_smem` calls), the DMA engine could be loading B tiles for the *next* `j0` block simultaneously.
+
+The idea: after the last `i0` iteration's `gemmini_loop_ws_spad` (but before the last `gemmini_fence`), issue the B mvin for the *next* `j0` block. This overlaps:
+- Next `j0`'s B-tile DMA loads
+- Current output's `gemmini_mx_read_smem` drain
+
+## Plan
+
+1. **Restructure the `j0` loop** to separate B-tile loading from the start of the loop body into a "pre-issue" pattern.
+
+2. **Before the `j0` loop begins**, pre-load B tiles for `j0=0`.
+
+3. **Inside the `j0` loop**, after processing all `i0` iterations (after `gemmini_loop_ws_spad` for the last `i0`, before or interleaved with `gemmini_mx_read_smem`):
+   - Issue B mvin for `j0+1` (if it exists) immediately after `gemmini_loop_ws_spad`
+   - Then issue `gemmini_mx_read_smem` + `gemmini_fence()`
+   
+   This way, the B DMA for the next block overlaps with the output drain latency of the current block.
+
+4. **Concretely**, the loop body becomes:
+   - Use "already loaded B tiles" (pre-loaded from previous iteration or pre-loop)
+   - For each `i0`: configure, load scales, mvin A, config mvout, compute
+   - After the last `i0`'s `gemmini_loop_ws_spad` and before/during `gemmini_mx_read_smem`: issue B mvin for `j0+1`
+   - Then `gemmini_mx_read_smem` + `gemmini_fence()` for all `i0` outputs
+
+   Wait — but `gemmini_mx_read_smem` must come right after `gemmini_loop_ws_spad` for each `i0` iteration (the smem gets overwritten each iteration). So we can only pipeline B-load for `j0+1` after the *last* `i0`'s drain.
+
+   Actually, looking more carefully: we issue B mvin for `j0+1` right after `gemmini_loop_ws_spad` of the last `i0` iteration, then do `gemmini_mx_read_smem` + `gemmini_fence()`. The B DMA and the smem read overlap in hardware.
+
+**Specific code changes:**
+
+- Extract B-tile mvin into a helper lambda/inline block parameterized by `j0`
+- Pre-load B for `j0=0` before the loop
+- At the end of each `j0` iteration (after the last `i0`'s `gemmini_loop_ws_spad`, before `gemmini_mx_read_smem`), issue B mvin for `j0+1`
+- Skip the B mvin at the top of the `j0` loop (it's already loaded from previous iteration's pre-issue)
+- Use `gemmini_config_ld(MATMUL_N * sizeof(elem_t))` before the pre-issued B mvin (config persists, so only need to set it once per B-load group)
+
+This directly addresses strategy 4 and overlaps DMA with output drain latency, which should reduce the total wall-clock time by hiding B-load latency behind the `gemmini_mx_read_smem` calls.

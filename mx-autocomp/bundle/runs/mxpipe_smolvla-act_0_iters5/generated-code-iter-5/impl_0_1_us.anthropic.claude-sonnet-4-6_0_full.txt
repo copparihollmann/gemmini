@@ -1,0 +1,99 @@
+Looking at the original code, I need to understand what's happening:
+
+- Matrix multiply: A (128×320) × B (320×320) → C (128×320)
+- BLOCKS_M = 128/BLK, BLOCKS_N = 320/BLK outer tiles
+- Inner: tiles = BLK/DIM tiles in I and J, tiles_K = 320/DIM = 20 tiles in K
+
+The original has correctness issues and performance problems:
+1. B mvin uses wrong layout: `b_base + (k * tiles + j) * DIM` should be `b_base + (j * tiles_K + k) * DIM`
+2. `gemmini_flush` inside the loop is excessive
+3. Config can be hoisted out of the loop
+4. Scale loading can be optimized
+
+Let me verify scratchpad fits: with BLK=32 (tiles=2), tiles_K=20:
+- A: 2*20*16 = 640 rows
+- B: 2*20*16 = 640 rows  
+- Total: 1280 ≤ 8192 ✓
+- Accumulator: 2*2*16 = 64 ≤ 256 ✓
+
+The B layout fix: B is weight-stationary, B tile [j][k] goes at `b_base + (j*tiles_K + k)*DIM`.
+
+```c
+void solution(void) {
+  int tiles   = BLK / DIM;
+  int tiles_K = MATMUL_K / DIM;
+
+  uint32_t a_base   = 0;
+  uint32_t b_base   = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+  int      SPAD_DEST = 128;
+
+  // Hoist config_ex outside both loops — format/dataflow never changes.
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                               1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+
+      // Stage per-block e8m0 scale factors for this (i0, j0) tile pair.
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+
+      // Load A scales (sel=0) then B scales (sel=1).
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      // MVIN A tiles: A[i0*BLK + i*DIM : +DIM][k*DIM : +DIM]
+      // A is row-major with row stride = MATMUL_K elements.
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+      for (int i = 0; i < tiles; i++) {
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+            a_base + (i * tiles_K + k) * DIM,
+            DIM, DIM);
+        }
+      }
+
+      // MVIN B tiles: B[k*DIM : +DIM][j0*BLK + j*DIM : +DIM]
+      // B is row-major with row stride = MATMUL_N elements.
+      // Weight-stationary layout: b_base + (j*tiles_K + k)*DIM
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int j = 0; j < tiles; j++) {
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin2(
+            (void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+            b_base + (j * tiles_K + k) * DIM,
+            DIM, DIM);
+        }
+      }
+
+      // Configure output stride and requantizer bounds.
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                                   tiles, tiles, tiles_K,
+                                   0, 0, 1);
+
+      // Fused hardware matmul over scratchpad tiles.
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K,
+                           0, 0, 0,
+                           a_base, BANK_NUM * BANK_ROWS,
+                           0, SPAD_DEST,
+                           false, false,
+                           false, false, false,
+                           NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Drain BF16 results from mx_smem to DRAM, one row at a time.
+      for (int r = 0; r < BLK; r++) {
+        gemmini_mx_read_smem(
+          &C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+          SPAD_DEST * 16 + r * BLK,
+          BLK);
+      }
+      gemmini_fence();
+    }
+  }
+}
+```

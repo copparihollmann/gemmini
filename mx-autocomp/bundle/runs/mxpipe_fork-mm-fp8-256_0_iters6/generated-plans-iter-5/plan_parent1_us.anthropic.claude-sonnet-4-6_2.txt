@@ -1,0 +1,106 @@
+## Analysis
+
+Looking at the original code, I need to identify the most impactful single strategy to apply.
+
+The current code uses `gemmini_config_st(DIM * sizeof(elem_t))` which sets the output stride to `DIM * 1 = 16 bytes`. However, the actual BF16 output matrix `C_hw` has `MATMUL_N` columns, meaning each output row is `MATMUL_N * sizeof(out_t)` bytes wide (where `out_t` is `uint16_t` = 2 bytes for BF16). The stride should be `MATMUL_N * sizeof(out_t)` to correctly lay out the output in row-major order.
+
+**Strategy 12** addresses this: set `gemmini_config_st` stride to `MATMUL_N * sizeof(out_t)` instead of `DIM * sizeof(elem_t)`.
+
+## Plan
+
+**Strategy selected: #12 — set `gemmini_config_st` stride to `MATMUL_N * sizeof(out_t)`**
+
+### What to change:
+
+Replace:
+```c
+gemmini_config_st(DIM * sizeof(elem_t));
+```
+
+With:
+```c
+gemmini_config_st(MATMUL_N * sizeof(out_t));
+```
+
+### Why this is correct:
+
+- `out_t` is `uint16_t` (BF16 = 2 bytes)
+- `C_hw` is a 2D array with `MATMUL_N` columns of BF16 values
+- The store stride must equal the number of bytes per output row: `MATMUL_N * 2`
+- The original `DIM * sizeof(elem_t)` = `16 * 1` = 16 bytes is wrong; it only spans one DIM-width column of 1-byte elements, not a full BF16 output row
+- This misconfiguration causes the requantizer to write BF16 output tiles with incorrect row strides, producing garbled output layout in `C_hw`
+
+### The rewritten code:
+
+```c
+void solution(void) {
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+#ifdef SPIKE_SIM
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+#else
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
+#endif
+
+  // ---- MVIN A: tile (i,k) -> a_base + (i*tiles_K + k)*DIM ----
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+
+  // ---- MVIN B: tile (k,j) -> b_base + (k*tiles_J + j)*DIM ----
+  // Batch up to MAX_BLOCK_LEN=4 consecutive j-tiles per k-row using gemmini_block_mvin
+  for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j += MAX_BLOCK_LEN) {
+      int batch = (tiles_J - j < MAX_BLOCK_LEN) ? (tiles_J - j) : MAX_BLOCK_LEN;
+      elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+      gemmini_block_mvin((void*)dram_ptr, sp_addr, batch);
+    }
+  }
+
+  int SPAD_DEST = 0;
+
+  // Fix: use correct BF16 output row stride (MATMUL_N * sizeof(out_t))
+  gemmini_config_st(MATMUL_N * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // ---- Compute ----
+  gemmini_loop_ws_spad(
+      tiles_I, tiles_J, tiles_K,
+      0, 0, 0,
+      a_base,
+      BANK_NUM * BANK_ROWS,
+      0,
+      SPAD_DEST,
+      false, false,
+      false, false, false,
+      NO_ACTIVATION,
+      0, 0,
+      false,
+      0x38);
+
+  gemmini_fence();
+
+#ifdef SPIKE_SIM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+#else
+  printf("Moving out:\n");
+  for (int i = 0; i < tiles_J*tiles_I*2; i++) {
+      gemmini_mvout((void*)((uint64_t*) C_hw + i*2*DIM), SPAD_DEST + i*DIM);
+  }
+  gemmini_fence();
+#endif
+
+}
+```

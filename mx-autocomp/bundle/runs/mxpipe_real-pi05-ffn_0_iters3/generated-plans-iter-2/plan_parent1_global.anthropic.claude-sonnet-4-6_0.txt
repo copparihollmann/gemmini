@@ -1,0 +1,42 @@
+## Analysis of the Current Code
+
+Looking at the current `solution()` function, I can identify the key inefficiency related to the selected strategy:
+
+**Strategy 3: Amortize `gemmini_mxquant_config_mvout` calls by batching multiple output tiles per configuration.**
+
+Currently, the outer loop iterates over `(i0, j0)` block pairs, and inside each iteration:
+1. `gemmini_flush(0)` is called — a full accelerator flush every block pair
+2. `gemmini_extended3_config_ex(...)` is called — full reconfiguration every block pair
+3. `gemmini_mx_load_scales(...)` — scale loads every block pair
+4. `gemmini_mxquant_config_mvout(...)` — requantizer config every block pair
+5. `gemmini_loop_ws_spad(...)` — compute every block pair
+6. `gemmini_mx_read_smem(...)` + `gemmini_fence()` — readout every block pair
+
+The `gemmini_flush`, `gemmini_extended3_config_ex`, and `gemmini_mxquant_config_mvout` are being issued once per `(i0, j0)` block pair. These configurations **do not change** between iterations since:
+- The format fields (fp8, BF16 output) are constant
+- The `tiles`, `tiles_K`, `SPAD_DEST`, `BLK_OUTC` are all constant across iterations
+- The `scale_factors` buffer pointer is constant (it's always zeros — just a dummy buffer for the requantizer's output scale, not the MX block scales)
+
+## Plan: Hoist `gemmini_flush`, `gemmini_extended3_config_ex`, and `gemmini_mxquant_config_mvout` Out of the Loop (Strategy 1 + 3 combined, but specifically Strategy 3)
+
+**Specifically for Strategy 3:**
+
+The `gemmini_mxquant_config_mvout` call takes `(scale_factors, tiles, tiles, tiles_K, 0, 0, tiles_K)` — **these arguments are identical on every `(i0, j0)` iteration**. The requantizer configuration does not depend on which block `(i0, j0)` is being computed. It only parameterizes the tile counts and output scale buffer, which are fixed for the entire problem.
+
+However, the programming model sequence requires: `gemmini_mxquant_config_mvout` → `gemmini_loop_ws_spad` → `gemmini_mx_read_smem` per compute invocation. The constraint is that `gemmini_mxquant_config_mvout` must precede the `gemmini_loop_ws_spad` that consumes it.
+
+**The key insight:** `gemmini_flush` is being called inside the loop unnecessarily. Flush is only needed once at startup. Additionally, `gemmini_extended3_config_ex` with the same arguments is being re-issued every iteration. These are the dominant hoistable overhead calls.
+
+**Concrete changes:**
+
+1. **Hoist `gemmini_flush(0)` before the `i0`/`j0` loop** — it only needs to run once to initialize hardware state.
+
+2. **Hoist `gemmini_extended3_config_ex(...)` before the loop** — the format (fp8 in, BF16 out, weight-stationary, no transpose, stride=1) never changes across blocks.
+
+3. **Hoist `gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, tiles_K)` before the loop** — `tiles = BLK/DIM` and `tiles_K = MATMUL_K/DIM` are compile-time constants, `scale_factors` is the same buffer, and the selector/granularity args are fixed. Since `gemmini_loop_ws_spad` re-reads the requantizer config state at execution time (not configuration time), a single upfront configuration covers all `BLOCKS_M × BLOCKS_N` invocations, provided the tile counts match — which they do since every block uses the same `tiles × tiles × tiles_K` shape (padding handles the partial blocks at boundaries without changing the tile counts passed to the hardware).
+
+4. **Hoist `gemmini_config_ld` calls** — `MATMUL_K * sizeof(elem_t)` for A and `MATMUL_N * sizeof(elem_t)` for B are constants. These can be issued once before the loop body (the stride only needs re-issuing when it changes between the A and B mvin phases, which still happens inside the loop between the two mvin loops).
+
+5. **Keep `gemmini_mx_load_scales` inside the loop** — the A and B scale factors genuinely differ per `(i0, j0)` block (they select the sub-block rows/cols of the full scale arrays), so they cannot be hoisted.
+
+The result: `gemmini_flush` (1 call total instead of `BLOCKS_M*BLOCKS_N`), `gemmini_extended3_config_ex` (1 call instead of `BLOCKS_M*BLOCKS_N`), and `gemmini_mxquant_config_mvout` (1 call instead of `BLOCKS_M*BLOCKS_N`) are all amortized across all output tiles. This directly implements Strategy 3 (amortize `gemmini_mxquant_config_mvout`) and Strategy 1 (hoist redundant operations), eliminating the per-block reconfiguration overhead that dominates when block counts are large.

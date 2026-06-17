@@ -1,0 +1,340 @@
+{'correct': True, 'test_results': {0: True}, 'compiled': True, 'latency': 620}
+Prev latency: 619
+New latency: 620
+Plan: ## Analysis of the Current Code
+
+Looking at the current solution, I need to identify the key inefficiency:
+
+```c
+// Configure port 0 (A tiles via mvin) and port 1 (B tiles via mvin2) independently
+gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+```
+
+Both ports are configured with stride `MATMUL_K * sizeof(elem_t)`. This is correct for **A** tiles (since A_in has row stride `MATMUL_K`), but it's **wrong for B tiles**.
+
+Looking at the mvin loop:
+```c
+gemmini_extended_mvin2(
+  (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+  b_base + (j * tiles_K + k) * DIM,
+  DIM, DIM);
+```
+
+B is indexed as `j * DIM * MATMUL_K + k * DIM`, meaning B_in has **MATMUL_K** as the column count (leading dimension). So B's DRAM row stride is also `MATMUL_K * sizeof(elem_t)`.
+
+Wait — let me re-examine. The canonical reference (`matmul_tiled_fp8_64x64.c`) also uses `MATMUL_M` as the stride for both, but that file uses `MATMUL_M` (not `MATMUL_K`). The key insight from **strategy 11**: the stride must match the actual DRAM leading dimension of each matrix.
+
+In the baseline (`autocomp_baseline_sol0.c`), the config uses `MATMUL_M * sizeof(elem_t)` for both A and B. In the current code, `MATMUL_K * sizeof(elem_t)` is used for both. The B matrix indexing `j * DIM * MATMUL_K + k * DIM` confirms B's leading dimension is `MATMUL_K`, so port 1's stride should be `MATMUL_K * sizeof(elem_t)` — which matches. So both strides appear consistent with the data layout used.
+
+Now re-examining **strategy 10**: setting `b_spad_id=1` signals to the hardware loop that B tiles are reused across the I-dimension, allowing it to skip redundant B-tile preloads. Currently `b_spad_id=0` is used, which means no reuse hint is given.
+
+## Selected Strategy: Strategy 10
+
+**Set `b_spad_id=1` in `gemmini_loop_ws_spad`** to signal weight-stationary B-tile reuse across all I-dimension iterations.
+
+In a weight-stationary matmul, the B tiles are the same for every `i` iteration — only the A tiles change. With `b_spad_id=0`, the hardware loop re-preloads B tiles for every (i, j, k) combination. Setting `b_spad_id=1` tells the hardware loop controller that B is already in scratchpad and can be reused, skipping redundant B preload cycles across the I dimension and reducing systolic array stall cycles.
+
+## Plan
+
+Change the `gemmini_loop_ws_spad` call from:
+```c
+gemmini_loop_ws_spad(..., 0, 0, false, 0x38);
+//                        ^  ^
+//                   a_spad_id=0, b_spad_id=0
+```
+to:
+```c
+gemmini_loop_ws_spad(..., 0, 1, false, 0x38);
+//                        ^  ^
+//                   a_spad_id=0, b_spad_id=1
+```
+
+This single change signals to the fused hardware loop that the B (weight) tiles already loaded into scratchpad at `b_base` are **stationary** and should be reused across all `tiles_I` iterations without re-preloading, eliminating the redundant B-tile preload stalls.
+
+## Rewritten Code
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Configure port 0 (A tiles via mvin) and port 1 (B tiles via mvin2) independently
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+  // Interleave A (mvin, port 0) and B (mvin2, port 1) loads per k-slice
+  // so both DMA engines run concurrently, hiding transfer latency
+  for (int k = 0; k < tiles_K; k++) {
+    for (int i = 0; i < tiles_I; i++)
+      gemmini_extended_mvin(
+        (void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+        a_base + (i * tiles_K + k) * DIM,
+        DIM, DIM);
+    for (int j = 0; j < tiles_J; j++)
+      gemmini_extended_mvin2(
+        (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+        b_base + (j * tiles_K + k) * DIM,
+        DIM, DIM);
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 1, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+The only change is `b_spad_id` from `0` to `1` in the `gemmini_loop_ws_spad` call, telling the hardware that B tiles are stationary in scratchpad and should be reused across I-dimension iterations without redundant preloads.
+
+CodeCandidate(parent=CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED baseline MX matmul kernel (64x128x128, fp8:e4m3).
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+  for (int j = 0; j < tiles_J; j++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+                            b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+''',
+score=673,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''## Analysis of the Original Code
+
+The original code uses a single `gemmini_config_ld` call with stride `MATMUL_K * sizeof(elem_t)` for **both** A and B tile loads. Let me examine the matrix layouts:
+
+- **Matrix A** is stored row-major with shape `[M][K]`, so the DRAM row stride for A tiles is `MATMUL_K * sizeof(elem_t)` bytes. ✓
+- **Matrix B** is stored row-major with shape `[K][N]` (or transposed), so the DRAM row stride for B tiles is `MATMUL_N * sizeof(elem_t)` bytes (or `MATMUL_N/2` for fp4-packed, but here fp8 so `MATMUL_N * sizeof(elem_t)`).
+
+For this kernel: `MATMUL_M=64, MATMUL_N=128, MATMUL_K=128`.
+- A stride needed: `MATMUL_K * sizeof(elem_t)` = `128 * 1` = **128 bytes**
+- B stride needed: `MATMUL_N * sizeof(elem_t)` = `128 * 1` = **128 bytes**
+
+In this specific case both strides happen to be equal (128), so there\'s no stride mismatch bug to fix here. Let me re-examine for other inefficiencies.
+
+Looking at the mvin loops more carefully:
+- A tiles loop: `i * DIM * MATMUL_K + k * DIM` — correct for row-major A
+- B tiles loop: `j * DIM * MATMUL_K + k * DIM` — B is indexed with `MATMUL_K` as the inner stride (B has shape `[K][N]`, so row stride is `N`, but here we use `MATMUL_K` as the row stride)
+
+Wait — the B DRAM pointer is `((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM`. But B has shape `[K][N]`, so iterating over `(k, j)` tiles, the correct pointer would be `k * DIM * MATMUL_N + j * DIM`. The baseline uses `j * DIM * MATMUL_K + k * DIM` which treats B as `[N][K]` — this suggests B is stored as `[N][K]` (transposed), which is consistent with weight-stationary where B is `[J-tiles × K-tiles]` in `[N][K]` layout.
+
+The key inefficiency I\'ll target: **Strategy 12** — use `gemmini_extended_mvin2` for B tile loads and `gemmini_extended_mvin` for A tile loads concurrently, exploiting independent DMA ports, AND **Strategy 11** — split the single `gemmini_config_ld` to set separate strides for A and B since they share the same stride here but the ports are independent and can be configured separately.
+
+The clearest applicable strategy is **Strategy 12**: use `gemmini_extended_mvin2` for B tiles and `gemmini_extended_mvin` for A tiles, with separate `gemmini_config_ld` configurations for each port (using `gemmini_extended3_config_ld` with `id=1` for mvin2), allowing A and B DMA transfers to proceed in parallel.
+
+## Plan: Apply Strategy 12 — Use `mvin2` for B Tiles with Separate Port Configuration
+
+**What to change:**
+
+1. **Split the single `gemmini_config_ld` into two separate load configurations**: use `gemmini_extended3_config_ld(stride, MVIN_SCALE_IDENTITY, false, 0)` (id=0) for port 0 (A tiles) and `gemmini_extended3_config_ld(stride, MVIN_SCALE_IDENTITY, false, 1)` (id=1) for port 1 (B tiles). Both have stride `MATMUL_K * sizeof(elem_t)` = 128 bytes in this case.
+
+2. **Interleave A and B mvin calls**: Instead of first issuing all A mvins then all B mvins (two sequential passes), issue them in an interleaved pattern: for each `(i, j, k)` combination, issue an `gemmini_extended_mvin` (port 0, A tile) immediately followed by `gemmini_extended_mvin2` (port 1, B tile). This allows the hardware\'s two independent DMA engines to overlap A and B transfers, hiding approximately half the total DMA latency.
+
+3. **Restructure the loop**: The current code has separate `(i,k)` and `(j,k)` loops. Restructure to a combined loop that interleaves both ports. Since each A tile `(i,k)` needs to be paired with B tiles for all `j`, and each B tile `(j,k)` needs to be loaded once, the natural interleaving is: iterate over `k` in the outer loop, then issue all A-row tiles for that `k` via mvin, and all B-col tiles for that `k` via mvin2, alternating calls so both DMA ports stay busy simultaneously.
+
+**Concrete restructuring:**
+```
+// Configure port 0 (A) and port 1 (B) independently
+gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+// Interleave A (mvin) and B (mvin2) loads per k-slice
+for (int k = 0; k < tiles_K; k++) {
+  for (int i = 0; i < tiles_I; i++)
+    gemmini_extended_mvin(A_ptr(i,k),  a_base + (i*tiles_K + k)*DIM, DIM, DIM);
+  for (int j = 0; j < tiles_J; j++)
+    gemmini_extended_mvin2(B_ptr(j,k), b_base + (j*tiles_K + k)*DIM, DIM, DIM);
+}
+```
+
+This keeps the scratchpad layout identical (same `a_base`/`b_base` addressing), preserves all correctness constraints, and allows the two DMA ports to run concurrently — port 0 draining A tiles while port 1 drains B tiles — reducing effective mvin latency and improving pipeline utilization before `gemmini_loop_ws_spad`.''',
+code='''void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Configure port 0 (A tiles via mvin) and port 1 (B tiles via mvin2) independently
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+  // Interleave A (mvin, port 0) and B (mvin2, port 1) loads per k-slice
+  // so both DMA engines run concurrently, hiding transfer latency
+  for (int k = 0; k < tiles_K; k++) {
+    for (int i = 0; i < tiles_I; i++)
+      gemmini_extended_mvin(
+        (void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+        a_base + (i * tiles_K + k) * DIM,
+        DIM, DIM);
+    for (int j = 0; j < tiles_J; j++)
+      gemmini_extended_mvin2(
+        (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+        b_base + (j * tiles_K + k) * DIM,
+        DIM, DIM);
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+''',
+score=619,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='us.anthropic.claude-sonnet-4-6',
+code_gen_model='us.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None),
+plan='''## Analysis of the Current Code
+
+Looking at the current solution, I need to identify the key inefficiency:
+
+```c
+// Configure port 0 (A tiles via mvin) and port 1 (B tiles via mvin2) independently
+gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+```
+
+Both ports are configured with stride `MATMUL_K * sizeof(elem_t)`. This is correct for **A** tiles (since A_in has row stride `MATMUL_K`), but it\'s **wrong for B tiles**.
+
+Looking at the mvin loop:
+```c
+gemmini_extended_mvin2(
+  (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+  b_base + (j * tiles_K + k) * DIM,
+  DIM, DIM);
+```
+
+B is indexed as `j * DIM * MATMUL_K + k * DIM`, meaning B_in has **MATMUL_K** as the column count (leading dimension). So B\'s DRAM row stride is also `MATMUL_K * sizeof(elem_t)`.
+
+Wait — let me re-examine. The canonical reference (`matmul_tiled_fp8_64x64.c`) also uses `MATMUL_M` as the stride for both, but that file uses `MATMUL_M` (not `MATMUL_K`). The key insight from **strategy 11**: the stride must match the actual DRAM leading dimension of each matrix.
+
+In the baseline (`autocomp_baseline_sol0.c`), the config uses `MATMUL_M * sizeof(elem_t)` for both A and B. In the current code, `MATMUL_K * sizeof(elem_t)` is used for both. The B matrix indexing `j * DIM * MATMUL_K + k * DIM` confirms B\'s leading dimension is `MATMUL_K`, so port 1\'s stride should be `MATMUL_K * sizeof(elem_t)` — which matches. So both strides appear consistent with the data layout used.
+
+Now re-examining **strategy 10**: setting `b_spad_id=1` signals to the hardware loop that B tiles are reused across the I-dimension, allowing it to skip redundant B-tile preloads. Currently `b_spad_id=0` is used, which means no reuse hint is given.
+
+## Selected Strategy: Strategy 10
+
+**Set `b_spad_id=1` in `gemmini_loop_ws_spad`** to signal weight-stationary B-tile reuse across all I-dimension iterations.
+
+In a weight-stationary matmul, the B tiles are the same for every `i` iteration — only the A tiles change. With `b_spad_id=0`, the hardware loop re-preloads B tiles for every (i, j, k) combination. Setting `b_spad_id=1` tells the hardware loop controller that B is already in scratchpad and can be reused, skipping redundant B preload cycles across the I dimension and reducing systolic array stall cycles.
+
+## Plan
+
+Change the `gemmini_loop_ws_spad` call from:
+```c
+gemmini_loop_ws_spad(..., 0, 0, false, 0x38);
+//                        ^  ^
+//                   a_spad_id=0, b_spad_id=0
+```
+to:
+```c
+gemmini_loop_ws_spad(..., 0, 1, false, 0x38);
+//                        ^  ^
+//                   a_spad_id=0, b_spad_id=1
+```
+
+This single change signals to the fused hardware loop that the B (weight) tiles already loaded into scratchpad at `b_base` are **stationary** and should be reused across all `tiles_I` iterations without re-preloading, eliminating the redundant B-tile preload stalls.
+
+## Rewritten Code
+
+```c
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Configure port 0 (A tiles via mvin) and port 1 (B tiles via mvin2) independently
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+  // Interleave A (mvin, port 0) and B (mvin2, port 1) loads per k-slice
+  // so both DMA engines run concurrently, hiding transfer latency
+  for (int k = 0; k < tiles_K; k++) {
+    for (int i = 0; i < tiles_I; i++)
+      gemmini_extended_mvin(
+        (void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+        a_base + (i * tiles_K + k) * DIM,
+        DIM, DIM);
+    for (int j = 0; j < tiles_J; j++)
+      gemmini_extended_mvin2(
+        (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+        b_base + (j * tiles_K + k) * DIM,
+        DIM, DIM);
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 1, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+The only change is `b_spad_id` from `0` to `1` in the `gemmini_loop_ws_spad` call, telling the hardware that B tiles are stationary in scratchpad and should be reused across I-dimension iterations without redundant preloads.''',
+code='''void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Configure port 0 (A tiles via mvin) and port 1 (B tiles via mvin2) independently
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+  // Interleave A (mvin, port 0) and B (mvin2, port 1) loads per k-slice
+  // so both DMA engines run concurrently, hiding transfer latency
+  for (int k = 0; k < tiles_K; k++) {
+    for (int i = 0; i < tiles_I; i++)
+      gemmini_extended_mvin(
+        (void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+        a_base + (i * tiles_K + k) * DIM,
+        DIM, DIM);
+    for (int j = 0; j < tiles_J; j++)
+      gemmini_extended_mvin2(
+        (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+        b_base + (j * tiles_K + k) * DIM,
+        DIM, DIM);
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 1, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+''',
+score=None,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='us.anthropic.claude-sonnet-4-6',
+code_gen_model='us.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None)

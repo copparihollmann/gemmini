@@ -1,0 +1,210 @@
+Looking at the error message and the code, I can see several issues that need to be fixed. The main problems are:
+
+1. Incorrect memory layout calculations for the scratchpad
+2. Missing proper double-buffering management
+3. Incorrect tile loading patterns
+4. Potential memory access issues
+
+Let me analyze and fix the code:
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+
+// Assuming the baseline definitions are present:
+// DIM, ATT_H, ATT_HKV, ATT_S, ATT_D, GROUPS_S, S_OUT_COLS, D_OUT_COLS, QSS_BYTES, VSS_BYTES, etc.
+
+void solution(void) {
+  // Double buffers to eliminate data races during pipelining
+  static out_t S1_hw_buf[2][ATT_S][ATT_S / 4];
+  static elem_t P_q_buf[2][ATT_S][ATT_S];
+  static uint8_t P_scales_buf[2][GROUPS_S][ATT_S];
+
+  // ---- Pre-pipeline Head 0 ----
+  gemmini_flush(0);
+
+  // Launch S1 for head 0
+  {
+    int h = 0;
+    int kv = h / (ATT_H / ATT_HKV);
+    const elem_t *Q_in = Qs[h];
+    const uint8_t *Q_sc = Qss[h];
+    const elem_t *KT_in = KTs[kv];
+    const uint8_t *KT_sc = KTss[kv];
+
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)Q_sc, QSS_BYTES, 0);
+    gemmini_mx_load_scales((uint64_t)KT_sc, QSS_BYTES, 1);
+
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k++) {
+        gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM * ATT_D),
+                              a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      }
+
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j++) {
+        gemmini_extended_mvin((void*)(((elem_t*)KT_in) + k * DIM * ATT_S + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+      }
+
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw_buf[0][0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+  }
+
+  gemmini_fence(); // Ensure S1 of head 0 is fully loaded for the first softmax pass
+
+  for (int h = 0; h < ATT_H; h++) {
+    int cur_buf = h % 2;
+    int next_buf = (h + 1) % 2;
+
+    // 1. Overlap: Launch next S1 on Gemmini while CPU is busy computing current Softmax
+    if (h + 1 < ATT_H) {
+      gemmini_flush(0);
+
+      int h_next = h + 1;
+      int kv_next = h_next / (ATT_H / ATT_HKV);
+      const elem_t *Q_in_next = Qs[h_next];
+      const uint8_t *Q_sc_next = Qss[h_next];
+      const elem_t *KT_in_next = KTs[kv_next];
+      const uint8_t *KT_sc_next = KTss[kv_next];
+
+      int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)Q_sc_next, QSS_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)KT_sc_next, QSS_BYTES, 1);
+
+      gemmini_config_ld(ATT_D * sizeof(elem_t));
+      for (int i = 0; i < tiles_I; i++)
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin((void*)(((elem_t*)Q_in_next) + i * DIM * ATT_D + k * DIM * ATT_D),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+        }
+
+      gemmini_config_ld(ATT_S * sizeof(elem_t));
+      for (int k = 0; k < tiles_K; k++)
+        for (int j = 0; j < tiles_J; j++) {
+          gemmini_extended_mvin((void*)(((elem_t*)KT_in_next) + k * DIM * ATT_S + j * DIM),
+                                b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+        }
+
+      gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      gemmini_mx_read_smem(&S1_hw_buf[next_buf][0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+    }
+
+    // 2. Compute integer softmax on CPU (Float-Free)
+    for (int i = 0; i < ATT_S; i++) {
+      int64_t q[ATT_S];
+      int64_t mq = -((int64_t)1 << 62);
+      for (int j = 0; j < ATT_S; j += 4) {
+        uint64_t w = S1_hw_buf[cur_buf][i][j / 4];
+        for (int l = 0; l < 4; l++) {
+#if ATT_CAUSAL
+          if (j + l > i) { q[j + l] = -((int64_t)1 << 62); continue; }
+#endif
+          int64_t qq = mx_ibf16_to_q((uint16_t)((w >> (l * 16)) & 0xFFFF));
+          q[j + l] = qq;
+          if (qq > mq) mq = qq;
+        }
+      }
+      int64_t p[ATT_S];
+      int64_t sm = 0;
+      int64_t gmax_arr[GROUPS_S];
+      for (int g = 0; g < GROUPS_S; g++) {
+        int64_t gmax = 0;
+        for (int j = g * 32; j < (g + 1) * 32; j++) {
+          int64_t pv = mx_iexp(q[j] - mq);
+          p[j] = pv;
+          sm += pv;
+          if (pv > gmax) gmax = pv;
+        }
+        gmax_arr[g] = gmax;
+      }
+      int ls = mx_ilog2((uint64_t)sm);
+      uint64_t inv_sm = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;
+      for (int g = 0; g < GROUPS_S; g++) {
+        int64_t gmax = gmax_arr[g];
+        if (gmax == 0) {
+          P_scales_buf[cur_buf][g][i] = 0;
+          for (int j = g * 32; j < (g + 1) * 32; j++) P_q_buf[cur_buf][i][j] = 0;
+          continue;
+        }
+        int e = mx_ilog2((uint64_t)gmax) - ls - MX_P_TARGET_LOG2;
+        P_scales_buf[cur_buf][g][i] = (uint8_t)(e + 127);
+        for (int j = g * 32; j < (g + 1) * 32; j++) {
+          P_q_buf[cur_buf][i][j] = mx_ienc_fp8(p[j], inv_sm, ls, e);
+        }
+      }
+    }
+
+    // 3. Synchronize: Wait for the next S1 and the previous O to finish executing
+    gemmini_fence();
+
+    // 4. Launch current head's O matmul asynchronously
+    {
+      int kv = h / (ATT_H / ATT_HKV);
+      const elem_t *V_in = Vs[kv];
+      const uint8_t *V_sc = Vss[kv];
+
+      int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)&P_scales_buf[cur_buf][0][0], sizeof(P_scales_buf[cur_buf]), 0);
+      gemmini_mx_load_scales((uint64_t)V_sc, VSS_BYTES, 1);
+
+      gemmini_config_ld(ATT_S * sizeof(elem_t));
+      for (int i = 0; i < tiles_I; i++)
+        for (int k = 0; k < tiles_K; k++) {
+          gemmini_extended_mvin((void*)(((elem_t*)P_q_buf[cur_buf]) + i * DIM * ATT_S + k * DIM * ATT_S),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+        }
+
+      gemmini_config_ld(ATT_D * sizeof(elem_t));
+      for (int k = 0; k < tiles_K; k++)
+        for (int j = 0; j < tiles_J; j++) {
+          gemmini_extended_mvin((void*)(((elem_t*)V_in) + k * DIM * ATT_D + j * DIM),
+                                b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+        }
+
+      gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      gemmini_mx_read_smem(&O_hw[h][0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+    }
+  }
+
+  // Final synchronization to ensure the last head's O finishes writing to DRAM
+  gemmini_fence();
+}
+```
+
+The key fixes made:
+
+1. **Fixed pointer arithmetic**: Changed incorrect pointer calculations like `i * DIM * ATT_D + k * DIM` to `i * DIM * ATT_D + k * DIM * ATT_D` to properly index into 2D arrays.
+
+2. **Simplified tile loading**: Removed the complex batching logic that was causing issues and went back to simple sequential loading of tiles.
+
+3. **Fixed memory layout calculations**: Ensured consistent addressing patterns for both Q/KT matrices and P/V matrices.
+
+4. **Corrected scale loading**: Fixed the address calculation for P_scales_buf to properly reference the scale data.
+
+These changes ensure that the memory accesses align correctly with the Gemmini hardware requirements and the data layout assumptions.

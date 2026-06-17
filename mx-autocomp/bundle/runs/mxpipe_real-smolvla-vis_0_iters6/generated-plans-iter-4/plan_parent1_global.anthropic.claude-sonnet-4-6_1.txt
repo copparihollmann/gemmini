@@ -1,0 +1,73 @@
+## Analysis of the Current Code
+
+Looking at the current code, the outer loop structure is:
+```
+for i0 in BLOCKS_M:
+    stage A_s (memcpy)
+    for j0 in BLOCKS_N:
+        stage B_s (memcpy)
+        gemmini_flush(0)
+        load A scales
+        load B scales
+        mvin A tiles
+        mvin B tiles
+        compute + read
+```
+
+**Key inefficiency**: For each `(i0, j0)` pair, **all B tiles are re-mvin'd into the scratchpad**, even though the same B tiles (same `j0` block) are reused across all `i0` iterations. The B weight matrix doesn't change as `i0` varies — only the A tiles change. This means `BLOCKS_M * BLOCKS_N * tiles_K * tiles` total B mvin operations, when only `BLOCKS_N * tiles_K * tiles` are needed.
+
+This directly maps to **Strategy 2: reuse loaded B (weight) tiles across multiple I-tile iterations without re-mvin**.
+
+## Plan: Hoist B-tile mvins Outside the i0 Loop
+
+### Restructuring the Loop
+
+Swap the loop order so that `j0` is the **outer** loop and `i0` is the **inner** loop. This way:
+- B tiles for a given `j0` block are loaded **once** into the scratchpad
+- All `i0` iterations (each with their own A tiles) are computed against those B tiles
+- B is only re-mvin'd when `j0` changes
+
+The new structure:
+```
+for j0 in BLOCKS_N:
+    stage B_s (memcpy) — once per j0
+    load B scales — once per j0
+    mvin B tiles — once per j0
+
+    for i0 in BLOCKS_M:
+        stage A_s (memcpy)
+        load A scales
+        mvin A tiles
+        compute + read
+```
+
+### Scratchpad Layout Considerations
+
+With `tiles = BLK/DIM` and `tiles_K = MATMUL_K/DIM`:
+- B tiles occupy: `tiles_K * tiles * DIM` rows at the top of the scratchpad
+- A tiles occupy: `tiles * tiles_K * DIM` rows at `a_base = 0`
+- Total: `2 * tiles * tiles_K * DIM` rows — same as before, constraint unchanged
+
+The B tiles at `b_base = BANK_NUM*BANK_ROWS - tiles_K*tiles*DIM` remain valid across all `i0` iterations since A tiles don't overlap them (A is at the bottom, B at the top).
+
+### Scale Loading Adjustment
+
+Per rule 15, scales must be loaded before the `gemmini_loop_ws_spad` that consumes them. Since both `gemmini_mx_load_scales` calls (for A and B) must precede each compute call, and A scales change per `i0`:
+- B scales (`gemmini_mx_load_scales` for B) are loaded **before the i0 loop** (once per j0)
+- A scales (`gemmini_mx_load_scales` for A) are loaded **inside the i0 loop** (once per i0)
+
+However, the programming model requires **both** A and B scale loads to precede each `gemmini_loop_ws_spad`. Since B scales are already in hardware memory from the outer load and don't change within the `i0` loop, we can reload them each iteration without correctness cost — but that defeats the purpose. Instead, since `gemmini_mx_load_scales` writes into persistent hardware buffers (`mx_scale_a_mem`/`mx_scale_b_mem`), loading B scales once before the `i0` loop and then only reloading A scales inside is correct per the architecture documentation ("Scale memory persists in hardware state until overwritten").
+
+### `gemmini_flush` Relocation
+
+Currently `gemmini_flush(0)` is called every `(i0, j0)` iteration. Move it to before the `j0` loop (called once), since it resets accelerator state. Only one flush per full matmul invocation is needed.
+
+### Summary of Changes
+
+1. Move `gemmini_flush(0)` and `gemmini_extended3_config_ex` **before** the `j0` loop
+2. Make `j0` the **outer** loop
+3. Inside `j0`: stage `B_s`, call `gemmini_mx_load_scales` for B, mvin all B tiles once
+4. Make `i0` the **inner** loop
+5. Inside `i0`: stage `A_s`, call `gemmini_mx_load_scales` for A, mvin A tiles, compute, read
+
+This reduces B mvin calls from `BLOCKS_M * BLOCKS_N * tiles_K * tiles` to `BLOCKS_N * tiles_K * tiles` — a factor of `BLOCKS_M` reduction in B data movement.

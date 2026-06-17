@@ -1,0 +1,52 @@
+## Analysis of the Current Code
+
+The matrix dimensions are M=41, N=512, K=512. With BLK=32 (I infer from context where tiles=BLK/DIM=2), the outer loop has:
+- BLOCKS_M = ceil(41/BLK) = 2 iterations (i0=0: full 32 rows, i0=1: partial 9 rows)
+- BLOCKS_N = 512/BLK = 16 iterations
+
+**The key inefficiency targeted by strategy 3:** Every iteration computes `pad_i = BLK - mrows` and `pad_j = BLK - ncols` and passes them to `gemmini_loop_ws_spad`. For 31 out of 32 (i0,j0) combinations, both pad_i=0 and pad_j=0 (the full block fast path). Only for the single boundary block (i0=1, all j0) does pad_i=BLK-9=23 appear. The partial-block path wastes cycles zero-padding in compute for the common case.
+
+## Plan: Apply Strategy 3 — Specialize into Fast Path and Slow Path
+
+### What to change:
+
+1. **In the outer `(i0, j0)` loop body**, replace the single unified path with an explicit branch:
+   - **Fast path** (`mrows == BLK && ncols == BLK`, i.e., no padding needed): call `gemmini_loop_ws_spad` with `pad_i=0, pad_j=0` directly, with no branching overhead and no zero-padding in the systolic array loop.
+   - **Slow path** (boundary tile, `mrows < BLK || ncols < BLK`): call `gemmini_loop_ws_spad` with the actual `pad_i` and `pad_j` values as before.
+
+2. **Eliminate the `pad_i`/`pad_j` computation** from the fast path entirely so the compiler sees constants (0, 0) and the hardware receives them directly, removing any pad-related overhead.
+
+3. **The `mrows`/`ncols` computation and `continue`** check remain in both paths for correctness — but in the fast path the check is `if (i0 < BLOCKS_M - 1 && j0 < BLOCKS_N)` (or equivalently, statically known full blocks), so the compiler can optimize it away.
+
+4. **Structure**: Hoist the i0 loop into two regions:
+   - For `i0 = 0` to `BLOCKS_M - 2` (all full M-blocks): inner `j0` loop uses the fast path with `pad_i = 0`. Within this, also check `ncols == BLK` — since N=512 is an exact multiple of BLK, `ncols` is always BLK for all j0, so `pad_j = 0` is always true and the fast path always applies for the full M-rows.
+   - For `i0 = BLOCKS_M - 1` (last, potentially partial M-block): inner `j0` loop uses the slow path with the computed `pad_i`/`pad_j`.
+
+5. **Remove the `memcpy` calls from the fast path** is not applicable here (they are already present in both paths for scale staging), so leave scale loading identical. The key savings come from the accelerator not processing zero-padded tiles in the fused hardware loop.
+
+6. **Concrete code structure**:
+
+```
+// Fast path: i0 over full blocks
+for (int i0 = 0; i0 < BLOCKS_M - 1; i0++) {   // all full-BLK M blocks
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {    // N=512 exact multiple, always full
+        // scale memcpy, mvin, config — identical
+        // gemmini_loop_ws_spad(..., pad_i=0, pad_j=0, ...)  // NO padding
+        // readout: r from 0..BLK-1, ncols=BLK
+    }
+}
+// Slow path: last i0 block (may be partial)
+{
+    int i0 = BLOCKS_M - 1;
+    int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) { return; }
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+        int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+        int pad_i = BLK - mrows, pad_j = BLK - ncols;
+        // scale memcpy, mvin, config — identical
+        // gemmini_loop_ws_spad(..., pad_i, pad_j, ...)
+        // readout: r from 0..mrows-1, ncols
+    }
+}
+```
+
+This ensures the hot path (31 out of 32 outer iterations) never incurs padding overhead, while correctness is preserved for the boundary block via the slow path.

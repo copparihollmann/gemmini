@@ -1,0 +1,203 @@
+## Strategy: Fuse the Two Matrix Multiplications by Reusing the Static Weight Tiles Across the Softmax Boundary
+
+### Analysis of the Current Code
+
+The current code performs two independent GEMM passes:
+
+1. **QK^T pass**: Q (S×D, fp4) × K^T (D×S, fp4) → S1 (S×S, bf16)
+2. **PV pass**: P (S×S, fp4) × V (D×S transposed, fp4) → O (S×D, bf16)
+
+Each pass performs:
+- `gemmini_flush(0)` — full pipeline drain
+- `gemmini_extended3_config_ex` — full reconfiguration
+- Two `gemmini_mx_load_scales` calls
+- Full mvin of A and B tiles
+- `gemmini_mxquant_config_mvout` + `gemmini_loop_ws_spad`
+- `gemmini_mx_read_smem` + `gemmini_fence`
+
+The key inefficiency I want to target is different from all listed strategies:
+
+**The two `gemmini_flush(0)` calls are unnecessary after the first one.** More importantly, in the current tiling (`ti = ATT_S/DIM/2 = 4`, `tj = ATT_S/DIM/2 = 4`, `tk = ATT_D/DIM = 4` for QK^T), the B tiles for KT occupy `tk*tj*DIM = 4*4*16 = 256` rows and A tiles occupy `ti*tk*DIM = 4*4*16 = 256` rows — total 512 rows out of 8192. **The scratchpad is almost completely empty.** The strategy is:
+
+### New Strategy: **Tile the Softmax Independently Per Row-Block to Eliminate Full-Matrix BF16 Intermediate Buffering**
+
+Currently, `S1_hw` holds the entire S×S = 128×128 BF16 result (128×32 uint64 words = 32KB) before the softmax loop begins. The softmax loop then reads all of S1_hw from DRAM before writing P_hw back to DRAM. Then the PV pass reads P_hw from DRAM.
+
+The strategy is: **process the softmax in row-strips that match the tile size, writing P tiles directly — but more concretely, eliminate the second `gemmini_flush(0)`**. The second `gemmini_flush` drains the entire pipeline including any in-flight operations and resets hardware state completely, which is expensive. Since the first matmul already ends with `gemmini_fence()` which ensures completion, the second `gemmini_flush(0)` is redundant and wasteful.
+
+Additionally, the `gemmini_config_ld` for both A and B tiles is called once per matmul, but the stride for KT uses `ATT_S*sizeof(elem_t)/2` — this divide by 2 accounts for fp4 packing (2 values per byte). This is correct. But notice: **the KT_in B tiles use `gemmini_extended_mvin` (same port as A tiles)** when they should ideally use `gemmini_extended_mvin2` (the dedicated B-port) to allow overlapping A and B loads.
+
+### Concrete Plan
+
+**Replace `gemmini_flush(0)` before the second GEMM with nothing** (the fence from the first GEMM already ensures ordering), and **use `gemmini_extended_mvin2` for B tiles** (KT and V) to enable the hardware to overlap A-side and B-side DMA transfers, since mvin and mvin2 are independent ports.
+
+Here is the rewritten code:
+
+```c
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+#include "include/attn_data.h"  // provides Q_hw, KT_in, V_in, Q_scales_row, KT_scales_col,
+                                 // V_scales_col, P_scales, P_hw, S1_hw, O_hw, etc.
+
+#define DIM 16
+#define BF16_PER_WORD 4
+#define GKP (ATT_S / 32)
+
+typedef uint8_t  elem_t;
+typedef uint64_t out_t;
+
+static uint32_t scale_factors[512] __attribute__((aligned(32))) = {0};
+
+void solution(void) {
+  // -------------------------------------------------------------------------
+  // GEMM 1: S1 = Q * KT  (fp4 × fp4 → bf16)
+  //   Q:  [ATT_S][ATT_D] fp4, stored packed (2 per byte) → row stride = ATT_D/2
+  //   KT: [ATT_D][ATT_S] fp4, stored packed (2 per byte) → row stride = ATT_S/2
+  //   ti = ATT_S/(DIM*2), tj = ATT_S/(DIM*2), tk = ATT_D/DIM
+  // -------------------------------------------------------------------------
+  {
+    int ti = ATT_S / DIM / 2;
+    int tj = ATT_S / DIM / 2;
+    int tk = ATT_D / DIM;
+    uint32_t ab = 0;
+    uint32_t bb = BANK_NUM * BANK_ROWS - tk * tj * DIM;
+    int SD = 128;
+
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                1, 1, 0, 0, false, 2, 2, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&Q_scales_row,  sizeof(Q_scales_row),  0);
+    gemmini_mx_load_scales((uint64_t)&KT_scales_col, sizeof(KT_scales_col), 1);
+
+    gemmini_config_st((ATT_S / BF16_PER_WORD) * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti, tj, tk, 0, 0, 1);
+
+    // MVIN A (Q) tiles via mvin port
+    gemmini_config_ld(ATT_D * sizeof(elem_t) / 2);  // fp4: 2 per byte → stride = ATT_D/2
+    for (int i = 0; i < ti; i++) {
+      for (int k = 0; k < tk; k++) {
+        elem_t  *dram_ptr = ((elem_t *)Q_hw)  + i * DIM * (ATT_D / 2) + k * DIM;
+        uint32_t sp_addr  = ab + (i * tk + k) * DIM;
+        gemmini_extended_mvin((void *)dram_ptr, sp_addr, DIM, DIM);
+      }
+    }
+
+    // MVIN B (KT) tiles via mvin2 port — independent DMA channel, overlaps with mvin
+    // Note: gemmini_extended3_config_ld with id=1 configures the mvin2 stride
+    gemmini_extended3_config_ld((ATT_S / 2) * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+    for (int k = 0; k < tk; k++) {
+      for (int j = 0; j < tj; j++) {
+        elem_t  *dram_ptr = ((elem_t *)KT_in) + k * DIM * (ATT_S / 2) + j * DIM;
+        uint32_t sp_addr  = bb + (k * tj + j) * DIM;
+        gemmini_extended_mvin2((void *)dram_ptr, sp_addr, DIM, DIM);
+      }
+    }
+
+    gemmini_loop_ws_spad(ti, tj, tk, 0, 0, 0,
+                         ab, BANK_NUM * BANK_ROWS, 0, SD,
+                         false, false, false, false, false,
+                         NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[0][0], SD * 16, ATT_S * ATT_S);
+    gemmini_fence();
+  }
+
+  // -------------------------------------------------------------------------
+  // Softmax: S1 → P (integer arithmetic, host CPU)
+  // -------------------------------------------------------------------------
+  for (int i = 0; i < ATT_S; i++) {
+    int64_t q[ATT_S];
+    int64_t mq = -((int64_t)1 << 62);
+    for (int j = 0; j < ATT_S; j++) {
+      int64_t qq = mx_ibf16_to_q(
+          (uint16_t)((S1_hw[i][j / 4] >> ((j % 4) * 16)) & 0xFFFF));
+      q[j] = qq;
+      if (qq > mq) mq = qq;
+    }
+    int64_t p[ATT_S], sm = 0;
+    for (int j = 0; j < ATT_S; j++) {
+      int64_t pv = mx_iexp(q[j] - mq);
+      p[j] = pv;
+      sm += pv;
+    }
+    int ls = mx_ilog2((uint64_t)sm);
+    uint64_t inv = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) /
+                   (uint64_t)sm;
+    for (int g = 0; g < GKP; g++) {
+      int64_t gm = 0;
+      for (int j = g * 32; j < g * 32 + 32; j++)
+        if (p[j] > gm) gm = p[j];
+      int e = (gm > 0) ? (mx_ilog2((uint64_t)gm) - ls + 0) : 0;
+      P_scales[g][i] = (uint8_t)(e + 127);
+      for (int j = g * 32; j < g * 32 + 32; j++) {
+        uint64_t R  = (((uint64_t)p[j] * inv) + ((uint64_t)1 << (ls - 1))) >> ls;
+        uint64_t Rt = (e >= 0) ? (R >> e) : (R << (-e));
+        uint8_t  idx = mx_enc_P(Rt);
+        if ((i & 1) == 0)
+          P_hw[i >> 1][j] = (P_hw[i >> 1][j] & 0xF0) | idx;
+        else
+          P_hw[i >> 1][j] = (P_hw[i >> 1][j] & 0x0F) | (idx << 4);
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // GEMM 2: O = P * V  (fp4 × fp4 → bf16)
+  //   P:  [ATT_S][ATT_S] fp4, stored packed → row stride = ATT_S/2
+  //   V:  [ATT_S][ATT_D] fp4, stored packed → row stride = ATT_D/2
+  //   ti = ATT_S/(DIM*2), tj = ATT_D/(DIM*2), tk = ATT_S/DIM
+  // -------------------------------------------------------------------------
+  {
+    int ti = ATT_S / DIM / 2;
+    int tj = ATT_D / DIM / 2;
+    int tk = ATT_S / DIM;
+    uint32_t ab = 0;
+    uint32_t bb = BANK_NUM * BANK_ROWS - tk * tj * DIM;
+    int SD = 128;
+
+    // No gemmini_flush needed: fence above already drained the pipeline.
+    // Re-issue config_ex for the second GEMM (same formats, so minimal overhead).
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                                1, 1, 0, 0, false, 2, 2, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&P_scales,      sizeof(P_scales),      0);
+    gemmini_mx_load_scales((uint64_t)&V_scales_col,  sizeof(V_scales_col),  1);
+
+    gemmini_config_st((ATT_D / BF16_PER_WORD) * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, ti, tj, tk, 0, 0, 1);
+
+    // MVIN A (P) tiles via mvin port
+    gemmini_config_ld((ATT_S / 2) * sizeof(elem_t));  // fp4: stride = ATT_S/2
+    for (int i = 0; i < ti; i++) {
+      for (int k = 0; k < tk; k++) {
+        elem_t  *dram_ptr = ((elem_t *)P_hw)  + i * DIM * (ATT_S / 2) + k * DIM;
+        uint32_t sp_addr  = ab + (i * tk + k) * DIM;
+        gemmini_extended_mvin((void *)dram_ptr, sp_addr, DIM, DIM);
+      }
+    }
+
+    // MVIN B (V) tiles via mvin2 port — independent DMA channel
+    gemmini_extended3_config_ld((ATT_D / 2) * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+    for (int k = 0; k < tk; k++) {
+      for (int j = 0; j < tj; j++) {
+        elem_t  *dram_ptr = ((elem_t *)V_in)  + k * DIM * (ATT_D / 2) + j * DIM;
+        uint32_t sp_addr  = bb + (k * tj + j) * DIM;
+        gemmini_extended_mvin2((void *)dram_ptr, sp_addr, DIM, DIM);
+      }
+    }
+
+    gemmini_loop_ws_spad(ti, tj, tk, 0, 0, 0,
+                         ab, BANK_NUM * BANK_ROWS, 0, SD,
+                         false, false, false, false, false,
+                         NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[0][0], SD * 16, ATT_S * ATT_D);
+    gemmini_fence();
+  }
+}
+```
+
+### Why This Improves Performance
+
+1. **Eliminating `gemmini_flush(0)` before GEMM 2**: The `gemmini_flush` resets all hardware pipeline state and waits for all in-flight operations to drain. After `gemmini_fence()` at the end of GEMM 1, the pipeline is already fully drained and results are in DRAM. The second `gemmini_flush` is pure overhead — it resets state unnecessarily and adds a full barrier with no functional benefit. Removing it saves the full flush latency.
+
+2. **Using `gemmini_extended_mvin2` for B tiles**: The mvin and mvin2 ports are independent DMA channels. By issuing A-tile loads on port 0 (mvin) and B-tile loads on port 1 (mvin2), both DMA streams can proceed concurrently. In the original code, all tiles go through the same mvin port (port 0), so A and B loads are serialized. With separate ports, the total mvin time is `max(A_load_time, B_load_time)` instead of `A_load_time + B_load_time`, roughly halving the data-movement latency for the mvin phase. The `gemmini_extended3_config_ld(..., id=1)` call configures the stride for port 1 without affecting port 0's stride setting.

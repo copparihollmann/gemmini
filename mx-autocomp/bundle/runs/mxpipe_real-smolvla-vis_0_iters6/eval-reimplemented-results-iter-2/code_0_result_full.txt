@@ -1,0 +1,254 @@
+{'correct': False}
+Prev latency: 10608
+New latency: N/A
+Plan: ## Analysis of the Current Code
+
+Looking at the current code, I can identify the key inefficiency targeted by **strategy 7**: `gemmini_flush(0)` is called **inside the outer `(i0, j0)` loop**, meaning it executes once per output tile block. For a matrix with `BLOCKS_M × BLOCKS_N` output tiles, this is catastrophically expensive since `gemmini_flush` resets hardware state and is very costly.
+
+The flush is only needed once to initialize the hardware state before the first computation begins. Subsequent iterations don't need it because the `gemmini_extended3_config_ex`, `gemmini_mx_load_scales`, etc. instructions properly configure all necessary state before each tile's computation.
+
+## Plan: Hoist `gemmini_flush(0)` Outside All Loops
+
+**What to change:**
+1. Remove `gemmini_flush(0)` from inside the `for (int i0...) for (int j0...)` loop body.
+2. Add a single `gemmini_flush(0)` call **before** the outermost `for (int i0 = 0; ...)` loop begins.
+
+**Why this is correct:**
+- The flush resets hardware state (scratchpad, accumulator, scale memory, etc.), but every iteration of the loop already re-issues `gemmini_extended3_config_ex`, `gemmini_mx_load_scales` (for both A and B), `gemmini_config_ld`, `gemmini_config_st`, `gemmini_mxquant_config_mvout`, and `gemmini_loop_ws_spad` — fully re-establishing all required hardware state from scratch each iteration.
+- Therefore the per-iteration flush provides no correctness benefit after the first iteration; it only wastes cycles.
+- A single flush before the loop initializes the hardware once, and then each tile's configuration sequence correctly sets up all state needed for that tile.
+
+**Concrete code change:**
+
+Move `gemmini_flush(0);` from:
+```c
+for (int i0 = 0; i0 < BLOCKS_M; i0++)
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    ...
+    gemmini_flush(0);   // ← REMOVE from here
+    gemmini_extended3_config_ex(...);
+    ...
+  }
+```
+
+To:
+```c
+gemmini_flush(0);       // ← ADD exactly once here, before all loops
+for (int i0 = 0; i0 < BLOCKS_M; i0++)
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    ...
+    gemmini_extended3_config_ex(...);
+    ...
+  }
+```
+
+This eliminates `BLOCKS_M × BLOCKS_N - 1` redundant flush calls, which for a 113×256×256 matrix with `BLK=16` gives `BLOCKS_M = ceil(113/16) = 8`, `BLOCKS_N = 256/16 = 16`, so **127 redundant flushes are eliminated** out of 128 total, directly reducing latency proportionally to the flush cost.
+
+CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED outer-tiled MX matmul baseline (113x256x256).
+void solution(void) {
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+   for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      // Partial last M/N block: compute only the real rows/cols, pad the rest.
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+      // PROF cpu_stage
+      // Stage only the tiny per-32-group scales; A/B data is mvin\'d DIRECTLY
+      // from DRAM (no host-side block memcpy — that was 98% of the cycles).
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+      int tiles = BLK / DIM, tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+      // PROF accel
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+      gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K (full block-aligned tiles)
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+      for (int j = 0; j < tiles; j++)                    // B[k][j0*BLK+j] -> slot (k*tiles + j)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                b_base + (k * tiles + j) * DIM, DIM, DIM);
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+      // Accelerator-centric readout: per-row hardware DMA from smem straight into the
+      // bf16-packed row-major output (block-internal smem row stride is BLK).
+      for (int r = 0; r < mrows; r++)
+        gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16 + r * BLK, ncols);
+      gemmini_fence();
+    }
+}
+''',
+score=10608,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'CPU/host data staging detected (2 memcpy, ~0 scalar copy loops). Host staging is typically the dominant cost on this accelerator and autocomp cannot speed it up directly: mvin tiles STRIDED straight from the source DRAM arrays instead of copying through a host buffer, and keep partial sums in shared memory (bf16 accumulate) rather than accumulating on the CPU.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''## Analysis of the Current Code
+
+Looking at the current code, I can identify the key inefficiency targeted by **strategy 7**: `gemmini_flush(0)` is called **inside the outer `(i0, j0)` loop**, meaning it executes once per output tile block. For a matrix with `BLOCKS_M × BLOCKS_N` output tiles, this is catastrophically expensive since `gemmini_flush` resets hardware state and is very costly.
+
+The flush is only needed once to initialize the hardware state before the first computation begins. Subsequent iterations don\'t need it because the `gemmini_extended3_config_ex`, `gemmini_mx_load_scales`, etc. instructions properly configure all necessary state before each tile\'s computation.
+
+## Plan: Hoist `gemmini_flush(0)` Outside All Loops
+
+**What to change:**
+1. Remove `gemmini_flush(0)` from inside the `for (int i0...) for (int j0...)` loop body.
+2. Add a single `gemmini_flush(0)` call **before** the outermost `for (int i0 = 0; ...)` loop begins.
+
+**Why this is correct:**
+- The flush resets hardware state (scratchpad, accumulator, scale memory, etc.), but every iteration of the loop already re-issues `gemmini_extended3_config_ex`, `gemmini_mx_load_scales` (for both A and B), `gemmini_config_ld`, `gemmini_config_st`, `gemmini_mxquant_config_mvout`, and `gemmini_loop_ws_spad` — fully re-establishing all required hardware state from scratch each iteration.
+- Therefore the per-iteration flush provides no correctness benefit after the first iteration; it only wastes cycles.
+- A single flush before the loop initializes the hardware once, and then each tile\'s configuration sequence correctly sets up all state needed for that tile.
+
+**Concrete code change:**
+
+Move `gemmini_flush(0);` from:
+```c
+for (int i0 = 0; i0 < BLOCKS_M; i0++)
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    ...
+    gemmini_flush(0);   // ← REMOVE from here
+    gemmini_extended3_config_ex(...);
+    ...
+  }
+```
+
+To:
+```c
+gemmini_flush(0);       // ← ADD exactly once here, before all loops
+for (int i0 = 0; i0 < BLOCKS_M; i0++)
+  for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+    ...
+    gemmini_extended3_config_ex(...);
+    ...
+  }
+```
+
+This eliminates `BLOCKS_M × BLOCKS_N - 1` redundant flush calls, which for a 113×256×256 matrix with `BLK=16` gives `BLOCKS_M = ceil(113/16) = 8`, `BLOCKS_N = 256/16 = 16`, so **127 redundant flushes are eliminated** out of 128 total, directly reducing latency proportionally to the flush cost.''',
+code='''void solution(void) {
+  gemmini_flush(0);
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int mrows = REAL_M - i0 * BLK;
+      if (mrows > BLK) mrows = BLK;
+      if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK;
+      if (ncols > BLK) ncols = BLK;
+      if (ncols <= 0) continue;
+
+      // Copy per-block scales for A and B
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+
+      int tiles   = BLK / DIM;
+      int tiles_K = MATMUL_K / DIM;
+
+      // A tiles start at row 0; B tiles start at top of scratchpad
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - (uint32_t)(tiles * tiles_K * DIM);
+      int SPAD_DEST = 128;
+
+      int pad_i = BLK - mrows;
+      int pad_j = BLK - ncols;
+
+      // Step 1: Configure execution (FP8 E4M3 inputs, BF16 output)
+      gemmini_extended3_config_ex(
+          WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+          /*C_stride*/1, /*A_stride*/1,
+          /*A_transpose*/0, /*B_transpose*/0,
+          /*set_only_strides*/false,
+          /*act_mx_fmt*/0, /*wgt_mx_fmt*/0, /*out_mx_fmt*/3, /*uselut*/0);
+
+      // Step 2: Load scales — sel=0 for A (activation), sel=1 for B (weight)
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      // Step 4: MVIN A tiles into scratchpad
+      // A is row-major [M][K], tile (i,k) starts at A_in[(i0*BLK+i*DIM)*MATMUL_K + k*DIM]
+      // Scratchpad layout: a_base + (i*tiles_K + k)*DIM
+      gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+      for (int i = 0; i < tiles; i++) {
+        for (int k = 0; k < tiles_K; k++) {
+          const elem_t *a_ptr = ((const elem_t *)A_in)
+              + (size_t)(i0 * BLK + i * DIM) * MATMUL_K
+              + (size_t)(k * DIM);
+          uint32_t spad_addr = a_base + (uint32_t)((i * tiles_K + k) * DIM);
+          gemmini_extended_mvin((void *)a_ptr, spad_addr, DIM, DIM);
+        }
+      }
+
+      // MVIN B tiles into scratchpad
+      // B is row-major [K][N], tile (k,j) starts at B_in[k*DIM*MATMUL_N + (j0*BLK+j*DIM)]
+      // Scratchpad layout: b_base + (j*tiles_K + k)*DIM  (j outer, k inner)
+      gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+      for (int j = 0; j < tiles; j++) {
+        for (int k = 0; k < tiles_K; k++) {
+          const elem_t *b_ptr = ((const elem_t *)B_in)
+              + (size_t)(k * DIM) * MATMUL_N
+              + (size_t)(j0 * BLK + j * DIM);
+          uint32_t spad_addr = b_base + (uint32_t)((j * tiles_K + k) * DIM);
+          gemmini_extended_mvin2((void *)b_ptr, spad_addr, DIM, DIM);
+        }
+      }
+
+      // Step 5: Configure requantized mvout
+      gemmini_config_st(BLK * sizeof(out_t));
+      gemmini_mxquant_config_mvout(
+          (uint64_t)scale_factors,
+          /*i_bound*/tiles, /*j_bound*/tiles, /*k_bound*/tiles_K,
+          /*scale_act_sel*/0, /*scale_w_sel*/0,
+          /*lut_update_granularity*/1);
+
+      // Step 6: Fused hardware matmul (weight-stationary, tiles already in spad)
+      gemmini_loop_ws_spad(
+          tiles, tiles, tiles_K,
+          pad_i, pad_j, 0,
+          a_base, BANK_NUM * BANK_ROWS,
+          /*D*/0, /*C=SPAD_DEST*/SPAD_DEST,
+          /*A_transpose*/false, /*B_transpose*/false,
+          /*full_C*/false, /*low_D*/false,
+          /*ex_accumulate*/false,
+          /*act*/NO_ACTIVATION,
+          /*a_spad_id*/0, /*b_spad_id*/0,
+          /*is_resadd*/false,
+          /*skips*/0x38);
+
+      // Step 7: Drain BF16 results from mx_smem to DRAM, row by row
+      for (int r = 0; r < mrows; r++) {
+        gemmini_mx_read_smem(
+            (void *)&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+            SPAD_DEST * 16 + r * BLK,
+            ncols);
+      }
+      gemmini_fence();
+    }
+  }
+}
+''',
+score=inf,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='global.anthropic.claude-sonnet-4-6',
+code_gen_model='global.anthropic.claude-sonnet-4-6',
+stdout='Kernel produced an INCORRECT/illegal result on spike. Diagnostic (fix this before optimizing):\nGemmini extension configured with:\ndim = 16\nGenerated implementation latency: 10618 cycles\nIncorrect result',
+stderr=None)

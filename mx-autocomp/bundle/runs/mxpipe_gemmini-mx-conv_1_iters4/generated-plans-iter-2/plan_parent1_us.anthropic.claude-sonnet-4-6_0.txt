@@ -1,0 +1,66 @@
+## Analysis of the Current Code
+
+Looking at the current implementation, I can identify a key inefficiency in the im2col loop:
+
+```c
+for (int pi = 0; pi < CONV_H / CONV_KSZ; pi++)
+  for (int pj = 0; pj < PATCHES_X; pj++)
+    for (int c = 0; c < CONV_C; c++)
+      for (int dy = 0; dy < CONV_KSZ; dy++)
+        for (int dx = 0; dx < CONV_KSZ; dx++)
+          A_buf[pi * PATCHES_X + pj][c * CONV_KSZ * CONV_KSZ + dy * CONV_KSZ + dx] =
+              X_in[c][pi * CONV_KSZ + dy][pj * CONV_KSZ + dx];
+```
+
+The innermost `dx` loop writes to **contiguous columns** in `A_buf` (column index `c*K*K + dy*K + dx` increments by 1 as `dx` increments), but reads from **contiguous columns** in `X_in` (`X_in[c][row][pj*CONV_KSZ + dx]` — `dx` increments the innermost dimension). This means both the source and destination are contiguous in the `dx` dimension — the entire innermost loop body is a small `memcpy` of `CONV_KSZ` bytes. Strategy 11 directly applies: replacing the `dx` loop with a `memcpy` eliminates scalar store overhead, enables the compiler to use SIMD/vector instructions, and improves cache utilization.
+
+## Strategy: Replace the Innermost `dx` Loop with `memcpy` (Strategy 11)
+
+**How it works:** For each fixed `(pi, pj, c, dy)`, the `dx` loop copies `CONV_KSZ` consecutive bytes from `&X_in[c][pi*CONV_KSZ + dy][pj*CONV_KSZ + 0]` into `&A_buf[pi*PATCHES_X + pj][c*CONV_KSZ*CONV_KSZ + dy*CONV_KSZ + 0]`. Both pointers are contiguous in memory for the `dx` stride, so a single `memcpy(dst, src, CONV_KSZ * sizeof(elem_t))` replaces the entire scalar loop. This reduces loop overhead, enables the C compiler to emit vectorized memory copy (SIMD), and improves cache line utilization by issuing wider stores.
+
+## Rewritten Code
+
+```c
+void solution(void) {
+  // im2col: replace innermost dx scalar loop with memcpy for contiguous copy
+  for (int pi = 0; pi < CONV_H / CONV_KSZ; pi++)
+    for (int pj = 0; pj < PATCHES_X; pj++)
+      for (int c = 0; c < CONV_C; c++)
+        for (int dy = 0; dy < CONV_KSZ; dy++)
+          memcpy(
+            &A_buf[pi * PATCHES_X + pj][c * CONV_KSZ * CONV_KSZ + dy * CONV_KSZ],
+            &X_in[c][pi * CONV_KSZ + dy][pj * CONV_KSZ],
+            CONV_KSZ * sizeof(elem_t));
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Configure both mvin ports with the same stride (A and B share the same K-dimension stride)
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+  // Interleave A (port 0 / mvin) and B (port 1 / mvin2) loads per k-slice
+  for (int k = 0; k < tiles_K; k++) {
+    for (int i = 0; i < tiles_I; i++) {
+      gemmini_extended_mvin(
+          (void*)(((elem_t*)A_buf) + i * DIM * MATMUL_K + k * DIM),
+          a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    }
+    for (int j = 0; j < tiles_J; j++) {
+      gemmini_extended_mvin2(
+          (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+          b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+    }
+  }
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+**Why this improves performance:** The im2col kernel fills `A_buf` with `CONV_H/CONV_KSZ * PATCHES_X * CONV_C * CONV_KSZ` separate `memcpy` calls each copying `CONV_KSZ` contiguous bytes. The compiler can now lower each call to a single vector load+store (e.g., a 4-byte or 8-byte word copy for `CONV_KSZ=4`) instead of a scalar byte loop, reducing both instruction count and memory transaction overhead for this pre-processing step, which feeds all subsequent Gemmini DMA operations.

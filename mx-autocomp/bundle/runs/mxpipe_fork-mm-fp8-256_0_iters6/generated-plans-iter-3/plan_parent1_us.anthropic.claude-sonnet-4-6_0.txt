@@ -1,0 +1,98 @@
+## Analysis of the Current Code
+
+Looking at the original code, I can identify a key inefficiency in the **output stride configuration**:
+
+```c
+gemmini_config_st(DIM * sizeof(elem_t));
+```
+
+This configures the store stride as `DIM * sizeof(elem_t) = 16 * 1 = 16 bytes`. However, the output is BF16-packed (4 BF16 values per `uint64_t` word), so the correct output stride should be `OUT_COLS * sizeof(out_t)` = `(MATMUL_M / BF16_PER_WORD) * 8` bytes. This matches what the reference patterns use.
+
+But looking more carefully at the feedback — **0KB scratchpad utilization** — the issue is that `SPAD_DEST = 0` places the output at the bottom of the scratchpad, which overlaps with `a_base = 0`. The A tiles are loaded starting at address 0, and the output destination is also 0, causing a conflict that wastes scratchpad capacity.
+
+## Selected Strategy: **Strategy 5 — Choose tile layout to avoid scratchpad bank conflicts**
+
+## Plan
+
+The problem is that `SPAD_DEST = 0` conflicts with `a_base = 0`. The A tiles occupy `tiles_I * tiles_K * DIM` rows starting from address 0. Placing the compute output (`SPAD_DEST`) at 0 means A and the output region alias the same scratchpad space.
+
+The fix is to set `SPAD_DEST = 128` (as used in the `matmul_tiled_fp4_64x64.c` reference), which places the output in shared memory (`mx_smem`) at a non-conflicting word offset. Since `gemmini_loop_ws_spad` writes results into `mx_smem` (not the scratchpad itself), `SPAD_DEST` is a word offset into `mx_smem`, not a scratchpad address — so it doesn't overlap with A or B in the scratchpad at all. Setting it to 128 instead of 0 is the conventional safe value used by the reference code.
+
+Additionally, fix `gemmini_config_st` to use the correct BF16-packed output stride: `OUT_COLS * sizeof(out_t)` instead of `DIM * sizeof(elem_t)`, matching the reference patterns and ensuring the store engine steps correctly across BF16-packed output rows.
+
+**Specific changes:**
+1. Change `int SPAD_DEST = 0;` → `int SPAD_DEST = 128;`
+2. Change `gemmini_config_st(DIM * sizeof(elem_t));` → `gemmini_config_st(OUT_COLS * sizeof(out_t));`
+3. Update `gemmini_mx_read_smem` offset accordingly: `SPAD_DEST * 16` = `128 * 16 = 2048` (already parameterized as `SPAD_DEST * 16`, so this follows automatically)
+
+These changes eliminate the address-0 aliasing between A tiles and the output destination, allow the scratchpad to hold A and B tiles without interference from the output region, and correctly configure the output store stride for BF16-packed results.
+
+```c
+void solution(void) {
+
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+#ifdef SPIKE_SIM
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+#else
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
+#endif
+
+  // ---- MVIN A: tile (i,k) -> a_base + (i*tiles_K + k)*DIM ----
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM;
+      uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+      gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  // ---- MVIN B: tile (k,j) -> b_base + (j*tiles_K + k)*DIM ----
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+
+  for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j++) {
+      elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
+      uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
+      gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
+    }
+  }
+
+  // SPAD_DEST=128: mx_smem word offset for output, avoids aliasing a_base=0
+  int SPAD_DEST = 128;
+
+  // OUT_COLS * sizeof(out_t): correct BF16-packed output row stride in bytes
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // ---- Compute ----
+  gemmini_loop_ws_spad(
+      tiles_I, tiles_J, tiles_K,
+      0, 0, 0,
+      a_base,
+      BANK_NUM * BANK_ROWS,
+      0,
+      SPAD_DEST,
+      false, false,
+      false, false, false,
+      NO_ACTIVATION,
+      0, 0,
+      false,
+      0x38);
+
+#ifdef SPIKE_SIM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+#else
+  for (int i = 0; i < tiles_J*tiles_I*2; i++) {
+      gemmini_mvout((void*)((uint64_t*) C_hw + i*2*DIM), SPAD_DEST + i*DIM);
+  }
+  gemmini_fence();
+#endif
+
+}
+```

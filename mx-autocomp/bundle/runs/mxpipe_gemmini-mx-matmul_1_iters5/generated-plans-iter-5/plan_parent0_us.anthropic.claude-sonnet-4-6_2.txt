@@ -1,0 +1,115 @@
+## Analysis
+
+Looking at the original code, I need to identify the key inefficiency to address with exactly one strategy.
+
+**Current structure:**
+- tiles_I=4, tiles_J=4, tiles_K=4 (since M=N=K=64, DIM=16)
+- A mvin: 4×1 = 4 block-mvin calls (with MAX_BLOCK_LEN=4, each i does 1 block of 4)
+- B mvin: 4×1 = 4 block-mvin calls (each k does 1 block of 4)
+- Then config_st + mxquant_config_mvout
+- Then loop_ws_spad
+
+**Strategy 16: Defer `gemmini_mxquant_config_mvout` until immediately before `gemmini_loop_ws_spad`**
+
+Wait, let me re-read the original code. The `gemmini_config_st` and `gemmini_mxquant_config_mvout` are already placed *after* all mvins (both A and B), so strategy 16 is already implemented.
+
+**Strategy 13: Fully unroll all mvin loops**
+
+Since tiles_I=4, tiles_J=4, tiles_K=4 are compile-time constants, the loops have known bounds. The inner loop with `MAX_BLOCK_LEN=4` and `tiles_K=4` means the k-loop runs exactly once (k=0, block=4). Similarly j-loop runs once. This means the compiler *might* already optimize these, but explicit `#pragma GCC unroll` or manual unrolling ensures it.
+
+**Strategy 14: Hoist DRAM base-pointer arithmetic out of mvin loops**
+
+Currently, each mvin call computes `((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM` inside the loop. With unrolled loops (tiles=4), this arithmetic happens at each iteration. Hoisting precomputes these pointer values.
+
+**Plan: Apply Strategy 13 — Fully unroll all mvin loops**
+
+Since M=N=K=64, DIM=16: tiles_I=tiles_J=tiles_K=4. The k-loop for A: `k` goes 0 to 3, step MAX_BLOCK_LEN=4 → runs exactly **once** (block=4). The j-loop for B: `j` goes 0 to 3, step 4 → runs exactly **once** (block=4). The outer i-loop runs 4 times, outer k-loop runs 4 times. Fully unrolling eliminates all loop overhead and enables the compiler to compute all addresses at compile time.
+
+## Plan
+
+**Strategy selected: #13 — Fully unroll all mvin loops using `#pragma GCC unroll`**
+
+Since tiles_I=tiles_J=tiles_K=4 are compile-time constants (M=N=K=64, DIM=16), all loop bounds are known at compile time. Add `#pragma GCC unroll 4` before each outer loop and `#pragma GCC unroll 1` before the inner block loop (which executes exactly once since MAX_BLOCK_LEN=4 equals tiles_K/tiles_J=4). This eliminates:
+- Loop counter initialization, increment, and comparison instructions
+- Branch instructions for loop termination
+- Enables the compiler to constant-fold all index expressions (`i * DIM * MATMUL_K + k * DIM`, `b_base + (k * tiles_J + j) * DIM`, etc.) at compile time, converting runtime address arithmetic into immediate offsets
+- Removes data-dependent conditional (`block = k + MAX_BLOCK_LEN <= tiles_K ? MAX_BLOCK_LEN : tiles_K - k`) since the condition is always true with one full block
+
+Combined with strategy 14 (hoist pointer arithmetic), precompute all DRAM pointers as `const elem_t*` variables before the mvin calls so the address-generation is fully resolved at compile time.
+
+```c
+void solution(void) {
+  // Step 1: Configure execution with fp8 e4m3 format, BF16 output
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      /*C_stride*/1, /*A_stride*/1,
+      /*A_transpose*/0, /*B_transpose*/0,
+      /*set_only_strides*/false,
+      /*act_mx_fmt*/0, /*wgt_mx_fmt*/0, /*out_mx_fmt*/3, /*uselut*/0);
+
+  // Step 2: Load scale factors
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Compile-time constants: tiles_I=tiles_J=tiles_K=4, MAX_BLOCK_LEN=4
+  // k-inner loop runs exactly once (block=MAX_BLOCK_LEN=4=tiles_K)
+  // j-inner loop runs exactly once (block=MAX_BLOCK_LEN=4=tiles_J)
+
+  // Step 3: MVIN A tiles — fully unrolled, hoisted pointer arithmetic
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+
+  // Precompute all A tile DRAM pointers (hoisted, compile-time foldable)
+  const elem_t* a_ptr_0 = ((const elem_t*)A_in) + 0 * DIM * MATMUL_K + 0 * DIM;
+  const elem_t* a_ptr_1 = ((const elem_t*)A_in) + 1 * DIM * MATMUL_K + 0 * DIM;
+  const elem_t* a_ptr_2 = ((const elem_t*)A_in) + 2 * DIM * MATMUL_K + 0 * DIM;
+  const elem_t* a_ptr_3 = ((const elem_t*)A_in) + 3 * DIM * MATMUL_K + 0 * DIM;
+
+  // Fully unrolled: i=0..3, k=0 (single block of 4 covers all tiles_K=4)
+  gemmini_extended_mvin(a_ptr_0, a_base + (0 * tiles_K + 0) * DIM, MAX_BLOCK_LEN * DIM, DIM);
+  gemmini_extended_mvin(a_ptr_1, a_base + (1 * tiles_K + 0) * DIM, MAX_BLOCK_LEN * DIM, DIM);
+  gemmini_extended_mvin(a_ptr_2, a_base + (2 * tiles_K + 0) * DIM, MAX_BLOCK_LEN * DIM, DIM);
+  gemmini_extended_mvin(a_ptr_3, a_base + (3 * tiles_K + 0) * DIM, MAX_BLOCK_LEN * DIM, DIM);
+
+  // Step 4: MVIN B tiles — fully unrolled, hoisted pointer arithmetic
+  gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+  // Precompute all B tile DRAM pointers (hoisted, compile-time foldable)
+  const elem_t* b_ptr_0 = ((const elem_t*)B_in) + 0 * DIM * MATMUL_N + 0 * DIM;
+  const elem_t* b_ptr_1 = ((const elem_t*)B_in) + 1 * DIM * MATMUL_N + 0 * DIM;
+  const elem_t* b_ptr_2 = ((const elem_t*)B_in) + 2 * DIM * MATMUL_N + 0 * DIM;
+  const elem_t* b_ptr_3 = ((const elem_t*)B_in) + 3 * DIM * MATMUL_N + 0 * DIM;
+
+  // Fully unrolled: k=0..3, j=0 (single block of 4 covers all tiles_J=4)
+  gemmini_extended_mvin2(b_ptr_0, b_base + (0 * tiles_J + 0) * DIM, MAX_BLOCK_LEN * DIM, DIM);
+  gemmini_extended_mvin2(b_ptr_1, b_base + (1 * tiles_J + 0) * DIM, MAX_BLOCK_LEN * DIM, DIM);
+  gemmini_extended_mvin2(b_ptr_2, b_base + (2 * tiles_J + 0) * DIM, MAX_BLOCK_LEN * DIM, DIM);
+  gemmini_extended_mvin2(b_ptr_3, b_base + (3 * tiles_J + 0) * DIM, MAX_BLOCK_LEN * DIM, DIM);
+
+  // Step 5: Configure output stride and requantizer
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout(
+      (uint64_t)scale_factors,
+      /*i_bound*/tiles_I, /*j_bound*/tiles_J, /*k_bound*/tiles_K,
+      /*scale_act_sel*/0, /*scale_w_sel*/0,
+      /*lut_update_granularity*/1);
+
+  // Step 6: Execute fused weight-stationary tiled matmul
+  gemmini_loop_ws_spad(
+      tiles_I, tiles_J, tiles_K,
+      /*pad_I*/0, /*pad_J*/0, /*pad_K*/0,
+      a_base, BANK_NUM * BANK_ROWS,
+      /*D*/0, /*C=SPAD_DEST*/SPAD_DEST,
+      /*A_transpose*/false, /*B_transpose*/false,
+      /*full_C*/false, /*low_D*/false,
+      /*ex_accumulate*/false,
+      /*act*/NO_ACTIVATION,
+      /*a_spad_id*/0, /*b_spad_id*/0,
+      /*is_resadd*/false,
+      /*skips*/0x38);
+
+  // Step 7: Drain BF16 results from mx_smem to DRAM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+
+  // Step 8: Memory fence before host reads output
+  gemmini_fence();
+}
+```

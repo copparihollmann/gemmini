@@ -1,0 +1,55 @@
+# Optimization Plan: Reuse Loaded B (Weight) Tiles Across Multiple I-Tile Iterations
+
+## Analysis of the Current Code
+
+The current code has an outer loop over `(i0, j0)` blocks. For each `(i0, j0)` pair, it:
+1. Calls `gemmini_flush` + full reconfiguration
+2. Loads A scales and B scales (per block)
+3. MVINs all A tiles for block `i0`
+4. MVINs all B tiles for block `j0`
+5. Runs `gemmini_loop_ws_spad`
+6. Reads results
+
+**Key inefficiency**: For a fixed `j0` block, B tiles are identical across all `i0` iterations. With `BLOCKS_M` outer-I iterations and `BLOCKS_N` outer-J iterations, B tiles are re-loaded `BLOCKS_M` times per `j0` — pure redundant work.
+
+Similarly, B scales (`B_scales_col[g][j0*BLK]`) are identical for all `i0` at a given `j0`.
+
+## Strategy: Reuse Loaded B Tiles Across Multiple I-Tile Iterations
+
+### Plan
+
+**Restructure the loop nest** from `(i0, j0)` to `(j0, i0)` — i.e., make `j0` the outer loop and `i0` the inner loop. Then:
+
+1. **Outside the `i0` loop** (once per `j0`):
+   - Compute `b_base` and MVIN all B tiles for this `j0` block into the scratchpad **once**
+   - Stage `B_s` scale factors once (they don't change across `i0`)
+
+2. **Inside the `i0` loop** (once per `(i0, j0)` pair):
+   - Stage only `A_s` scale factors (these change with `i0`)
+   - MVIN A tiles for block `i0` starting at `a_base = 0`
+   - Call `gemmini_mx_load_scales` for A (new scales) and B (reuse the same `B_s` already staged — but **still call it** since the programming model requires both A and B scales before `loop_ws_spad`; however `B_s` staging via `memcpy` is skipped)
+   - Run `gemmini_loop_ws_spad` and read results
+
+### Critical correctness note on scratchpad layout
+
+With reuse, B tiles must remain at their fixed `b_base` position across all `i0`. A tiles for different `i0` blocks all land at `a_base = 0` (overwriting the previous `i0`'s A tiles — that's fine since A is fully consumed before the next `i0` overwrites it). The scratchpad constraint `(tiles_I*tiles_K + tiles_J*tiles_K)*DIM ≤ 8192` must still hold (unchanged from original).
+
+### What changes
+
+- **Eliminate `BLOCKS_M - 1` redundant B `memcpy`s** for `B_s` (already staged correctly)
+- **Eliminate `BLOCKS_M - 1` redundant B MVIN loops** per `j0`: instead of `BLOCKS_M × BLOCKS_N` B-mvin sequences, only `BLOCKS_N` B-mvin sequences total
+- **Eliminate `BLOCKS_M` `gemmini_flush` calls per `j0`**: flush only once per `j0` since the accelerator state (format, B tiles) is intact across `i0` iterations; move `gemmini_flush` to outside the `i0` loop
+- **Eliminate redundant `gemmini_extended3_config_ex` calls**: issue once per `j0` outside the `i0` loop (format does not change)
+- **Keep `gemmini_mx_load_scales` inside `i0` loop**: A scales change with `i0`; B scales (`B_s`) can be pre-staged outside and the `gemmini_mx_load_scales` for B still called (pointing to the same pre-staged `B_s` buffer, which is filled once before the `i0` loop)
+- **Keep `gemmini_config_ld` for B and B mvin loop outside `i0`**: these only need to run once per `j0`
+- **`gemmini_config_ld` for A, A mvin loop, `gemmini_mxquant_config_mvout`, `gemmini_loop_ws_spad`, `gemmini_mx_read_smem`, `gemmini_fence`**: remain inside the `i0` loop as before
+
+### Savings estimate
+
+For the given problem (113×256×256 with `BLK=16`, so `BLOCKS_M=8`, `BLOCKS_N=16`):  
+- B MVIN calls reduced from `BLOCKS_M × BLOCKS_N × tiles × tiles_K` to `BLOCKS_N × tiles × tiles_K`  
+- That's a 7/8 reduction in B mvin work  
+- `gemmini_flush` reduced from `BLOCKS_M × BLOCKS_N = 128` to `BLOCKS_N = 16` calls  
+- `memcpy` for `B_s` reduced from 128 to 16 calls  
+
+This directly addresses the "reuse loaded B tiles across multiple I-tile iterations" strategy and should substantially reduce the total latency.

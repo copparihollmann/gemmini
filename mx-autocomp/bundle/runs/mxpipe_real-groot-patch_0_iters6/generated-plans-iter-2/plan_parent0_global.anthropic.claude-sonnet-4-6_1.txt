@@ -1,0 +1,145 @@
+# Strategy: Batch Multiple (i0, j0) Blocks Per Accelerator Invocation by Exploiting Full Scratchpad Capacity
+
+## Analysis of the Current Code
+
+The current code issues one accelerator invocation per (i0, j0) block pair. For each invocation:
+- `BLK = 32` (typical), so `tiles = 2`, `tiles_K = MATMUL_K/16 = 32`
+- A tiles loaded: `tiles * tiles_K * DIM = 2 * 32 * 16 = 1024` scratchpad rows
+- B tiles loaded: `tiles * tiles_K * DIM = 2 * 32 * 16 = 1024` scratchpad rows
+- Total: **2048 rows out of 8192** — only **25% scratchpad utilization**
+
+The `gemmini_flush(0)` inside every (i0, j0) iteration is particularly costly — it flushes and reinitializes the accelerator pipeline for every small block, even though `gemmini_extended3_config_ex` with the same FP8 format is reissued identically.
+
+## Proposed Strategy: Batch Multiple J-blocks Per Invocation (Weight-Stationary Multi-Column Batching)
+
+**Key insight:** In weight-stationary mode, B tiles are stationary and A tiles stream. For a fixed `i0`, multiple `j0` blocks can be loaded simultaneously into the scratchpad and computed in a single `gemmini_loop_ws_spad` call with a larger `tiles_J`.
+
+### How It Works
+
+Instead of calling `gemmini_loop_ws_spad(tiles, tiles, tiles_K, ...)` for one (i0, j0), we:
+
+1. **Fix i0**, then pack `J_BATCH` consecutive j0-blocks into the scratchpad at once
+2. Load B tiles for all `J_BATCH` j0-blocks into the top of the scratchpad
+3. Load A tiles for the single i0-block once (amortized over J_BATCH outputs)
+4. Call `gemmini_loop_ws_spad` with `tiles_J_big = tiles * J_BATCH`
+
+**Scratchpad budget for J_BATCH=3:**
+- `tiles_I_big = tiles = 2`, `tiles_J_big = 3*2 = 6`, `tiles_K = 32`
+- A: `2 * 32 * 16 = 1024` rows
+- B: `6 * 32 * 16 = 3072` rows
+- Total: **4096 rows** ≤ 8192 ✓
+- Accumulator: `tiles_I_big * tiles_J_big * DIM = 2 * 6 * 16 = 192` rows ≤ 256 ✓
+
+**For J_BATCH=4:**
+- B: `8 * 32 * 16 = 4096` rows; A: 1024; Total: 5120 ≤ 8192 ✓
+- Accumulator: `2 * 8 * 16 = 256` rows ≤ 256 ✓ (exactly fills)
+
+This reduces `gemmini_flush` calls by factor of J_BATCH, amortizes `gemmini_extended3_config_ex`, `gemmini_mx_load_scales`, `gemmini_mxquant_config_mvout`, and the fixed per-invocation overhead across more output tiles.
+
+### Scale Factor Handling
+
+For a batch of J_BATCH j0-blocks with fixed i0, we need a combined scale buffer:
+- A scales: same `A_s[g][0..BLK-1]` (unchanged, covers the single i0)
+- B scales: concatenate B scales for j0, j0+1, ..., j0+J_BATCH-1 into a single buffer `B_s_batch[g][0..J_BATCH*BLK-1]`
+
+The `gemmini_mx_load_scales` for B is called once with length `J_BATCH * B_S_BYTES`.
+
+### Implementation Plan
+
+```c
+#define J_BATCH 4   // batch 4 j0-blocks per accelerator call
+
+void solution(void) {
+  // Hoist config outside all loops — format is invariant
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  int tiles    = BLK / DIM;
+  int tiles_K  = MATMUL_K / DIM;
+  int SPAD_DEST = 128;
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    int mrows = REAL_M - i0 * BLK;
+    if (mrows > BLK) mrows = BLK;
+    if (mrows <= 0) continue;
+
+    // Load A scales for this i0 row-block (invariant across j0 batches)
+    for (int g = 0; g < MATMUL_K / 32; g++)
+      memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+
+    // Mvin A tiles once — reused across all j0 batches for this i0
+    uint32_t a_base = 0;
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i = 0; i < tiles; i++)
+      for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin(
+          (void*)(((elem_t*)A_in) + (i0*BLK + i*DIM)*MATMUL_K + k*DIM),
+          a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+    for (int j0 = 0; j0 < BLOCKS_N; j0 += J_BATCH) {
+      int jbatch = J_BATCH;
+      if (j0 + jbatch > BLOCKS_N) jbatch = BLOCKS_N - j0;
+      int tiles_J_big = tiles * jbatch;
+
+      // Compute ncols for each j in batch; pad_j is for the last j in batch
+      int last_ncols = REAL_N - (j0 + jbatch - 1) * BLK;
+      if (last_ncols > BLK) last_ncols = BLK;
+      int pad_j = BLK - last_ncols;  // only last j-block may be partial
+      int pad_i = BLK - mrows;
+
+      // Build combined B scales for all jbatch blocks
+      for (int jj = 0; jj < jbatch; jj++)
+        for (int g = 0; g < MATMUL_K / 32; g++)
+          memcpy(&B_s_batch[g][jj * BLK], &B_scales_col[g][(j0+jj)*BLK], BLK);
+
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_J_big * tiles_K * DIM;
+
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s_batch, jbatch * B_S_BYTES, 1);
+
+      // Mvin B tiles for all jbatch j-blocks
+      gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+      for (int jj = 0; jj < jbatch; jj++)
+        for (int j = 0; j < tiles; j++)
+          for (int k = 0; k < tiles_K; k++)
+            gemmini_extended_mvin(
+              (void*)(((elem_t*)B_in) + k*DIM*MATMUL_N + (j0+jj)*BLK + j*DIM),
+              b_base + ((jj*tiles + j) * tiles_K + k) * DIM, DIM, DIM);
+
+      gemmini_config_st(tiles_J_big * BLK_OUTC / tiles * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+          tiles, tiles_J_big, tiles_K, 0, 0, 1);
+
+      gemmini_loop_ws_spad(tiles, tiles_J_big, tiles_K, pad_i, pad_j, 0,
+          a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+          false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Drain results: smem is laid out as tiles_I rows × tiles_J_big columns
+      for (int jj = 0; jj < jbatch; jj++) {
+        int ncols = REAL_N - (j0 + jj) * BLK;
+        if (ncols > BLK) ncols = BLK;
+        if (ncols <= 0) continue;
+        for (int r = 0; r < mrows; r++)
+          gemmini_mx_read_smem(
+            &C_hw[i0*BLK + r][(j0+jj)*BLK / BF16_PER_WORD],
+            SPAD_DEST*16 + r * tiles_J_big * BLK + jj * BLK,
+            ncols);
+      }
+      gemmini_fence();
+    }
+  }
+}
+```
+
+## Why This Improves Performance
+
+| Cost Amortized | Before | After (J_BATCH=4) |
+|---|---|---|
+| `gemmini_flush` | 1 per (i0,j0) | 1 total |
+| `gemmini_extended3_config_ex` | 1 per (i0,j0) | 1 total |
+| A mvin | 1 per (i0,j0) | 1 per i0 (4× reduction) |
+| `gemmini_mx_load_scales` A | 1 per (i0,j0) | 1 per i0 (4× reduction) |
+| Fixed per-invoke overhead | proportional to N_blocks² | reduced by J_BATCH |
+
+The A tiles (1024 rows) are loaded **once per i0** and reused across J_BATCH=4 j0-blocks, eliminating 75% of A-mvin traffic. The `gemmini_flush` overhead — a full pipeline drain — is eliminated from the inner loop entirely by hoisting it before the outer loop (since format never changes). The single large `gemmini_loop_ws_spad` with `tiles_J_big=8` processes 4× more output per accelerator invocation, reducing fixed scheduling overhead by 4×.

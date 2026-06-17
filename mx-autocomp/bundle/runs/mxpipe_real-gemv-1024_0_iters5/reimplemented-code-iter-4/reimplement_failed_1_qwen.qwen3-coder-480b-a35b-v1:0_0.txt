@@ -1,0 +1,109 @@
+// Optimized MX matmul with maximum tiling to utilize full scratchpad/accumulator
+void solution(void) {
+  // Calculate tiling parameters based on full matrix dimensions
+  const int tiles_I = (REAL_M + DIM - 1) / DIM;  // Round up to nearest tile
+  const int tiles_J = (REAL_N + DIM - 1) / DIM;
+  const int tiles_K = (MATMUL_K + DIM - 1) / DIM;
+
+  // Compute actual padded dimensions
+  const int M_padded = tiles_I * DIM;
+  const int N_padded = tiles_J * DIM;
+  
+  // Scratchpad layout calculations - B must be placed at the top
+  const uint32_t a_base = 0;
+  const uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_J * tiles_K * DIM;
+  const int SPAD_DEST = 128;
+
+  // Padding for partial tiles
+  const int pad_i = M_padded - REAL_M;
+  const int pad_j = N_padded - REAL_N;
+  const int pad_k = 0; // K is always a multiple in this context
+
+  // 1. Flush and configure execution format for the entire computation
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+                              /*C_stride*/1, /*A_stride*/1,
+                              /*A_transpose*/0, /*B_transpose*/0,
+                              /*set_only_strides*/false,
+                              /*act_mx_fmt*/0, /*wgt_mx_fmt*/0, /*out_mx_fmt*/3, /*uselut*/0);
+
+  // 2. Load global scale factors directly (no pre-formatting needed)
+  gemmini_mx_load_scales((uint64_t)A_scales_row, sizeof(A_scales_row), 0); // A/activation scales
+  gemmini_mx_load_scales((uint64_t)B_scales_col, sizeof(B_scales_col), 1); // B/weight scales
+
+  // 3. MVIN A tiles directly from source DRAM (using port 0 only)
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t)); // Stride is K
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      // Handle potential partial tiles at the edges
+      int rows = (i == tiles_I - 1 && REAL_M % DIM != 0) ? REAL_M % DIM : DIM;
+      int cols = (k == tiles_K - 1 && MATMUL_K % DIM != 0) ? MATMUL_K % DIM : DIM;
+      
+      // Only load if there's valid data
+      if (i * DIM < REAL_M && k * DIM < MATMUL_K) {
+        gemmini_extended_mvin(
+            (void*)(((elem_t*)A_in) + (i * DIM) * MATMUL_K + (k * DIM)),
+            a_base + (i * tiles_K + k) * DIM,
+            cols, rows);
+      }
+    }
+  }
+
+  // 4. MVIN B tiles directly from source DRAM (using port 0 only - FIX)
+  gemmini_config_ld(N_padded * sizeof(elem_t)); // Stride is padded N
+  for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k++) {
+      // Handle potential partial tiles at the edges
+      int rows = (k == tiles_K - 1 && MATMUL_K % DIM != 0) ? MATMUL_K % DIM : DIM;
+      int cols = (j == tiles_J - 1 && REAL_N % DIM != 0) ? REAL_N % DIM : DIM;
+      
+      // Only load if there's valid data
+      if (k * DIM < MATMUL_K && j * DIM < REAL_N) {
+        gemmini_extended_mvin(  // Changed from mvin2 to mvin (port 0)
+            (void*)(((elem_t*)B_in) + (k * DIM) * N_padded + (j * DIM)),
+            b_base + (j * tiles_K + k) * DIM,
+            cols, rows);
+      }
+    }
+  }
+
+  // 5. Configure store and requantizer parameters for the full output
+  gemmini_config_st(N_padded * sizeof(out_t)); // Stride is padded N
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+                               tiles_I, tiles_J, tiles_K,
+                               /*scale_act_sel*/0, /*scale_w_sel*/0,
+                               /*lut_update_granularity*/1);
+
+  // 6. Compute the entire fused weight-stationary loop in one go
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K,
+                       pad_i, pad_j, pad_k,
+                       a_base, b_base, 0, SPAD_DEST,
+                       false, false, // A_transpose, B_transpose
+                       false, false, false, // full_C, low_D, ex_accumulate
+                       NO_ACTIVATION, 0, 0, false, // act, a_spad_id, b_spad_id, is_resadd
+                       0x38); // Skips bitmask
+
+  // 7. Drain the entire shared memory result to DRAM and synchronize
+  // Output is organized in tiles_I x tiles_J layout in shared memory
+  for (int i = 0; i < tiles_I; i++) {
+    for (int j = 0; j < tiles_J; j++) {
+      int out_rows = (i == tiles_I - 1 && REAL_M % DIM != 0) ? REAL_M % DIM : DIM;
+      int out_cols = (j == tiles_J - 1 && REAL_N % DIM != 0) ? REAL_N % DIM : DIM;
+      
+      if (out_rows > 0 && out_cols > 0) {
+        // Calculate source offset in shared memory (each tile is DIM x DIM BF16s)
+        int smem_src_offset = SPAD_DEST * 16 + (i * tiles_J + j) * DIM * DIM;
+        // Calculate destination in C_hw (row-major, padded layout)
+        out_t *dst_ptr = &C_hw[i * DIM][j * DIM / BF16_PER_WORD];
+        
+        // Read out_cols BF16 values per row
+        for (int r = 0; r < out_rows; r++) {
+          gemmini_mx_read_smem(&dst_ptr[r * N_padded / BF16_PER_WORD],
+                               smem_src_offset + r * DIM,
+                               out_cols);
+        }
+      }
+    }
+  }
+  gemmini_fence();
+}

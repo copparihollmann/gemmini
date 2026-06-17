@@ -1,0 +1,72 @@
+Looking at the code, I need to identify the bugs:
+
+1. **B matrix layout is wrong**: The code uses `b_base + (k * tiles + j) * DIM` but the correct layout per the spec is `b_base + (j * tiles_K + k) * DIM`. The indices for j and k are swapped.
+
+2. **Scale buffer sel convention**: `gemmini_mx_load_scales` sel=0 is for A (activation), sel=1 is for B (weight). The code has this correct, but let me verify the scale staging - it's staging into `A_s` and `B_s` which should be fine.
+
+3. **mvin2 for B**: B tiles should be loaded via `gemmini_extended_mvin2` (mvin2 port), not `gemmini_extended_mvin` (mvin port). Using the wrong port for B can cause conflicts.
+
+4. **`gemmini_config_ld` with id**: For mvin2 (B matrix), need to use `gemmini_extended3_config_ld` with `id=1` to configure the correct DMA port.
+
+5. **smem read offset**: The `gemmini_mx_read_smem` uses `SPAD_DEST*16 + r * BLK` for the partial case - this should be `SPAD_DEST*16 + r * BLK` where BLK is in BF16 units, which seems correct since smem is addressed in 16-bit word units.
+
+Let me re-examine the B layout: spec says `b_base + (j*tiles_K + k)*DIM`. The original code has `(k * tiles + j) * DIM` which is wrong - j and k relationship is inverted.
+
+```c
+void solution(void) {
+  gemmini_flush(0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++)
+   for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+      int mrows = REAL_M - i0 * BLK; if (mrows > BLK) mrows = BLK; if (mrows <= 0) continue;
+      int ncols = REAL_N - j0 * BLK; if (ncols > BLK) ncols = BLK; if (ncols <= 0) continue;
+
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK);
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK);
+      }
+
+      int tiles = BLK / DIM;
+      int tiles_K = MATMUL_K / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles * tiles_K * DIM;
+      int SPAD_DEST = 128;
+      int pad_i = BLK - mrows, pad_j = BLK - ncols;
+
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);
+
+      // Load A tiles via mvin (port 0): stride = K columns
+      gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+      for (int i = 0; i < tiles; i++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i0 * BLK + i * DIM) * MATMUL_K + k * DIM),
+                                a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+
+      // Load B tiles via mvin2 (port 1): stride = N columns
+      // B layout: b_base + (j * tiles_K + k) * DIM  (j outer, k inner)
+      gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+      for (int j = 0; j < tiles; j++)
+        for (int k = 0; k < tiles_K; k++)
+          gemmini_extended_mvin2((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK + j * DIM)),
+                                 b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles, tiles, tiles_K, 0, 0, 1);
+
+      gemmini_loop_ws_spad(tiles, tiles, tiles_K, pad_i, pad_j, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                           SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+      if (ncols == BLK) {
+        gemmini_mx_read_smem(&C_hw[i0 * BLK][(j0 * BLK) / BF16_PER_WORD],
+                             SPAD_DEST * 16, mrows * BLK);
+      } else {
+        for (int r = 0; r < mrows; r++)
+          gemmini_mx_read_smem(&C_hw[i0 * BLK + r][(j0 * BLK) / BF16_PER_WORD],
+                               SPAD_DEST * 16 + r * BLK, ncols);
+      }
+      gemmini_fence();
+    }
+}
+```

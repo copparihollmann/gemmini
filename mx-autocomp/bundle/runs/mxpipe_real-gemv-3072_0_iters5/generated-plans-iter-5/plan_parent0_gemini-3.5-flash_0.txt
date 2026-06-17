@@ -1,0 +1,97 @@
+### Optimization Strategy: Padding-Aware Asymmetric Tiling with Direct Scale Factor DRAM Loading
+
+In the baseline implementation, the matrix multiplication is tiled symmetrically using a block size of `BLK = 64` for both the $M$ and $N$ dimensions. However, because this is a $1 \times 1024 \times 3072$ matrix multiplication, the actual $M$ dimension is only $1$ (padded to Gemmini's systolic array tile size of $16$). Symmetrically tiling with `BLK = 64` forces `tiles_I = 4`, causing the hardware to waste $75\%$ of its compute cycles on dummy padding rows.
+
+We can apply a new strategy: **Padding-Aware Asymmetric Tiling with Direct Scale Factor DRAM Loading**. By decoupling the block sizes of the $M$ and $N$ dimensions, we achieve the following:
+
+1. **Eliminate Dummy Calculations**: We set $BLK_M = 16$ (`tiles_I = 1`), completely eliminating the padded dummy computations on the systolic array.
+2. **Maximize Scratchpad Utilization**: Reducing `tiles_I` to $1$ frees up $3072$ rows in the scratchpad. We reallocate this space to increase the column block size $BLK_N$ to $112$ (`tiles_J = 7`). This utilizes exactly $100\%$ of the $8192$-row scratchpad ($(1 \times 64 + 7 \times 64) \times 16 = 8192$) and reduces the number of outer loop iterations from $48$ to $28$.
+3. **Direct Scale Factor Loading**: Since we no longer tile along $M$, the scale factors in `A_scales_row` are fully contiguous for our active block. We can stream them directly from DRAM into Gemmini's scale memory, completely eliminating the expensive host-side `memcpy` for the $A$ scale factors.
+
+---
+
+### Optimized Code
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "include/gemmini_testutils.h"
+
+// Assuming DIM, MATMUL_K, MATMUL_N, REAL_M, REAL_N, BF16_PER_WORD, BANK_NUM, BANK_ROWS are globally defined
+// Assuming A_in, B_in, C_hw, A_scales_row, B_scales_col are globally defined
+
+void solution(void) {
+  int BLK_M = 16;
+  int BLK_N = 112; // 7 * 16 = 112
+  int tiles_I = 1;
+  int tiles_J = 7;
+  int tiles_K = MATMUL_K / DIM; // 64
+
+  int mrows = REAL_M; 
+  if (mrows > BLK_M) mrows = BLK_M;
+  int pad_i = BLK_M - mrows;
+
+  uint32_t scale_factors[512] = {0};
+  uint8_t local_B_s[MATMUL_K / 32][112]; // Scaled locally to BLK_N
+
+  for (int j0 = 0; j0 < (REAL_N + BLK_N - 1) / BLK_N; j0++) {
+    int ncols = REAL_N - j0 * BLK_N;
+    if (ncols > BLK_N) ncols = BLK_N;
+    if (ncols <= 0) continue;
+
+    int pad_j = BLK_N - ncols;
+
+    // Stage only B scale factors for the current column block
+    for (int g = 0; g < MATMUL_K / 32; g++) {
+      memcpy(&local_B_s[g][0], &B_scales_col[g][j0 * BLK_N], BLK_N);
+    }
+
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM; // 8192 - 64 * 7 * 16 = 1024
+    int SPAD_DEST = 128;
+
+    gemmini_flush(0);
+
+    // 1. Configure Gemmini
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+    // 2. Direct Scale Loading (A is loaded contiguously from DRAM, B is loaded from staged buffer)
+    gemmini_mx_load_scales((uint64_t)A_scales_row, (MATMUL_K / 32) * BLK_M, 0);
+    gemmini_mx_load_scales((uint64_t)local_B_s, (MATMUL_K / 32) * BLK_N, 1);
+
+    // 4. MVIN A Tiles
+    gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++) {
+      for (int k = 0; k < tiles_K; k++) {
+        gemmini_extended_mvin((void*)(((elem_t*)A_in) + (i * DIM) * MATMUL_K + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+      }
+    }
+
+    // 4. MVIN B Tiles (Utilizing top of scratchpad and correct indexing)
+    gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+    for (int j = 0; j < tiles_J; j++) {
+      for (int k = 0; k < tiles_K; k++) {
+        gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + (j0 * BLK_N + j * DIM)),
+                              b_base + (j * tiles_K + k) * DIM, DIM, DIM);
+      }
+    }
+
+    // 5. Configure Store Stride and Requantizer
+    gemmini_config_st((BLK_N / BF16_PER_WORD) * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+    // 6. Compute weight-stationary tiled matmul in hardware
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, pad_i, pad_j, 0, 
+                         a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST, 
+                         false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+    // 7. Drain BF16 results from SMEM to DRAM
+    for (int r = 0; r < mrows; r++) {
+      gemmini_mx_read_smem(&C_hw[r][(j0 * BLK_N) / BF16_PER_WORD],
+                           SPAD_DEST * 16 + r * BLK_N, ncols);
+    }
+    gemmini_fence();
+  }
+}
+```

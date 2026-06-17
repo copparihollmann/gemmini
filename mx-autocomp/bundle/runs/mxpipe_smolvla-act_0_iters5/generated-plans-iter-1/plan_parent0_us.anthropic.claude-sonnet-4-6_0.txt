@@ -1,0 +1,32 @@
+## Analysis of the Current Code
+
+The current code has an outer loop over `(i0, j0)` blocks, and inside each iteration it:
+1. Does `memcpy` to stage scale factors into local buffers `A_s` and `B_s`
+2. Runs `gemmini_flush`, `config_ex`, loads scales, mvins all A and B tiles
+3. Issues one `gemmini_loop_ws_spad` + `gemmini_mxquant_config_mvout`
+4. Reads out results row-by-row with `BLK` separate `gemmini_mx_read_smem` calls
+
+The code reloads A tiles for every `j0` iteration even though the A tiles for a fixed `i0` are reused across all `j0` columns. This is the primary inefficiency: **for each `i0`, the same A tiles are mvin'd `BLOCKS_N` times**.
+
+## Selected Strategy: #9 — Assign B tiles to fixed high-address scratchpad region to enable weight-stationary reuse across I tiles (and by extension, restructure to reuse A tiles across J)
+
+More precisely, the plan applies **loop reordering (strategy 2)** combined with **weight-stationary reuse (strategy 9)**: reorder the outer loops from `(i0, j0)` to `(j0, i0)` so that **B tiles are loaded once per `j0` and reused across all `i0` iterations**, and correspondingly A tiles are loaded fresh each `i0` (which is unavoidable since A scales differ per `i0`). However, re-examining the dimensions:
+
+- `BLOCKS_M` outer I blocks, `BLOCKS_N` outer J blocks
+- Currently A is reloaded `BLOCKS_N` times; B is reloaded `BLOCKS_M` times
+
+Since B stays fixed per `j0`, hoisting B mvin outside the `i0` loop eliminates `(BLOCKS_M - 1) * BLOCKS_N` redundant B mvin batches and `(BLOCKS_M - 1) * BLOCKS_N` redundant B scale loads.
+
+## Concrete Plan
+
+**Reorder loops to `(j0, i0)`** and hoist the B-tile mvin and B scale preparation outside the `i0` loop:
+
+1. Make `j0` the outer loop and `i0` the inner loop.
+2. Before entering the `i0` loop: compute `b_base`, configure `gemmini_config_ld` with B's stride, mvin all B tiles into scratchpad, and copy/stage `B_s` scale factors — these are fixed for all `i0` at this `j0`.
+3. Inside the `i0` loop: only stage `A_s`, call `gemmini_mx_load_scales` for **both** A and B (the programming model requires both before each `gemmini_loop_ws_spad`; B scales can be reloaded cheaply from the already-staged `B_s` buffer), mvin A tiles, issue `gemmini_mxquant_config_mvout`, `gemmini_loop_ws_spad`, and `gemmini_mx_read_smem` + `gemmini_fence()`.
+4. The B tile mvin loop (the `j`/`k` double loop over B scratchpad slots) is now executed only `BLOCKS_N` times instead of `BLOCKS_M * BLOCKS_N` times, reducing mvin command count by a factor of `BLOCKS_M`.
+5. `a_base` and `b_base` remain correctly computed: `b_base = BANK_NUM*BANK_ROWS - tiles*tiles_K*DIM` (unchanged, B still at top of scratchpad), `a_base = 0` (A at bottom). The scratchpad constraint `(tiles_I_inner * tiles_K + tiles_J_inner * tiles_K) * DIM ≤ 8192` must be verified — it is the same as before since `tiles` and `tiles_K` are unchanged.
+6. The `gemmini_flush` call moves to once per `j0` (outside `i0`), eliminating redundant flushes.
+7. `gemmini_extended3_config_ex` is also hoisted to once per `j0` since format/stride settings are unchanged across `i0`.
+
+This directly reduces the dominant mvin cost: B tiles account for `tiles * tiles_K = (BLK/DIM) * (MATMUL_K/DIM)` mvin commands per `(i0,j0)` pair; hoisting saves `(BLOCKS_M - 1) * BLOCKS_N` full B-mvin batches.

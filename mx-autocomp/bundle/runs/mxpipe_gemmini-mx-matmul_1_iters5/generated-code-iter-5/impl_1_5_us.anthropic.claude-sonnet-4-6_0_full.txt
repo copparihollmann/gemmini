@@ -1,0 +1,75 @@
+Looking at the original code, the issue is "max retries reached" which suggests the previous optimization attempts failed. Let me carefully analyze the original code and produce a semantically equivalent, correct implementation.
+
+The original code for a 32x32x32 FP8 matmul with:
+- `tiles_I = 2, tiles_J = 2, tiles_K = 2` (32/16 = 2 each)
+- `a_base = 0` (A tiles at bottom of scratchpad)
+- `b_base = BANK_NUM*BANK_ROWS - tiles_K*tiles_J*DIM = 8192 - 2*2*16 = 8128`
+- `SPAD_DEST = 0` (output destination in mx_smem)
+
+The key insight is that for this small 32x32x32 case, the tiles fit well and the main optimization is to ensure correct ordering and potentially batch the mvin operations better. Since MAX_BLOCK_LEN=4, we can potentially batch multiple tiles per mvin call.
+
+For A: each row-block `(i,k)` is a single DIM×DIM tile — we can batch up to 4 consecutive k-tiles per mvin. For `tiles_K=2`, we can load both k=0 and k=1 for a given i in one batched call using `gemmini_extended_mvin` with `cols=DIM*2, rows=DIM` style, but the stride must be set correctly.
+
+Actually, looking more carefully, the simplest correct approach is to keep the logic equivalent but ensure it compiles and runs correctly:
+
+```c
+void solution(void) {
+  // Step 1: Configure execution for FP8 E4M3, BF16 output
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // Step 2: Load scale factors (sel=0 for A, sel=1 for B)
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Step 3: No LUT needed (uselut=0 for FP8)
+
+  // Step 4: MVIN A tiles into scratchpad
+  // A tile (i,k) -> spad row: a_base + (i*tiles_K + k)*DIM
+  // Stride = MATMUL_K * sizeof(elem_t) bytes (row stride in DRAM)
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));
+  for (int i = 0; i < tiles_I; i++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin(
+          (void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+          a_base + (i * tiles_K + k) * DIM,
+          DIM, DIM);
+    }
+  }
+
+  // MVIN B tiles into scratchpad
+  // B tile (k,j) -> spad row: b_base + (k*tiles_J + j)*DIM
+  // Stride = MATMUL_N * sizeof(elem_t) bytes
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));
+  for (int j = 0; j < tiles_J; j++) {
+    for (int k = 0; k < tiles_K; k++) {
+      gemmini_extended_mvin2(
+          (void*)(((elem_t*)B_in) + k * DIM * MATMUL_N + j * DIM),
+          b_base + (k * tiles_J + j) * DIM,
+          DIM, DIM);
+    }
+  }
+
+  // Step 5: Configure output stride and requantizer
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout(
+      (uint64_t)scale_factors,
+      tiles_I, tiles_J, tiles_K,
+      0, 0, 1);
+
+  // Step 6: Execute fused weight-stationary tiled matmul
+  gemmini_loop_ws_spad(
+      tiles_I, tiles_J, tiles_K,
+      0, 0, 0,
+      a_base, BANK_NUM * BANK_ROWS,
+      0, SPAD_DEST,
+      false, false,
+      false, false, false,
+      NO_ACTIVATION, 0, 0,
+      false, 0x38);
+
+  // Step 7: Drain BF16 results from mx_smem to DRAM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```

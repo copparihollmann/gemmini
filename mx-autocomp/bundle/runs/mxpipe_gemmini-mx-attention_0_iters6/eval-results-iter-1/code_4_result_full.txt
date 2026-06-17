@@ -1,0 +1,434 @@
+{'correct': True, 'test_results': {0: True}, 'compiled': True, 'latency_spike_raw': 1058022, 'latency': 1058022}
+Prev latency: 672193
+New latency: 1058022
+Plan: ## Strategy: Fuse the Softmax CPU Loop into Vectorized 4-Row Batches and Eliminate Redundant BF16 Unpacking Passes
+
+### Identification of the Bottleneck
+
+Looking at the profiled code, the dominant cost is **step 2: the CPU-side integer softmax loop**. The original code has a structural inefficiency in how it unpacks and processes the BF16 output from step 1:
+
+**Current structure:**
+1. **First pass** over `S1_hw[i][j/4]` — unpacks BF16 words and stores into `q[4][ATT_S]` (a large stack-allocated array of `int64_t`), while computing row maxima.
+2. **Second pass** over `q[4][ATT_S]` — computes `mx_iexp` and stores into `p[4][ATT_S]` (another large stack array), while summing.
+3. **Third pass** for scale/encode — reads back `p[4][ATT_S]` per group.
+
+With `ATT_S` large, `q[4][ATT_S]` and `p[4][ATT_S]` are large stack allocations of `int64_t`. For example if `ATT_S = 128`, that is `4 × 128 × 8 = 4096` bytes per array, `8 KB` total on the stack. These arrays blow the L1 data cache and are read/written multiple times: **the bottleneck is three separate passes over memory that could be reduced to two**.
+
+### The Strategy: Merge the iexp+sum Pass Into the Unpack+Max Pass Using a Two-Pass Algorithm
+
+The key insight is that computing softmax requires knowing the row maximum before computing exponentials — but we can **eliminate the intermediate `q[][]` storage entirely** by doing two passes directly over the *packed BF16 words in `S1_hw`* rather than over an unpacked `int64_t` buffer.
+
+**Proposed structure:**
+1. **Pass 1** over `S1_hw[i][j/4]` — unpack BF16 words, compute row maxima `mq[4]`. **Do not store `q[][]`.**
+2. **Pass 2** over `S1_hw[i][j/4]` — re-unpack BF16 words, compute `mx_iexp(val - mq[r])` on the fly, accumulate `sm[r]`, and compute scale/encode **directly per group** without storing `p[][]`.
+
+This eliminates the `p[4][ATT_S]` array entirely and replaces the `q[4][ATT_S]` array with nothing (we re-read from `S1_hw` which is already in L1/L2 because it was just written and is much smaller in uint64 packing: `ATT_S × ATT_S / 4` bytes vs `4 × ATT_S × 8` bytes per 4-row batch).
+
+### Why This Reduces Latency
+
+- **Eliminated one large intermediate buffer**: `q[4][ATT_S]` of `int64_t` is replaced by re-reading the already-cached packed `S1_hw` words. Since `S1_hw` stores 4 BF16 values per `uint64_t`, it is `4×` more compact than the unpacked `int64_t` array, fitting better in cache.
+- **Eliminated `p[4][ATT_S]`**: The per-group max and encode loop that read back `p[]` now runs inline during pass 2, so we never materialize `p[]` to memory at all.
+- **Pass 2 combines iexp, sum, group-max, and encode** in one sweep: for each group `g` in pass 2, we can compute `iexp` values, track the group max, accumulate the sum, and after finishing the group call `mx_ienc_fp8` — all without a third pass.
+- **Reduced stack pressure**: Eliminating two `4 × ATT_S` arrays of `int64_t` from the stack reduces register spills and cache pressure.
+
+### Concrete Code Change Plan
+
+```
+Pass 1: scan S1_hw rows i..i+3, unpack BF16 → ibf16, track mq[4].
+         (no q[][] storage)
+
+Pass 2: scan S1_hw rows i..i+3 again in group-sized chunks of 32 columns:
+  for g in 0..GROUPS_S:
+    for r in 0..4:
+      gmax_exp[r] = 0
+    for j in g*32..(g+1)*32:
+      for r in 0..4:
+        val = unpack S1_hw[i+r][j/4] at slot j%4   // likely already in cache
+        ev = mx_iexp(ibf16(val) - mq[r])
+        sm[r] += ev
+        if ev > gmax_exp[r]: gmax_exp[r] = ev
+    for r in 0..4:
+      compute e from gmax_exp[r], ls[r], set P_scales[g][i+r]
+      re-encode 32 values for P_q[i+r][g*32..(g+1)*32]
+         (third mini-pass only over 32 values, hot in L1)
+```
+
+The `ls[r]` and `inv_sm[r]` values needed for encoding depend on the full-row sum `sm[r]`, so the encode sub-pass for each group must wait until `sm[r]` is finalized. This means pass 2 first accumulates all groups' `sm[r]`, then a third mini-pass encodes. However, `sm[r]` can be computed in pass 2 (the iexp+sum pass), and the encode mini-pass only touches 32 values (one cache line worth), so it is negligible.
+
+The net effect: **two passes over `S1_hw` (compact, cached) instead of two passes over large `int64_t` arrays plus one pass over `S1_hw`**, reducing memory traffic by approximately `2 × 4 × ATT_S × 8` bytes per 4-row batch while keeping the same computational work.
+
+CodeCandidate(parent=CodeCandidate(parent=None,
+plan='''prior autocomp winner (mxpipe_gemmini-mx-attention_0_iters2)''',
+code='''void solution(void) {
+  // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&Q_scales_row, sizeof(Q_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&KT_scales_col, sizeof(KT_scales_col), 1);
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) { int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM); }
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) { int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM); }
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+    gemmini_fence();
+  }
+
+  // ---- 2) FLOAT-FREE integer softmax + fp8 requant (4 rows at a time) ----
+  for (int i = 0; i < ATT_S; i += 4) {
+    // Storage for 4 rows
+    int64_t q[4][ATT_S];
+    int64_t mq[4];
+    int64_t p[4][ATT_S];
+    int64_t sm[4];
+    int ls[4];
+    uint64_t inv_sm[4];
+
+    // Initialize max values
+    mq[0] = mq[1] = mq[2] = mq[3] = -((int64_t)1 << 62);
+
+    // Unpack 4 rows simultaneously + find max for each row
+    for (int j = 0; j < ATT_S; j += 4) {
+      uint64_t w0 = S1_hw[i + 0][j / 4];
+      uint64_t w1 = S1_hw[i + 1][j / 4];
+      uint64_t w2 = S1_hw[i + 2][j / 4];
+      uint64_t w3 = S1_hw[i + 3][j / 4];
+      for (int l = 0; l < 4; l++) {
+        int shift = l * 16;
+        int64_t qq0 = mx_ibf16_to_q((uint16_t)((w0 >> shift) & 0xFFFF));
+        int64_t qq1 = mx_ibf16_to_q((uint16_t)((w1 >> shift) & 0xFFFF));
+        int64_t qq2 = mx_ibf16_to_q((uint16_t)((w2 >> shift) & 0xFFFF));
+        int64_t qq3 = mx_ibf16_to_q((uint16_t)((w3 >> shift) & 0xFFFF));
+        q[0][j + l] = qq0; if (qq0 > mq[0]) mq[0] = qq0;
+        q[1][j + l] = qq1; if (qq1 > mq[1]) mq[1] = qq1;
+        q[2][j + l] = qq2; if (qq2 > mq[2]) mq[2] = qq2;
+        q[3][j + l] = qq3; if (qq3 > mq[3]) mq[3] = qq3;
+      }
+    }
+
+    // Compute iexp + sum for 4 rows simultaneously
+    sm[0] = sm[1] = sm[2] = sm[3] = 0;
+    for (int j = 0; j < ATT_S; j++) {
+      int64_t pv0 = mx_iexp(q[0][j] - mq[0]);
+      int64_t pv1 = mx_iexp(q[1][j] - mq[1]);
+      int64_t pv2 = mx_iexp(q[2][j] - mq[2]);
+      int64_t pv3 = mx_iexp(q[3][j] - mq[3]);
+      p[0][j] = pv0; sm[0] += pv0;
+      p[1][j] = pv1; sm[1] += pv1;
+      p[2][j] = pv2; sm[2] += pv2;
+      p[3][j] = pv3; sm[3] += pv3;
+    }
+
+    // Compute log2 + reciprocal for 4 rows
+    for (int r = 0; r < 4; r++) {
+      ls[r] = mx_ilog2((uint64_t)sm[r]);
+      inv_sm[r] = (((uint64_t)1 << (ls[r] + MX_FRAC)) + ((uint64_t)sm[r] >> 1)) / (uint64_t)sm[r];
+    }
+
+    // Scale computation: iterate over groups, process all 4 rows per group
+    for (int g = 0; g < GROUPS_S; g++) {
+      int jstart = g * 32;
+      int jend = (g + 1) * 32;
+
+      for (int r = 0; r < 4; r++) {
+        int row = i + r;
+        int64_t gmax = 0;
+        for (int j = jstart; j < jend; j++) if (p[r][j] > gmax) gmax = p[r][j];
+        if (gmax == 0) {
+          P_scales[g][row] = 0;
+          for (int j = jstart; j < jend; j++) P_q[row][j] = 0;
+          continue;
+        }
+        int e = mx_ilog2((uint64_t)gmax) - ls[r] - MX_P_TARGET_LOG2;
+        P_scales[g][row] = (uint8_t)(e + 127);
+        for (int j = jstart; j < jend; j++)
+          P_q[row][j] = mx_ienc_fp8(p[r][j], inv_sm[r], ls[r], e);
+      }
+    }
+  }
+
+  // ---- 3) O = P @ V on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+    gemmini_mx_load_scales((uint64_t)&V_scales_col, sizeof(V_scales_col), 1);
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) { int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM); }
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) { int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM); }
+    gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+    gemmini_fence();
+  }
+}
+''',
+score=672193,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'CPU/host data staging detected (0 memcpy, ~3 scalar copy loops). Host staging is typically the dominant cost on this accelerator and autocomp cannot speed it up directly: mvin tiles STRIDED straight from the source DRAM arrays instead of copying through a host buffer, and keep partial sums in shared memory (bf16 accumulate) rather than accumulating on the CPU.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''## Strategy: Fuse the Softmax CPU Loop into Vectorized 4-Row Batches and Eliminate Redundant BF16 Unpacking Passes
+
+### Identification of the Bottleneck
+
+Looking at the profiled code, the dominant cost is **step 2: the CPU-side integer softmax loop**. The original code has a structural inefficiency in how it unpacks and processes the BF16 output from step 1:
+
+**Current structure:**
+1. **First pass** over `S1_hw[i][j/4]` — unpacks BF16 words and stores into `q[4][ATT_S]` (a large stack-allocated array of `int64_t`), while computing row maxima.
+2. **Second pass** over `q[4][ATT_S]` — computes `mx_iexp` and stores into `p[4][ATT_S]` (another large stack array), while summing.
+3. **Third pass** for scale/encode — reads back `p[4][ATT_S]` per group.
+
+With `ATT_S` large, `q[4][ATT_S]` and `p[4][ATT_S]` are large stack allocations of `int64_t`. For example if `ATT_S = 128`, that is `4 × 128 × 8 = 4096` bytes per array, `8 KB` total on the stack. These arrays blow the L1 data cache and are read/written multiple times: **the bottleneck is three separate passes over memory that could be reduced to two**.
+
+### The Strategy: Merge the iexp+sum Pass Into the Unpack+Max Pass Using a Two-Pass Algorithm
+
+The key insight is that computing softmax requires knowing the row maximum before computing exponentials — but we can **eliminate the intermediate `q[][]` storage entirely** by doing two passes directly over the *packed BF16 words in `S1_hw`* rather than over an unpacked `int64_t` buffer.
+
+**Proposed structure:**
+1. **Pass 1** over `S1_hw[i][j/4]` — unpack BF16 words, compute row maxima `mq[4]`. **Do not store `q[][]`.**
+2. **Pass 2** over `S1_hw[i][j/4]` — re-unpack BF16 words, compute `mx_iexp(val - mq[r])` on the fly, accumulate `sm[r]`, and compute scale/encode **directly per group** without storing `p[][]`.
+
+This eliminates the `p[4][ATT_S]` array entirely and replaces the `q[4][ATT_S]` array with nothing (we re-read from `S1_hw` which is already in L1/L2 because it was just written and is much smaller in uint64 packing: `ATT_S × ATT_S / 4` bytes vs `4 × ATT_S × 8` bytes per 4-row batch).
+
+### Why This Reduces Latency
+
+- **Eliminated one large intermediate buffer**: `q[4][ATT_S]` of `int64_t` is replaced by re-reading the already-cached packed `S1_hw` words. Since `S1_hw` stores 4 BF16 values per `uint64_t`, it is `4×` more compact than the unpacked `int64_t` array, fitting better in cache.
+- **Eliminated `p[4][ATT_S]`**: The per-group max and encode loop that read back `p[]` now runs inline during pass 2, so we never materialize `p[]` to memory at all.
+- **Pass 2 combines iexp, sum, group-max, and encode** in one sweep: for each group `g` in pass 2, we can compute `iexp` values, track the group max, accumulate the sum, and after finishing the group call `mx_ienc_fp8` — all without a third pass.
+- **Reduced stack pressure**: Eliminating two `4 × ATT_S` arrays of `int64_t` from the stack reduces register spills and cache pressure.
+
+### Concrete Code Change Plan
+
+```
+Pass 1: scan S1_hw rows i..i+3, unpack BF16 → ibf16, track mq[4].
+         (no q[][] storage)
+
+Pass 2: scan S1_hw rows i..i+3 again in group-sized chunks of 32 columns:
+  for g in 0..GROUPS_S:
+    for r in 0..4:
+      gmax_exp[r] = 0
+    for j in g*32..(g+1)*32:
+      for r in 0..4:
+        val = unpack S1_hw[i+r][j/4] at slot j%4   // likely already in cache
+        ev = mx_iexp(ibf16(val) - mq[r])
+        sm[r] += ev
+        if ev > gmax_exp[r]: gmax_exp[r] = ev
+    for r in 0..4:
+      compute e from gmax_exp[r], ls[r], set P_scales[g][i+r]
+      re-encode 32 values for P_q[i+r][g*32..(g+1)*32]
+         (third mini-pass only over 32 values, hot in L1)
+```
+
+The `ls[r]` and `inv_sm[r]` values needed for encoding depend on the full-row sum `sm[r]`, so the encode sub-pass for each group must wait until `sm[r]` is finalized. This means pass 2 first accumulates all groups\' `sm[r]`, then a third mini-pass encodes. However, `sm[r]` can be computed in pass 2 (the iexp+sum pass), and the encode mini-pass only touches 32 values (one cache line worth), so it is negligible.
+
+The net effect: **two passes over `S1_hw` (compact, cached) instead of two passes over large `int64_t` arrays plus one pass over `S1_hw`**, reducing memory traffic by approximately `2 × 4 × ATT_S × 8` bytes per 4-row batch while keeping the same computational work.''',
+code='''void solution(void) {
+  // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&Q_scales_row, sizeof(Q_scales_row), 0);
+    gemmini_mx_load_scales((uint64_t)&KT_scales_col, sizeof(KT_scales_col), 1);
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) {
+        int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+      }
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) {
+        int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+      }
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+    gemmini_fence();
+  }
+
+  // ---- 2) FLOAT-FREE integer softmax + fp8 requant (4 rows at a time) ----
+  // Optimized: eliminates q[4][ATT_S] and p[4][ATT_S] stack arrays.
+  // Pass 1: scan packed S1_hw to find per-row maxima mq[4].
+  // Pass 2: re-scan packed S1_hw, compute iexp on-the-fly per group,
+  //         track group exp-max and accumulate sm[r], then encode inline.
+  // Only a small 32-element buffer is needed per group per row for re-encoding.
+  for (int i = 0; i < ATT_S; i += 4) {
+    int64_t mq[4];
+    int64_t sm[4];
+    int ls[4];
+    uint64_t inv_sm[4];
+
+    // --- Pass 1: find per-row max over all j ---
+    mq[0] = mq[1] = mq[2] = mq[3] = -((int64_t)1 << 62);
+
+    for (int j = 0; j < ATT_S; j += 4) {
+      uint64_t w0 = S1_hw[i + 0][j / 4];
+      uint64_t w1 = S1_hw[i + 1][j / 4];
+      uint64_t w2 = S1_hw[i + 2][j / 4];
+      uint64_t w3 = S1_hw[i + 3][j / 4];
+      for (int l = 0; l < 4; l++) {
+        int shift = l * 16;
+        int64_t qq0 = mx_ibf16_to_q((uint16_t)((w0 >> shift) & 0xFFFF));
+        int64_t qq1 = mx_ibf16_to_q((uint16_t)((w1 >> shift) & 0xFFFF));
+        int64_t qq2 = mx_ibf16_to_q((uint16_t)((w2 >> shift) & 0xFFFF));
+        int64_t qq3 = mx_ibf16_to_q((uint16_t)((w3 >> shift) & 0xFFFF));
+        if (qq0 > mq[0]) mq[0] = qq0;
+        if (qq1 > mq[1]) mq[1] = qq1;
+        if (qq2 > mq[2]) mq[2] = qq2;
+        if (qq3 > mq[3]) mq[3] = qq3;
+      }
+    }
+
+    // --- Pass 2: compute iexp per element, accumulate sm[r] per row ---
+    // Also track per-group exp-max for scale computation.
+    // We process group-by-group so we can encode inline after sm is known.
+    // However sm[r] requires the full-row sum before encoding is possible.
+    // Strategy: single pass over all j to compute sm[r], tracking per-group
+    // running max of exp values stored in a compact int64_t gmax_exp[GROUPS_S][4].
+    // Then a short re-encode pass (32 values per group, hot in L1) does encoding.
+
+    int64_t gmax_exp[GROUPS_S][4];
+    // exp values buffer: only 32 per group per row, reused across groups
+    // We store all exp values grouped: exp_buf[g][r][32]
+    // This is GROUPS_S * 4 * 32 * 8 bytes = e.g. for ATT_S=128, GROUPS_S=4:
+    // 4*4*32*8 = 4096 bytes — fits in L1
+    int64_t exp_buf[GROUPS_S][4][32];
+
+    sm[0] = sm[1] = sm[2] = sm[3] = 0;
+    for (int g = 0; g < GROUPS_S; g++) {
+      gmax_exp[g][0] = gmax_exp[g][1] = gmax_exp[g][2] = gmax_exp[g][3] = 0;
+    }
+
+    for (int j = 0; j < ATT_S; j++) {
+      int g = j / 32;
+      int jloc = j % 32;
+      // Unpack from packed S1_hw: word index = j/4, slot = j%4
+      int widx = j / 4;
+      int slot = j % 4;
+      int shift = slot * 16;
+
+      uint64_t w0 = S1_hw[i + 0][widx];
+      uint64_t w1 = S1_hw[i + 1][widx];
+      uint64_t w2 = S1_hw[i + 2][widx];
+      uint64_t w3 = S1_hw[i + 3][widx];
+
+      int64_t ev0 = mx_iexp(mx_ibf16_to_q((uint16_t)((w0 >> shift) & 0xFFFF)) - mq[0]);
+      int64_t ev1 = mx_iexp(mx_ibf16_to_q((uint16_t)((w1 >> shift) & 0xFFFF)) - mq[1]);
+      int64_t ev2 = mx_iexp(mx_ibf16_to_q((uint16_t)((w2 >> shift) & 0xFFFF)) - mq[2]);
+      int64_t ev3 = mx_iexp(mx_ibf16_to_q((uint16_t)((w3 >> shift) & 0xFFFF)) - mq[3]);
+
+      exp_buf[g][0][jloc] = ev0;
+      exp_buf[g][1][jloc] = ev1;
+      exp_buf[g][2][jloc] = ev2;
+      exp_buf[g][3][jloc] = ev3;
+
+      sm[0] += ev0; sm[1] += ev1; sm[2] += ev2; sm[3] += ev3;
+
+      if (ev0 > gmax_exp[g][0]) gmax_exp[g][0] = ev0;
+      if (ev1 > gmax_exp[g][1]) gmax_exp[g][1] = ev1;
+      if (ev2 > gmax_exp[g][2]) gmax_exp[g][2] = ev2;
+      if (ev3 > gmax_exp[g][3]) gmax_exp[g][3] = ev3;
+    }
+
+    // Compute log2 + reciprocal for 4 rows
+    for (int r = 0; r < 4; r++) {
+      ls[r] = mx_ilog2((uint64_t)sm[r]);
+      inv_sm[r] = (((uint64_t)1 << (ls[r] + MX_FRAC)) + ((uint64_t)sm[r] >> 1)) / (uint64_t)sm[r];
+    }
+
+    // --- Encode pass: per group, per row, using buffered exp values ---
+    // exp_buf[g][r][0..31] is hot in L1 (32 * 4 * 8 = 1024 bytes per group)
+    for (int g = 0; g < GROUPS_S; g++) {
+      int jstart = g * 32;
+      for (int r = 0; r < 4; r++) {
+        int row = i + r;
+        int64_t gmax = gmax_exp[g][r];
+        if (gmax == 0) {
+          P_scales[g][row] = 0;
+          for (int jloc = 0; jloc < 32; jloc++)
+            P_q[row][jstart + jloc] = 0;
+          continue;
+        }
+        int e = mx_ilog2((uint64_t)gmax) - ls[r] - MX_P_TARGET_LOG2;
+        P_scales[g][row] = (uint8_t)(e + 127);
+        for (int jloc = 0; jloc < 32; jloc++)
+          P_q[row][jstart + jloc] = mx_ienc_fp8(exp_buf[g][r][jloc], inv_sm[r], ls[r], e);
+      }
+    }
+  }
+
+  // ---- 3) O = P @ V on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+    gemmini_mx_load_scales((uint64_t)&V_scales_col, sizeof(V_scales_col), 1);
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) {
+        int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+      }
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) {
+        int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+      }
+    gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+    gemmini_fence();
+  }
+}
+''',
+score=None,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='us.anthropic.claude-sonnet-4-6',
+code_gen_model='us.anthropic.claude-sonnet-4-6',
+stdout=None,
+stderr=None)

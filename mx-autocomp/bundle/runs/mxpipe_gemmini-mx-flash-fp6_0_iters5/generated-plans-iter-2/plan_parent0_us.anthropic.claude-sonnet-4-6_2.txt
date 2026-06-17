@@ -1,0 +1,114 @@
+# Optimization Plan: Strategy 7 — Precompute and Store `expf2(row[j] - mn)` Results
+
+## Analysis of the Inefficiency
+
+In the current code, the softmax CPU loop processes each attention row `i` as follows:
+
+```c
+for(int i=0;i<ATT_S;i++){
+  float row[BT], mn=Mr[i];
+  // Pass 1: find max, fill row[] from bf16
+  for(int j=0;j<BT;j++){
+    uint16_t b=(uint16_t)((S1_hw[i][j/4]>>((j%4)*16))&0xFFFF);
+    row[j]=bf16f(b);
+    if(row[j]>mn)mn=row[j];
+  }
+  float corr=expf2(Mr[i]-mn), ln=Lr[i]*corr;
+  // Pass 2: compute exp(row[j]-mn), accumulate ln
+  for(int j=0;j<BT;j++){row[j]=expf2(row[j]-mn);ln+=row[j];}
+  for(int d=0;d<ATT_D;d++)O_acc[i][d]*=corr;
+  Mr[i]=mn; Lr[i]=ln;
+  // Pass 3: re-read row[] (already in registers/stack) to quantize into P_hw
+  for(int g=0;g<GBT;g++){
+    float gm=0.f;
+    for(int j=g*32;j<g*32+32;j++){float a=fabsf2(row[j]);if(a>gm)gm=a;}
+    int e=0;if(gm>0.f)e=fexp2(gm/0.5f)+1;
+    float isc=pow2i(-e);P_scales[g][i]=(uint8_t)(e+127);
+    for(int j=g*32;j<g*32+32;j++){
+      uint8_t idx=enc(row[j]*isc);
+      if((i&1)==0)P_hw[i>>1][j]=(P_hw[i>>1][j]&0xF0)|idx;
+      else P_hw[i>>1][j]=(P_hw[i>>1][j]&0x0F)|(idx<<4);
+    }
+  }
+}
+```
+
+The values `row[j] = expf2(row[j] - mn)` are computed in pass 2 and are already live in the `row[]` buffer when pass 3 executes. **This is actually already correct structurally** — `row[]` is reused. However, the deeper inefficiency is that the code does **three sequential loops over `j` from 0 to BT** for each row `i`:
+
+1. **Loop 1** (find max): reads S1_hw BF16 words, unpacks, finds max.
+2. **Loop 2** (exp + ln): iterates over all `j` again computing `expf2`.
+3. **Loop 3** (quantize groups): iterates over all `j` again, with an inner group scan for max, then a second scan for encoding.
+
+The strategy-7 insight is: **pass 3's group-max scan and pass 3's encoding scan over `row[j]` are two separate passes over the same already-computed data**. By fusing the group-max computation into pass 2 (while `expf2` is being computed), we eliminate one full pass over `row[]` in pass 3. Additionally, `row[]` is a stack array of `BT` floats — keeping it in registers and scanning it fewer times reduces memory traffic.
+
+More concretely: currently the quantization loop (pass 3) does **two inner loops** per group `g`:
+- First inner loop: scan `j` in `[g*32, g*32+32)` to find `gm = max |row[j]|`
+- Second inner loop: scan same `j` range again to encode each element
+
+These two inner loops **both re-read `row[g*32 .. g*32+32]`**, which is `BT` floats total across all groups, re-read twice = 2×BT float reads in pass 3 alone. By precomputing the per-group max values `gm[g]` during pass 2 (the exp loop), we reduce pass 3 to a **single inner loop** per group, halving the re-reads of `row[]` in pass 3.
+
+## Concrete Change
+
+### What to do:
+
+1. Allocate a small `float gm[GBT]` array initialized to 0 **before** the exp loop.
+2. Inside pass 2 (the `expf2` loop over all `j`), simultaneously update `gm[j/32]` with `fabsf2(row[j])` **after** writing `row[j] = expf2(row[j]-mn)`. This fuses the group-max scan into the already-necessary exp pass at zero extra iteration overhead.
+3. In pass 3, **remove the first inner loop** (group-max scan) entirely, using the already-computed `gm[g]` values directly to compute `e` and `isc`. Keep only the encoding inner loop.
+
+### Before (pass 2 + pass 3):
+
+```c
+// Pass 2: exp + ln accumulation
+for(int j=0;j<BT;j++){row[j]=expf2(row[j]-mn);ln+=row[j];}
+
+// Pass 3: quantize
+for(int g=0;g<GBT;g++){
+  float gm=0.f;
+  for(int j=g*32;j<g*32+32;j++){float a=fabsf2(row[j]);if(a>gm)gm=a;} // <-- REDUNDANT PASS
+  int e=0;if(gm>0.f)e=fexp2(gm/0.5f)+1;
+  float isc=pow2i(-e);P_scales[g][i]=(uint8_t)(e+127);
+  for(int j=g*32;j<g*32+32;j++){
+    uint8_t idx=enc(row[j]*isc);
+    if((i&1)==0)P_hw[i>>1][j]=(P_hw[i>>1][j]&0xF0)|idx;
+    else P_hw[i>>1][j]=(P_hw[i>>1][j]&0x0F)|(idx<<4);
+  }
+}
+```
+
+### After (fused pass 2 + simplified pass 3):
+
+```c
+// Pass 2: exp + ln accumulation + group-max precompute (fused)
+float gm[GBT];
+for(int g=0;g<GBT;g++) gm[g]=0.f;
+for(int j=0;j<BT;j++){
+  row[j]=expf2(row[j]-mn);
+  ln+=row[j];
+  float a=fabsf2(row[j]);
+  if(a>gm[j/32]) gm[j/32]=a;  // accumulate group max while exp values are hot
+}
+
+// Pass 3: quantize (single loop per group — group-max already known)
+for(int g=0;g<GBT;g++){
+  int e=0;if(gm[g]>0.f)e=fexp2(gm[g]/0.5f)+1;
+  float isc=pow2i(-e);P_scales[g][i]=(uint8_t)(e+127);
+  for(int j=g*32;j<g*32+32;j++){
+    uint8_t idx=enc(row[j]*isc);
+    if((i&1)==0)P_hw[i>>1][j]=(P_hw[i>>1][j]&0xF0)|idx;
+    else P_hw[i>>1][j]=(P_hw[i>>1][j]&0x0F)|(idx<<4);
+  }
+}
+```
+
+## Why This Is Safe (Semantic Equivalence)
+
+- `expf2(x)` is non-negative for all real `x`, so `fabsf2(row[j]) == row[j]` after the exp step. The group max is identical whether computed in a separate loop or fused.
+- `gm[g]` is initialized to 0 and updated monotonically — same result as the original separate max-scan.
+- The encoding logic and `P_scales` computation are unchanged; only the order of computation is rearranged.
+- No Gemmini instructions are reordered; this change is purely in the CPU softmax section between the two hardware matmuls.
+
+## Expected Benefit
+
+For `ATT_S=128, BT=64, GBT=BT/32=2`:
+- Original: pass 2 iterates `BT=64` times; pass 3 iterates `2 × (32 + 32) = 128` times per row → **192 iterations** over `row[]` per row.
+- Optimized: fused pass 2+max iterates `BT=64` times; pass 3 iterates `2 × 32 = 64` times per row → **128 iterations** over `row[]` per row — a **33% reduction** in total `row[]` traversal work in this section, across all `ATT_S=128` rows and all `NT` tokens.

@@ -1,0 +1,224 @@
+{'correct': False}
+Prev latency: 1596
+New latency: N/A
+Plan: An elegant and hardware-specific strategy to optimize the execution time of this MX matmul kernel is **Dual-Port DMA Parallelization with Interleaved Dispatching**.
+
+### Explanation of the Strategy
+
+In the baseline implementation, both matrix $A$ and matrix $B$ are loaded using the default `gemmini_extended_mvin` instruction, which maps to DMA Port 0. This serializes all memory transfers because the RISC-V host CPU queues all DMA requests in a single hardware queue.
+
+However, the Gemmini hardware architecture features **three independent DMA channels/ports** (`mvin`, `mvin2`, and `mvin3`) that can process memory transfers in parallel. 
+
+By applying this strategy:
+1. We configure **DMA Port 0** specifically for the layout and stride of Matrix $A$.
+2. We configure **DMA Port 1** specifically for the layout and stride of Matrix $B$ using `gemmini_extended3_config_ld` with `id = 1`.
+3. We replace B's loading calls with `gemmini_extended_mvin2`, which maps to DMA Port 1.
+4. We **interleave the dispatch of A and B tile transfers** in a single outer loop over the $K$ dimension. 
+
+This interleaving fills both hardware DMA queues simultaneously. The Gemmini memory controller can then overlap the DRAM access latencies of both ports in parallel, maximizing memory bandwidth utilization and eliminating the serialization bottleneck.
+
+---
+
+### Optimized Code
+
+```c
+// Optimized MX matmul kernel (32x256x256, fp8:e4m3).
+void solution(void) {
+  // 1. Configure Gemmini execution format
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // 2. Load scale factors
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // 3. Configure independent DMA ports
+  // Configure DMA Port 0 for Matrix A (stride K)
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+  // Configure DMA Port 1 for Matrix B (stride N)
+  gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+  // 4. Interleaved Multi-Port DMA loading of A and B tiles
+  // By interleaving mvin (Port 0) and mvin2 (Port 1), we fill both hardware DMA queues
+  // simultaneously, allowing the hardware to parallelize and overlap DRAM transfers.
+  for (int k = 0; k < tiles_K; k++) {
+    // Load A tiles for this k (using Port 0)
+    for (int i = 0; i < tiles_I; i++) {
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    }
+    // Load B tiles for this k (using Port 1)
+    for (int j = 0; j < tiles_J; j++) {
+      gemmini_extended_mvin2((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + j * DIM),
+                             b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+    }
+  }
+
+  // 5. Configure store and requantizer
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // 6. Fused hardware loop execution over scratchpad tiles
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, PAD_I, PAD_J, PAD_K, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // 7. Drain output from shared memory and synchronize
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, REAL_M * MATMUL_N);
+  gemmini_fence();
+}
+```
+
+CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED baseline MX matmul kernel (32x256x256, fp8:e4m3).
+void solution(void) {
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // mvin FULL padded tiles (block-aligned DIMxDIM -> 1 cheap DMA/tile; sub-DIM mvin is modeled
+  // as a slow/unaligned path on spike). The header holds padded data; loop_ws pad_I/pad_J/pad_K
+  // then skip the padded rows/cols in COMPUTE, so the real M*N*K result is unaffected.
+  gemmini_config_ld(MATMUL_K * sizeof(elem_t));      // A rows: stride K
+  for (int i = 0; i < tiles_I; i++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+  // B tile (k,j) = B_in[k][j] (stride N) into scratchpad slot (k*tiles_J + j) —
+  // the layout gemmini\'s MX loop reads (B_t = B_sp + (k*TJ + j)*DIM). The old
+  // (j*tiles_K + k) slot was a transpose: correct only when N==K, garbage otherwise.
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t));      // B rows: stride N
+  for (int j = 0; j < tiles_J; j++)
+    for (int k = 0; k < tiles_K; k++)
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + j * DIM),
+                            b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, PAD_I, PAD_J, PAD_K, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+  // read only the REAL rows (smem row stride is the padded MATMUL_N); padded rows stay 0 (memset).
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, REAL_M * MATMUL_N);
+  gemmini_fence();
+}
+''',
+score=1596,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'Accelerator-bound: compute and data-movement look balanced; tune tiling / scratchpad occupancy for more overlap.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''An elegant and hardware-specific strategy to optimize the execution time of this MX matmul kernel is **Dual-Port DMA Parallelization with Interleaved Dispatching**.
+
+### Explanation of the Strategy
+
+In the baseline implementation, both matrix $A$ and matrix $B$ are loaded using the default `gemmini_extended_mvin` instruction, which maps to DMA Port 0. This serializes all memory transfers because the RISC-V host CPU queues all DMA requests in a single hardware queue.
+
+However, the Gemmini hardware architecture features **three independent DMA channels/ports** (`mvin`, `mvin2`, and `mvin3`) that can process memory transfers in parallel. 
+
+By applying this strategy:
+1. We configure **DMA Port 0** specifically for the layout and stride of Matrix $A$.
+2. We configure **DMA Port 1** specifically for the layout and stride of Matrix $B$ using `gemmini_extended3_config_ld` with `id = 1`.
+3. We replace B\'s loading calls with `gemmini_extended_mvin2`, which maps to DMA Port 1.
+4. We **interleave the dispatch of A and B tile transfers** in a single outer loop over the $K$ dimension. 
+
+This interleaving fills both hardware DMA queues simultaneously. The Gemmini memory controller can then overlap the DRAM access latencies of both ports in parallel, maximizing memory bandwidth utilization and eliminating the serialization bottleneck.
+
+---
+
+### Optimized Code
+
+```c
+// Optimized MX matmul kernel (32x256x256, fp8:e4m3).
+void solution(void) {
+  // 1. Configure Gemmini execution format
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // 2. Load scale factors
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // 3. Configure independent DMA ports
+  // Configure DMA Port 0 for Matrix A (stride K)
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+  // Configure DMA Port 1 for Matrix B (stride N)
+  gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+
+  // 4. Interleaved Multi-Port DMA loading of A and B tiles
+  // By interleaving mvin (Port 0) and mvin2 (Port 1), we fill both hardware DMA queues
+  // simultaneously, allowing the hardware to parallelize and overlap DRAM transfers.
+  for (int k = 0; k < tiles_K; k++) {
+    // Load A tiles for this k (using Port 0)
+    for (int i = 0; i < tiles_I; i++) {
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    }
+    // Load B tiles for this k (using Port 1)
+    for (int j = 0; j < tiles_J; j++) {
+      gemmini_extended_mvin2((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + j * DIM),
+                             b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+    }
+  }
+
+  // 5. Configure store and requantizer
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // 6. Fused hardware loop execution over scratchpad tiles
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, PAD_I, PAD_J, PAD_K, a_base, BANK_NUM * BANK_ROWS, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // 7. Drain output from shared memory and synchronize
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, REAL_M * MATMUL_N);
+  gemmini_fence();
+}
+```''',
+code='''// Optimized MX matmul kernel (32x256x256, fp8:e4m3).
+void solution(void) {
+  // 1. Configure Gemmini execution format
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // 2. Load scale factors
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // 3. Configure DMA port for both matrices
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+
+  // 4. Sequential DMA loading of A and B tiles using single port
+  // Calculate B base address at the top of scratchpad
+  uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+  
+  for (int k = 0; k < tiles_K; k++) {
+    // Load A tiles for this k
+    for (int i = 0; i < tiles_I; i++) {
+      gemmini_extended_mvin((void*)(((elem_t*)A_in) + i * DIM * MATMUL_K + k * DIM),
+                            a_base + (i * tiles_K + k) * DIM, DIM, DIM);
+    }
+    // Load B tiles for this k
+    for (int j = 0; j < tiles_J; j++) {
+      gemmini_extended_mvin((void*)(((elem_t*)B_in) + (k * DIM) * MATMUL_N + j * DIM),
+                            b_base + (k * tiles_J + j) * DIM, DIM, DIM);
+    }
+  }
+
+  // 5. Configure store and requantizer
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+
+  // 6. Fused hardware loop execution over scratchpad tiles
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, PAD_I, PAD_J, PAD_K, a_base, b_base, 0,
+                       SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // 7. Drain output from shared memory and synchronize
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, REAL_M * MATMUL_N);
+  gemmini_fence();
+}
+''',
+score=inf,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='gemini-3.5-flash',
+code_gen_model='qwen.qwen3-coder-480b-a35b-v1:0',
+stdout='Kernel produced an INCORRECT/illegal result on spike. Diagnostic (fix this before optimizing):\nGEMMINI LOOP_WS ILLEGAL: a loop_ws input was loaded via mvin2/mvin3 (port != 0); the MX loop_ws_spad reads A/B from the port-0 scratchpad region on RTL, so this is spike-correct but RTL-WRONG (the fp8-128 dual-port-B winner). Use single-port gemmini_extended_mvin for loop_ws inputs. -- spike<->RTL dual-port divergence (task #38)\nGemmini extension configured with:\ndim = 16',
+stderr=None)

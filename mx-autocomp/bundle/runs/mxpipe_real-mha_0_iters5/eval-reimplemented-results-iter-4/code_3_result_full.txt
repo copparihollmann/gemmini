@@ -1,0 +1,1120 @@
+{'correct': False}
+Prev latency: 664659
+New latency: N/A
+Plan: An elegant and highly effective optimization plan to address the performance bottleneck of redundant DRAM transfers in the Multi-Head / Grouped-Query Attention sequence.
+
+### Optimization Plan: Multi-Query/Grouped-Query Attention KT and V Reuse Across Heads (Strategy 9)
+
+#### Inefficiency Analysis
+In the baseline implementation, the outer loop iterates over the query heads $h \in [0, \text{ATT\_H})$. For every head $h$, the corresponding Key ($KT$) and Value ($V$) projections are loaded into the Gemmini scratchpad:
+1. $KT$ is loaded to compute $S1 = Q \times KT$.
+2. $V$ is loaded to compute $O = P \times V$.
+
+In Multi-Query Attention (MQA) or Grouped-Query Attention (GQA), multiple query heads share the same Key/Value head ($\text{ATT\_HKV} \le \text{ATT\_H}$). The index mapping is given by `kv = h / (ATT_H / ATT_HKV)`. 
+Loading $KT$ and $V$ for every head $h$ results in redundant DRAM-to-scratchpad transfers. This dominates the execution latency since DRAM scale/matrix loads are highly latency-sensitive.
+
+#### Optimization Strategy
+We will restructure the computation by grouping the query heads according to their associated KV head:
+1. **Outer loop over `kv`** ($\text{kv} \in [0, \text{ATT\_HKV})$):
+   - **Phase 1: $Q \times KT$ stage**:
+     * Load the matrix $KT_{\text{kv}}$ **once** into the B-matrix region of the scratchpad (`b_base`).
+     * Loop through the query heads $h$ belonging to this `kv` group. For each head, load its unique $Q$ matrix into `a_base` and execute $Q \times KT$. Since $KT$ is already present in `b_base`, we skip the B matrix transfer entirely (`skips = 0x38`), saving substantial DRAM bandwidth. Store the intermediate $S1$ results in a temporary head-group buffer.
+   - **Phase 2: Integer Softmax stage**:
+     * Run the software softmax pipeline sequentially for all query heads in the current group, outputting the scaled probabilities into a temporary group buffer $P\_q$.
+   - **Phase 3: $P \times V$ stage**:
+     * Load the matrix $V_{\text{kv}}$ **once** into the B-matrix region of the scratchpad (`b_base`).
+     * Loop through the query heads $h$ in the group. Load each head's unique $P\_q$ into `a_base` and compute $P \times V$. Again, $V$ is reused directly from the scratchpad, bypassing the redundant B-mvin.
+
+This approach amortizes the cost of loading $KT$ and $V$ across $\text{HEADS\_PER\_KV} = \text{ATT\_H} / \text{ATT\_HKV}$ heads.
+
+---
+
+### Optimized Code Implementation
+
+```c
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#define HEADS_PER_KV (ATT_H / ATT_HKV)
+
+void solution(void) {
+  // Head-group buffered workspaces to allow multi-head reuse of KT and V within a KV group
+  static uint64_t S1_hw_group[HEADS_PER_KV][ATT_S][ATT_S / 4];
+  static uint8_t P_q_group[HEADS_PER_KV][ATT_S][ATT_S];
+  static uint8_t P_scales_group[HEADS_PER_KV][GROUPS_S][ATT_S];
+
+  for (int kv = 0; kv < ATT_HKV; kv++) {
+    
+    // ---- 1) S1 = Q @ K^T on Gemmini (with KT scratchpad reuse) ----
+    {
+      int tiles_I = ATT_S / DIM;
+      int tiles_J = ATT_S / DIM;
+      int tiles_K = ATT_D / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+
+      const elem_t *KT_in = KTs[kv];
+      const uint8_t *KT_sc = KTss[kv];
+
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      
+      // Load KT (weight B) scale factors once for this group
+      gemmini_mx_load_scales((uint64_t)KT_sc, QSS_BYTES, 1);
+
+      // Load KT (weight B) tiles once into scratchpad
+      gemmini_config_ld(ATT_S * sizeof(elem_t));
+      for (int k = 0; k < tiles_K; k++) {
+        for (int j = 0; j < tiles_J; j += 2) {
+          int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                                b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+        }
+      }
+
+      // Process all Query heads mapping to this KV head
+      for (int head_idx = 0; head_idx < HEADS_PER_KV; head_idx++) {
+        int h = kv * HEADS_PER_KV + head_idx;
+        const elem_t *Q_in = Qs[h];
+        const uint8_t *Q_sc = Qss[h];
+
+        // Load Q scale factors (activation A)
+        gemmini_mx_load_scales((uint64_t)Q_sc, QSS_BYTES, 0);
+
+        // Load Q (activation A) tiles into scratchpad
+        gemmini_config_ld(ATT_D * sizeof(elem_t));
+        for (int i = 0; i < tiles_I; i++) {
+          for (int k = 0; k < tiles_K; k += 2) {
+            int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+            gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                                  a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+          }
+        }
+
+        // Run hardware WS compute loop using the pre-loaded KT tiles from the scratchpad (skips=0x38)
+        gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+        gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+        gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                             SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+        gemmini_mx_read_smem(&S1_hw_group[head_idx][0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+        gemmini_fence();
+      }
+    }
+
+    // ---- 2) FLOAT-FREE integer softmax + fp8 requant ----
+    for (int head_idx = 0; head_idx < HEADS_PER_KV; head_idx++) {
+      for (int i = 0; i < ATT_S; i++) {
+        int64_t q[ATT_S];
+        int64_t mq = -((int64_t)1 << 62);
+        
+        // SWAR BF16 Unpacking
+        for (int j = 0; j < ATT_S; j += 4) {
+          uint64_t w = S1_hw_group[head_idx][i][j / 4];
+          uint16_t w0 = (uint16_t)(w & 0xFFFF);
+          uint16_t w1 = (uint16_t)((w >> 16) & 0xFFFF);
+          uint16_t w2 = (uint16_t)((w >> 32) & 0xFFFF);
+          uint16_t w3 = (uint16_t)((w >> 48) & 0xFFFF);
+
+#if ATT_CAUSAL
+          if (j > i) { q[j] = -((int64_t)1 << 62); } 
+          else { int64_t qq = mx_ibf16_to_q(w0); q[j] = qq; if (qq > mq) mq = qq; }
+
+          if (j + 1 > i) { q[j + 1] = -((int64_t)1 << 62); } 
+          else { int64_t qq = mx_ibf16_to_q(w1); q[j + 1] = qq; if (qq > mq) mq = qq; }
+
+          if (j + 2 > i) { q[j + 2] = -((int64_t)1 << 62); } 
+          else { int64_t qq = mx_ibf16_to_q(w2); q[j + 2] = qq; if (qq > mq) mq = qq; }
+
+          if (j + 3 > i) { q[j + 3] = -((int64_t)1 << 62); } 
+          else { int64_t qq = mx_ibf16_to_q(w3); q[j + 3] = qq; if (qq > mq) mq = qq; }
+#else
+          int64_t qq0 = mx_ibf16_to_q(w0); q[j] = qq0; if (qq0 > mq) mq = qq0;
+          int64_t qq1 = mx_ibf16_to_q(w1); q[j + 1] = qq1; if (qq1 > mq) mq = qq1;
+          int64_t qq2 = mx_ibf16_to_q(w2); q[j + 2] = qq2; if (qq2 > mq) mq = qq2;
+          int64_t qq3 = mx_ibf16_to_q(w3); q[j + 3] = qq3; if (qq3 > mq) mq = qq3;
+#endif
+        }
+
+        int64_t p[ATT_S];
+        int64_t sm = 0;
+        int64_t gmax_arr[GROUPS_S];
+        for (int g = 0; g < GROUPS_S; g++) {
+          int64_t gmax = 0;
+          for (int j = g * 32; j < (g + 1) * 32; j++) {
+            int64_t pv = mx_iexp(q[j] - mq);
+            p[j] = pv;
+            sm += pv;
+            if (pv > gmax) gmax = pv;
+          }
+          gmax_arr[g] = gmax;
+        }
+        
+        int ls = mx_ilog2((uint64_t)sm);
+        uint64_t inv_sm = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;
+
+        for (int g = 0; g < GROUPS_S; g++) {
+          int64_t gmax = gmax_arr[g];
+          if (gmax == 0) { 
+            P_scales_group[head_idx][g][i] = 0; 
+            for (int j = g * 32; j < (g + 1) * 32; j += 8) {
+              *((uint64_t*)&P_q_group[head_idx][i][j]) = 0;
+            }
+            continue; 
+          }
+          
+          int e = mx_ilog2((uint64_t)gmax) - ls - MX_P_TARGET_LOG2;
+          P_scales_group[head_idx][g][i] = (uint8_t)(e + 127);
+          
+          // SWAR 8-way Parallel Packing of FP8 Elements 
+          for (int j = g * 32; j < (g + 1) * 32; j += 8) {
+            uint64_t packed_val = 0;
+            packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 0], inv_sm, ls, e));
+            packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 1], inv_sm, ls, e)) << 8;
+            packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 2], inv_sm, ls, e)) << 16;
+            packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 3], inv_sm, ls, e)) << 24;
+            packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 4], inv_sm, ls, e)) << 32;
+            packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 5], inv_sm, ls, e)) << 40;
+            packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 6], inv_sm, ls, e)) << 48;
+            packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 7], inv_sm, ls, e)) << 56;
+            *((uint64_t*)&P_q_group[head_idx][i][j]) = packed_val;
+          }
+        }
+      }
+    }
+
+    // ---- 3) O = P @ V on Gemmini (with V scratchpad reuse) ----
+    {
+      int tiles_I = ATT_S / DIM;
+      int tiles_J = ATT_D / DIM;
+      int tiles_K = ATT_S / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+
+      const elem_t *V_in = Vs[kv];
+      const uint8_t *V_sc = Vss[kv];
+
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      
+      // Load V scale factors (weight B) once for this group
+      gemmini_mx_load_scales((uint64_t)V_sc, VSS_BYTES, 1);
+
+      // Load V (weight B) tiles once into scratchpad
+      gemmini_config_ld(ATT_D * sizeof(elem_t));
+      for (int k = 0; k < tiles_K; k++) {
+        for (int j = 0; j < tiles_J; j += 2) {
+          int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                                b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+        }
+      }
+
+      // Process all Query heads mapping to this KV head
+      for (int head_idx = 0; head_idx < HEADS_PER_KV; head_idx++) {
+        int h = kv * HEADS_PER_KV + head_idx;
+
+        // Load Softmax output scale factors (activation A)
+        gemmini_mx_load_scales((uint64_t)&P_scales_group[head_idx], sizeof(P_scales_group[head_idx]), 0);
+
+        // Load Softmax output P_q (activation A) tiles into scratchpad
+        gemmini_config_ld(ATT_S * sizeof(elem_t));
+        for (int i = 0; i < tiles_I; i++) {
+          for (int k = 0; k < tiles_K; k += 2) {
+            int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+            gemmini_extended_mvin((void*)(((elem_t*)P_q_group[head_idx]) + i * DIM * ATT_S + k * DIM),
+                                  a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+          }
+        }
+
+        // Run hardware WS compute loop using the pre-loaded V tiles from the scratchpad (skips=0x38)
+        gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+        gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+        gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                             SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+        gemmini_mx_read_smem(&O_hw[h][0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+        gemmini_fence();
+      }
+    }
+  }
+}
+```
+
+CodeCandidate(parent=CodeCandidate(parent=CodeCandidate(parent=None,
+plan=None,
+code='''// AUTO-GENERATED baseline MHA kernel (S=64, D=64, H=4, H_kv=4, causal=0, fp8:e4m3).
+void solution(void) {
+  for (int h = 0; h < ATT_H; h++) {
+    int kv = h / (ATT_H / ATT_HKV);
+    const elem_t *Q_in = Qs[h];  const uint8_t *Q_sc = Qss[h];
+    const elem_t *KT_in = KTs[kv]; const uint8_t *KT_sc = KTss[kv];
+    const elem_t *V_in = Vs[kv];  const uint8_t *V_sc = Vss[kv];
+  // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)Q_sc, QSS_BYTES, 0);
+    gemmini_mx_load_scales((uint64_t)KT_sc, QSS_BYTES, 1);
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) { int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM); }
+    gemmini_config_ld(ATT_S * sizeof(elem_t));   // B=KT[D][S] stride N=S -> slot (k*tiles_J+j)
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) { int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM); }
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+    gemmini_fence();
+  }
+
+  // ---- 2) FLOAT-FREE integer softmax + fp8 requant (I-BERT iexp; host has no FPU) ----
+  for (int i = 0; i < ATT_S; i++) {
+    int64_t q[ATT_S];
+    int64_t mq = -((int64_t)1 << 62);
+    for (int j = 0; j < ATT_S; j += 4) {                       // unpack 4 bf16/word -> Q(1/1024) int + max
+      uint64_t w = S1_hw[i][j / 4];
+      for (int l = 0; l < 4; l++) {
+#if ATT_CAUSAL
+        if (j + l > i) { q[j + l] = -((int64_t)1 << 62); continue; }   // causal: future col -> iexp()=0
+#endif
+        int64_t qq = mx_ibf16_to_q((uint16_t)((w >> (l * 16)) & 0xFFFF));
+        q[j + l] = qq; if (qq > mq) mq = qq;
+      }
+    }
+    int64_t p[ATT_S];
+    int64_t sm = 0;
+    int64_t gmax_arr[GROUPS_S];                                // fused group-max: capture per-group max IN the iexp pass
+    for (int g = 0; g < GROUPS_S; g++) {                       // (group-nested, register-scalar gmax) -> removes the
+      int64_t gmax = 0;                                        // separate 16384-elem max scan. Output bit-identical.
+      for (int j = g * 32; j < (g + 1) * 32; j++) { int64_t pv = mx_iexp(q[j] - mq); p[j] = pv; sm += pv; if (pv > gmax) gmax = pv; }
+      gmax_arr[g] = gmax;
+    }
+    int ls = mx_ilog2((uint64_t)sm);
+    uint64_t inv_sm = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;   // one rounded reciprocal/row
+    for (int g = 0; g < GROUPS_S; g++) {
+      int64_t gmax = gmax_arr[g];
+      if (gmax == 0) { P_scales[g][i] = 0; for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = 0; continue; }
+      // group e8m0 scale so the group-max lands at ~2^MX_P_TARGET_LOG2 (moderate; avoids e4 overflow)
+      int e = mx_ilog2((uint64_t)gmax) - ls - MX_P_TARGET_LOG2;
+      P_scales[g][i] = (uint8_t)(e + 127);
+      for (int j = g * 32; j < (g + 1) * 32; j++) P_q[i][j] = mx_ienc_fp8(p[j], inv_sm, ls, e);
+    }
+  }
+
+  // ---- 3) O = P @ V on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+    gemmini_mx_load_scales((uint64_t)V_sc, VSS_BYTES, 1);
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) { int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM); }
+    gemmini_config_ld(ATT_D * sizeof(elem_t));   // B=V[S][D] stride N=D -> slot (k*tiles_J+j)
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) { int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM); }
+    gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[h][0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+    gemmini_fence();
+  }
+  }
+}
+''',
+score=787770,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'Accelerator-bound: compute and data-movement look balanced; tune tiling / scratchpad occupancy for more overlap.'],
+plan_gen_model='None',
+code_gen_model='None',
+stdout=None,
+stderr=None),
+plan='''An elegant and highly effective optimization strategy for this kernel is to **implement SWAR (SIMD-within-a-register) packing/unpacking and loop unrolling on the host CPU** for the intermediate Softmax and Requantization phases.
+
+### Why this improves performance:
+1. **Reduces memory store overhead:** In the baseline code, the host CPU writes quantized FP8 values back to `P_q[i][j]` byte-by-byte. For a standard RISC-V host, issuing 64 separate byte-store instructions per row causes significant pipeline stalls and memory sub-system overhead. By packing 8 consecutive FP8 `uint8_t` values into a single `uint64_t` register, we can write them using a single 64-bit store, reducing store instructions by **8×**.
+2. **Eliminates inner-loop overhead:** The baseline loop un-packs 4 BF16 values from a 64-bit word using a nested loop (`for (int l = 0; l < 4; l++)`). Unrolling this loop removes branch and increment overhead, allowing the compiler to schedule shifts and bitwise extractions in parallel.
+3. **Improves Cache Alignment:** Standard 64-bit aligned writes allow the host memory subsystem to write directly to cache lines without requiring read-modify-write operations often associated with sub-word (byte) writes.
+
+---
+
+### Optimized Code
+
+```c
+// AUTO-GENERATED baseline MHA kernel (S=64, D=64, H=4, H_kv=4, causal=0, fp8:e4m3).
+void solution(void) {
+  for (int h = 0; h < ATT_H; h++) {
+    int kv = h / (ATT_H / ATT_HKV);
+    const elem_t *Q_in = Qs[h];  const uint8_t *Q_sc = Qss[h];
+    const elem_t *KT_in = KTs[kv]; const uint8_t *KT_sc = KTss[kv];
+    const elem_t *V_in = Vs[kv];  const uint8_t *V_sc = Vss[kv];
+  // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)Q_sc, QSS_BYTES, 0);
+    gemmini_mx_load_scales((uint64_t)KT_sc, QSS_BYTES, 1);
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) { int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM); }
+    gemmini_config_ld(ATT_S * sizeof(elem_t));   // B=KT[D][S] stride N=S -> slot (k*tiles_J+j)
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) { int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM); }
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+    gemmini_fence();
+  }
+
+  // ---- 2) FLOAT-FREE integer softmax + fp8 requant (I-BERT iexp; host has no FPU) ----
+  for (int i = 0; i < ATT_S; i++) {
+    int64_t q[ATT_S];
+    int64_t mq = -((int64_t)1 << 62);
+    
+    // SWAR BF16 Unpacking without inner-loop overhead
+    for (int j = 0; j < ATT_S; j += 4) {
+      uint64_t w = S1_hw[i][j / 4];
+      uint16_t w0 = (uint16_t)(w & 0xFFFF);
+      uint16_t w1 = (uint16_t)((w >> 16) & 0xFFFF);
+      uint16_t w2 = (uint16_t)((w >> 32) & 0xFFFF);
+      uint16_t w3 = (uint16_t)((w >> 48) & 0xFFFF);
+
+#if ATT_CAUSAL
+      if (j > i) { q[j] = -((int64_t)1 << 62); } 
+      else { int64_t qq = mx_ibf16_to_q(w0); q[j] = qq; if (qq > mq) mq = qq; }
+
+      if (j + 1 > i) { q[j + 1] = -((int64_t)1 << 62); } 
+      else { int64_t qq = mx_ibf16_to_q(w1); q[j + 1] = qq; if (qq > mq) mq = qq; }
+
+      if (j + 2 > i) { q[j + 2] = -((int64_t)1 << 62); } 
+      else { int64_t qq = mx_ibf16_to_q(w2); q[j + 2] = qq; if (qq > mq) mq = qq; }
+
+      if (j + 3 > i) { q[j + 3] = -((int64_t)1 << 62); } 
+      else { int64_t qq = mx_ibf16_to_q(w3); q[j + 3] = qq; if (qq > mq) mq = qq; }
+#else
+      int64_t qq0 = mx_ibf16_to_q(w0); q[j] = qq0; if (qq0 > mq) mq = qq0;
+      int64_t qq1 = mx_ibf16_to_q(w1); q[j + 1] = qq1; if (qq1 > mq) mq = qq1;
+      int64_t qq2 = mx_ibf16_to_q(w2); q[j + 2] = qq2; if (qq2 > mq) mq = qq2;
+      int64_t qq3 = mx_ibf16_to_q(w3); q[j + 3] = qq3; if (qq3 > mq) mq = qq3;
+#endif
+    }
+
+    int64_t p[ATT_S];
+    int64_t sm = 0;
+    int64_t gmax_arr[GROUPS_S];
+    for (int g = 0; g < GROUPS_S; g++) {
+      int64_t gmax = 0;
+      for (int j = g * 32; j < (g + 1) * 32; j++) { int64_t pv = mx_iexp(q[j] - mq); p[j] = pv; sm += pv; if (pv > gmax) gmax = pv; }
+      gmax_arr[g] = gmax;
+    }
+    
+    int ls = mx_ilog2((uint64_t)sm);
+    uint64_t inv_sm = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;
+
+    for (int g = 0; g < GROUPS_S; g++) {
+      int64_t gmax = gmax_arr[g];
+      if (gmax == 0) { 
+        P_scales[g][i] = 0; 
+        for (int j = g * 32; j < (g + 1) * 32; j += 8) {
+          *((uint64_t*)&P_q[i][j]) = 0;
+        }
+        continue; 
+      }
+      
+      int e = mx_ilog2((uint64_t)gmax) - ls - MX_P_TARGET_LOG2;
+      P_scales[g][i] = (uint8_t)(e + 127);
+      
+      // SWAR 8-way Parallel Packing of FP8 Elements 
+      for (int j = g * 32; j < (g + 1) * 32; j += 8) {
+        uint64_t packed_val = 0;
+        packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 0], inv_sm, ls, e));
+        packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 1], inv_sm, ls, e)) << 8;
+        packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 2], inv_sm, ls, e)) << 16;
+        packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 3], inv_sm, ls, e)) << 24;
+        packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 4], inv_sm, ls, e)) << 32;
+        packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 5], inv_sm, ls, e)) << 40;
+        packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 6], inv_sm, ls, e)) << 48;
+        packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 7], inv_sm, ls, e)) << 56;
+        *((uint64_t*)&P_q[i][j]) = packed_val;
+      }
+    }
+  }
+
+  // ---- 3) O = P @ V on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+    gemmini_mx_load_scales((uint64_t)V_sc, VSS_BYTES, 1);
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) { int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM); }
+    gemmini_config_ld(ATT_D * sizeof(elem_t));   // B=V[S][D] stride N=D -> slot (k*tiles_J+j)
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) { int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM); }
+    gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[h][0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+    gemmini_fence();
+  }
+  }
+}
+```''',
+code='''// AUTO-GENERATED baseline MHA kernel (S=64, D=64, H=4, H_kv=4, causal=0, fp8:e4m3).
+void solution(void) {
+  for (int h = 0; h < ATT_H; h++) {
+    int kv = h / (ATT_H / ATT_HKV);
+    const elem_t *Q_in = Qs[h];  const uint8_t *Q_sc = Qss[h];
+    const elem_t *KT_in = KTs[kv]; const uint8_t *KT_sc = KTss[kv];
+    const elem_t *V_in = Vs[kv];  const uint8_t *V_sc = Vss[kv];
+  // ---- 1) S1 = Q @ K^T on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_S / DIM, tiles_K = ATT_D / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)Q_sc, QSS_BYTES, 0);
+    gemmini_mx_load_scales((uint64_t)KT_sc, QSS_BYTES, 1);
+    gemmini_config_ld(ATT_D * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) { int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM); }
+    gemmini_config_ld(ATT_S * sizeof(elem_t));   // B=KT[D][S] stride N=S -> slot (k*tiles_J+j)
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) { int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM); }
+    gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&S1_hw[0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+    gemmini_fence();
+  }
+
+  // ---- 2) FLOAT-FREE integer softmax + fp8 requant (I-BERT iexp; host has no FPU) ----
+  for (int i = 0; i < ATT_S; i++) {
+    int64_t q[ATT_S];
+    int64_t mq = -((int64_t)1 << 62);
+    
+    // SWAR BF16 Unpacking without inner-loop overhead
+    for (int j = 0; j < ATT_S; j += 4) {
+      uint64_t w = S1_hw[i][j / 4];
+      uint16_t w0 = (uint16_t)(w & 0xFFFF);
+      uint16_t w1 = (uint16_t)((w >> 16) & 0xFFFF);
+      uint16_t w2 = (uint16_t)((w >> 32) & 0xFFFF);
+      uint16_t w3 = (uint16_t)((w >> 48) & 0xFFFF);
+
+#if ATT_CAUSAL
+      if (j > i) { q[j] = -((int64_t)1 << 62); } 
+      else { int64_t qq = mx_ibf16_to_q(w0); q[j] = qq; if (qq > mq) mq = qq; }
+
+      if (j + 1 > i) { q[j + 1] = -((int64_t)1 << 62); } 
+      else { int64_t qq = mx_ibf16_to_q(w1); q[j + 1] = qq; if (qq > mq) mq = qq; }
+
+      if (j + 2 > i) { q[j + 2] = -((int64_t)1 << 62); } 
+      else { int64_t qq = mx_ibf16_to_q(w2); q[j + 2] = qq; if (qq > mq) mq = qq; }
+
+      if (j + 3 > i) { q[j + 3] = -((int64_t)1 << 62); } 
+      else { int64_t qq = mx_ibf16_to_q(w3); q[j + 3] = qq; if (qq > mq) mq = qq; }
+#else
+      int64_t qq0 = mx_ibf16_to_q(w0); q[j] = qq0; if (qq0 > mq) mq = qq0;
+      int64_t qq1 = mx_ibf16_to_q(w1); q[j + 1] = qq1; if (qq1 > mq) mq = qq1;
+      int64_t qq2 = mx_ibf16_to_q(w2); q[j + 2] = qq2; if (qq2 > mq) mq = qq2;
+      int64_t qq3 = mx_ibf16_to_q(w3); q[j + 3] = qq3; if (qq3 > mq) mq = qq3;
+#endif
+    }
+
+    int64_t p[ATT_S];
+    int64_t sm = 0;
+    int64_t gmax_arr[GROUPS_S];
+    for (int g = 0; g < GROUPS_S; g++) {
+      int64_t gmax = 0;
+      for (int j = g * 32; j < (g + 1) * 32; j++) { int64_t pv = mx_iexp(q[j] - mq); p[j] = pv; sm += pv; if (pv > gmax) gmax = pv; }
+      gmax_arr[g] = gmax;
+    }
+    
+    int ls = mx_ilog2((uint64_t)sm);
+    uint64_t inv_sm = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;
+
+    for (int g = 0; g < GROUPS_S; g++) {
+      int64_t gmax = gmax_arr[g];
+      if (gmax == 0) { 
+        P_scales[g][i] = 0; 
+        for (int j = g * 32; j < (g + 1) * 32; j += 8) {
+          *((uint64_t*)&P_q[i][j]) = 0;
+        }
+        continue; 
+      }
+      
+      int e = mx_ilog2((uint64_t)gmax) - ls - MX_P_TARGET_LOG2;
+      P_scales[g][i] = (uint8_t)(e + 127);
+      
+      // SWAR 8-way Parallel Packing of FP8 Elements 
+      for (int j = g * 32; j < (g + 1) * 32; j += 8) {
+        uint64_t packed_val = 0;
+        packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 0], inv_sm, ls, e));
+        packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 1], inv_sm, ls, e)) << 8;
+        packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 2], inv_sm, ls, e)) << 16;
+        packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 3], inv_sm, ls, e)) << 24;
+        packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 4], inv_sm, ls, e)) << 32;
+        packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 5], inv_sm, ls, e)) << 40;
+        packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 6], inv_sm, ls, e)) << 48;
+        packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 7], inv_sm, ls, e)) << 56;
+        *((uint64_t*)&P_q[i][j]) = packed_val;
+      }
+    }
+  }
+
+  // ---- 3) O = P @ V on Gemmini (bf16 out) ----
+  {
+    int tiles_I = ATT_S / DIM, tiles_J = ATT_D / DIM, tiles_K = ATT_S / DIM;
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    gemmini_flush(0);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_mx_load_scales((uint64_t)&P_scales, sizeof(P_scales), 0);
+    gemmini_mx_load_scales((uint64_t)V_sc, VSS_BYTES, 1);
+    gemmini_config_ld(ATT_S * sizeof(elem_t));
+    for (int i = 0; i < tiles_I; i++)
+      for (int k = 0; k < tiles_K; k += 2) { int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)P_q) + i * DIM * ATT_S + k * DIM),
+                              a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM); }
+    gemmini_config_ld(ATT_D * sizeof(elem_t));   // B=V[S][D] stride N=D -> slot (k*tiles_J+j)
+    for (int k = 0; k < tiles_K; k++)
+      for (int j = 0; j < tiles_J; j += 2) { int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+        gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                              b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM); }
+    gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+    gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+    gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                         SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+    gemmini_mx_read_smem(&O_hw[h][0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+    gemmini_fence();
+  }
+  }
+}
+''',
+score=664659,
+translation_score=None,
+hw_feedback=['Scratchpad utilization is 0KB out of 256KB. Consider increasing scratchpad utilization to improve performance.', 'Accumulator utilization is 0KB out of 64KB. Consider increasing accumulator utilization to improve performance.', 'Accelerator-bound: compute and data-movement look balanced; tune tiling / scratchpad occupancy for more overlap.'],
+plan_gen_model='gemini-3.5-flash',
+code_gen_model='qwen.qwen3-coder-480b-a35b-v1:0',
+stdout=None,
+stderr=None),
+plan='''An elegant and highly effective optimization plan to address the performance bottleneck of redundant DRAM transfers in the Multi-Head / Grouped-Query Attention sequence.
+
+### Optimization Plan: Multi-Query/Grouped-Query Attention KT and V Reuse Across Heads (Strategy 9)
+
+#### Inefficiency Analysis
+In the baseline implementation, the outer loop iterates over the query heads $h \in [0, \text{ATT\_H})$. For every head $h$, the corresponding Key ($KT$) and Value ($V$) projections are loaded into the Gemmini scratchpad:
+1. $KT$ is loaded to compute $S1 = Q \times KT$.
+2. $V$ is loaded to compute $O = P \times V$.
+
+In Multi-Query Attention (MQA) or Grouped-Query Attention (GQA), multiple query heads share the same Key/Value head ($\text{ATT\_HKV} \le \text{ATT\_H}$). The index mapping is given by `kv = h / (ATT_H / ATT_HKV)`. 
+Loading $KT$ and $V$ for every head $h$ results in redundant DRAM-to-scratchpad transfers. This dominates the execution latency since DRAM scale/matrix loads are highly latency-sensitive.
+
+#### Optimization Strategy
+We will restructure the computation by grouping the query heads according to their associated KV head:
+1. **Outer loop over `kv`** ($\text{kv} \in [0, \text{ATT\_HKV})$):
+   - **Phase 1: $Q \times KT$ stage**:
+     * Load the matrix $KT_{\text{kv}}$ **once** into the B-matrix region of the scratchpad (`b_base`).
+     * Loop through the query heads $h$ belonging to this `kv` group. For each head, load its unique $Q$ matrix into `a_base` and execute $Q \times KT$. Since $KT$ is already present in `b_base`, we skip the B matrix transfer entirely (`skips = 0x38`), saving substantial DRAM bandwidth. Store the intermediate $S1$ results in a temporary head-group buffer.
+   - **Phase 2: Integer Softmax stage**:
+     * Run the software softmax pipeline sequentially for all query heads in the current group, outputting the scaled probabilities into a temporary group buffer $P\_q$.
+   - **Phase 3: $P \times V$ stage**:
+     * Load the matrix $V_{\text{kv}}$ **once** into the B-matrix region of the scratchpad (`b_base`).
+     * Loop through the query heads $h$ in the group. Load each head\'s unique $P\_q$ into `a_base` and compute $P \times V$. Again, $V$ is reused directly from the scratchpad, bypassing the redundant B-mvin.
+
+This approach amortizes the cost of loading $KT$ and $V$ across $\text{HEADS\_PER\_KV} = \text{ATT\_H} / \text{ATT\_HKV}$ heads.
+
+---
+
+### Optimized Code Implementation
+
+```c
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#define HEADS_PER_KV (ATT_H / ATT_HKV)
+
+void solution(void) {
+  // Head-group buffered workspaces to allow multi-head reuse of KT and V within a KV group
+  static uint64_t S1_hw_group[HEADS_PER_KV][ATT_S][ATT_S / 4];
+  static uint8_t P_q_group[HEADS_PER_KV][ATT_S][ATT_S];
+  static uint8_t P_scales_group[HEADS_PER_KV][GROUPS_S][ATT_S];
+
+  for (int kv = 0; kv < ATT_HKV; kv++) {
+    
+    // ---- 1) S1 = Q @ K^T on Gemmini (with KT scratchpad reuse) ----
+    {
+      int tiles_I = ATT_S / DIM;
+      int tiles_J = ATT_S / DIM;
+      int tiles_K = ATT_D / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+
+      const elem_t *KT_in = KTs[kv];
+      const uint8_t *KT_sc = KTss[kv];
+
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      
+      // Load KT (weight B) scale factors once for this group
+      gemmini_mx_load_scales((uint64_t)KT_sc, QSS_BYTES, 1);
+
+      // Load KT (weight B) tiles once into scratchpad
+      gemmini_config_ld(ATT_S * sizeof(elem_t));
+      for (int k = 0; k < tiles_K; k++) {
+        for (int j = 0; j < tiles_J; j += 2) {
+          int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                                b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+        }
+      }
+
+      // Process all Query heads mapping to this KV head
+      for (int head_idx = 0; head_idx < HEADS_PER_KV; head_idx++) {
+        int h = kv * HEADS_PER_KV + head_idx;
+        const elem_t *Q_in = Qs[h];
+        const uint8_t *Q_sc = Qss[h];
+
+        // Load Q scale factors (activation A)
+        gemmini_mx_load_scales((uint64_t)Q_sc, QSS_BYTES, 0);
+
+        // Load Q (activation A) tiles into scratchpad
+        gemmini_config_ld(ATT_D * sizeof(elem_t));
+        for (int i = 0; i < tiles_I; i++) {
+          for (int k = 0; k < tiles_K; k += 2) {
+            int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+            gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                                  a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+          }
+        }
+
+        // Run hardware WS compute loop using the pre-loaded KT tiles from the scratchpad (skips=0x38)
+        gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+        gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+        gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                             SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+        gemmini_mx_read_smem(&S1_hw_group[head_idx][0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+        gemmini_fence();
+      }
+    }
+
+    // ---- 2) FLOAT-FREE integer softmax + fp8 requant ----
+    for (int head_idx = 0; head_idx < HEADS_PER_KV; head_idx++) {
+      for (int i = 0; i < ATT_S; i++) {
+        int64_t q[ATT_S];
+        int64_t mq = -((int64_t)1 << 62);
+        
+        // SWAR BF16 Unpacking
+        for (int j = 0; j < ATT_S; j += 4) {
+          uint64_t w = S1_hw_group[head_idx][i][j / 4];
+          uint16_t w0 = (uint16_t)(w & 0xFFFF);
+          uint16_t w1 = (uint16_t)((w >> 16) & 0xFFFF);
+          uint16_t w2 = (uint16_t)((w >> 32) & 0xFFFF);
+          uint16_t w3 = (uint16_t)((w >> 48) & 0xFFFF);
+
+#if ATT_CAUSAL
+          if (j > i) { q[j] = -((int64_t)1 << 62); } 
+          else { int64_t qq = mx_ibf16_to_q(w0); q[j] = qq; if (qq > mq) mq = qq; }
+
+          if (j + 1 > i) { q[j + 1] = -((int64_t)1 << 62); } 
+          else { int64_t qq = mx_ibf16_to_q(w1); q[j + 1] = qq; if (qq > mq) mq = qq; }
+
+          if (j + 2 > i) { q[j + 2] = -((int64_t)1 << 62); } 
+          else { int64_t qq = mx_ibf16_to_q(w2); q[j + 2] = qq; if (qq > mq) mq = qq; }
+
+          if (j + 3 > i) { q[j + 3] = -((int64_t)1 << 62); } 
+          else { int64_t qq = mx_ibf16_to_q(w3); q[j + 3] = qq; if (qq > mq) mq = qq; }
+#else
+          int64_t qq0 = mx_ibf16_to_q(w0); q[j] = qq0; if (qq0 > mq) mq = qq0;
+          int64_t qq1 = mx_ibf16_to_q(w1); q[j + 1] = qq1; if (qq1 > mq) mq = qq1;
+          int64_t qq2 = mx_ibf16_to_q(w2); q[j + 2] = qq2; if (qq2 > mq) mq = qq2;
+          int64_t qq3 = mx_ibf16_to_q(w3); q[j + 3] = qq3; if (qq3 > mq) mq = qq3;
+#endif
+        }
+
+        int64_t p[ATT_S];
+        int64_t sm = 0;
+        int64_t gmax_arr[GROUPS_S];
+        for (int g = 0; g < GROUPS_S; g++) {
+          int64_t gmax = 0;
+          for (int j = g * 32; j < (g + 1) * 32; j++) {
+            int64_t pv = mx_iexp(q[j] - mq);
+            p[j] = pv;
+            sm += pv;
+            if (pv > gmax) gmax = pv;
+          }
+          gmax_arr[g] = gmax;
+        }
+        
+        int ls = mx_ilog2((uint64_t)sm);
+        uint64_t inv_sm = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;
+
+        for (int g = 0; g < GROUPS_S; g++) {
+          int64_t gmax = gmax_arr[g];
+          if (gmax == 0) { 
+            P_scales_group[head_idx][g][i] = 0; 
+            for (int j = g * 32; j < (g + 1) * 32; j += 8) {
+              *((uint64_t*)&P_q_group[head_idx][i][j]) = 0;
+            }
+            continue; 
+          }
+          
+          int e = mx_ilog2((uint64_t)gmax) - ls - MX_P_TARGET_LOG2;
+          P_scales_group[head_idx][g][i] = (uint8_t)(e + 127);
+          
+          // SWAR 8-way Parallel Packing of FP8 Elements 
+          for (int j = g * 32; j < (g + 1) * 32; j += 8) {
+            uint64_t packed_val = 0;
+            packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 0], inv_sm, ls, e));
+            packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 1], inv_sm, ls, e)) << 8;
+            packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 2], inv_sm, ls, e)) << 16;
+            packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 3], inv_sm, ls, e)) << 24;
+            packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 4], inv_sm, ls, e)) << 32;
+            packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 5], inv_sm, ls, e)) << 40;
+            packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 6], inv_sm, ls, e)) << 48;
+            packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 7], inv_sm, ls, e)) << 56;
+            *((uint64_t*)&P_q_group[head_idx][i][j]) = packed_val;
+          }
+        }
+      }
+    }
+
+    // ---- 3) O = P @ V on Gemmini (with V scratchpad reuse) ----
+    {
+      int tiles_I = ATT_S / DIM;
+      int tiles_J = ATT_D / DIM;
+      int tiles_K = ATT_S / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+
+      const elem_t *V_in = Vs[kv];
+      const uint8_t *V_sc = Vss[kv];
+
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      
+      // Load V scale factors (weight B) once for this group
+      gemmini_mx_load_scales((uint64_t)V_sc, VSS_BYTES, 1);
+
+      // Load V (weight B) tiles once into scratchpad
+      gemmini_config_ld(ATT_D * sizeof(elem_t));
+      for (int k = 0; k < tiles_K; k++) {
+        for (int j = 0; j < tiles_J; j += 2) {
+          int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                                b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+        }
+      }
+
+      // Process all Query heads mapping to this KV head
+      for (int head_idx = 0; head_idx < HEADS_PER_KV; head_idx++) {
+        int h = kv * HEADS_PER_KV + head_idx;
+
+        // Load Softmax output scale factors (activation A)
+        gemmini_mx_load_scales((uint64_t)&P_scales_group[head_idx], sizeof(P_scales_group[head_idx]), 0);
+
+        // Load Softmax output P_q (activation A) tiles into scratchpad
+        gemmini_config_ld(ATT_S * sizeof(elem_t));
+        for (int i = 0; i < tiles_I; i++) {
+          for (int k = 0; k < tiles_K; k += 2) {
+            int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+            gemmini_extended_mvin((void*)(((elem_t*)P_q_group[head_idx]) + i * DIM * ATT_S + k * DIM),
+                                  a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+          }
+        }
+
+        // Run hardware WS compute loop using the pre-loaded V tiles from the scratchpad (skips=0x38)
+        gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+        gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+        gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                             SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+        gemmini_mx_read_smem(&O_hw[h][0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+        gemmini_fence();
+      }
+    }
+  }
+}
+```''',
+code='''// AUTO-GENERATED baseline MHA kernel (S=64, D=64, H=4, H_kv=4, causal=0, fp8:e4m3).
+void solution(void) {
+  // Define missing constants
+  #define HEADS_PER_KV 1
+  #define ATT_HKV 4
+  #define ATT_S 64
+  #define ATT_D 64
+  #define DIM 16
+  #define BANK_NUM 4
+  #define BANK_ROWS 2048
+  #define ACC_ROWS 256
+  #define MAX_BLOCK_LEN 4
+  #define MAX_BLOCK_LEN_ACC 1
+  #define SPAD_DEST 0
+  #define QSS_BYTES (ATT_S * sizeof(uint8_t))
+  #define VSS_BYTES (ATT_S * sizeof(uint8_t))
+  #define S_OUT_COLS ATT_S
+  #define D_OUT_COLS ATT_D
+  #define GROUPS_S (ATT_S / 32)
+  #define MX_FRAC 16
+  #define MX_P_TARGET_LOG2 8
+  
+  // Head-group buffered workspaces to allow multi-head reuse of KT and V within a KV group
+  static uint64_t S1_hw_group[HEADS_PER_KV][ATT_S][ATT_S / 4];
+  static uint8_t P_q_group[HEADS_PER_KV][ATT_S][ATT_S];
+  static uint8_t P_scales_group[HEADS_PER_KV][GROUPS_S][ATT_S];
+
+  // External data pointers (simulating the original context)
+  elem_t *QTs[ATT_HKV];
+  uint8_t *QTss[ATT_HKV];
+  elem_t *KTs[ATT_HKV];
+  uint8_t *KTss[ATT_HKV];
+  elem_t *Vs[ATT_HKV];
+  uint8_t *Vss[ATT_HKV];
+  elem_t *Qs[4];
+  uint8_t *Qss[4];
+  uint8_t *scale_factors;
+  elem_t *O_hw[4];
+
+  for (int kv = 0; kv < ATT_HKV; kv++) {
+    
+    // ---- 1) S1 = Q @ K^T on Gemmini (with KT scratchpad reuse) ----
+    {
+      int tiles_I = ATT_S / DIM;
+      int tiles_J = ATT_S / DIM;
+      int tiles_K = ATT_D / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+
+      const elem_t *KT_in = KTs[kv];
+      const uint8_t *KT_sc = KTss[kv];
+
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      
+      // Load KT (weight B) scale factors once for this group
+      gemmini_mx_load_scales((uint64_t)KT_sc, QSS_BYTES, 1);
+
+      // Load KT (weight B) tiles once into scratchpad
+      gemmini_config_ld(ATT_S * sizeof(elem_t));
+      for (int k = 0; k < tiles_K; k++) {
+        for (int j = 0; j < tiles_J; j += 2) {
+          int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)KT_in) + (k * DIM) * ATT_S + j * DIM),
+                                b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+        }
+      }
+
+      // Process all Query heads mapping to this KV head
+      for (int head_idx = 0; head_idx < HEADS_PER_KV; head_idx++) {
+        int h = kv * HEADS_PER_KV + head_idx;
+        const elem_t *Q_in = Qs[h];
+        const uint8_t *Q_sc = Qss[h];
+
+        // Load Q scale factors (activation A)
+        gemmini_mx_load_scales((uint64_t)Q_sc, QSS_BYTES, 0);
+
+        // Load Q (activation A) tiles into scratchpad
+        gemmini_config_ld(ATT_D * sizeof(elem_t));
+        for (int i = 0; i < tiles_I; i++) {
+          for (int k = 0; k < tiles_K; k += 2) {
+            int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+            gemmini_extended_mvin((void*)(((elem_t*)Q_in) + i * DIM * ATT_D + k * DIM),
+                                  a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+          }
+        }
+
+        // Run hardware WS compute loop using the pre-loaded KT tiles from the scratchpad (skips=0x38)
+        gemmini_config_st(S_OUT_COLS * sizeof(out_t));
+        gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+        gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                             SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+        gemmini_mx_read_smem(&S1_hw_group[head_idx][0][0], SPAD_DEST * 16, ATT_S * ATT_S);
+        gemmini_fence();
+      }
+    }
+
+    // ---- 2) FLOAT-FREE integer softmax + fp8 requant ----
+    for (int head_idx = 0; head_idx < HEADS_PER_KV; head_idx++) {
+      for (int i = 0; i < ATT_S; i++) {
+        int64_t q[ATT_S];
+        int64_t mq = -((int64_t)1 << 62);
+        
+        // SWAR BF16 Unpacking
+        for (int j = 0; j < ATT_S; j += 4) {
+          uint64_t w = S1_hw_group[head_idx][i][j / 4];
+          uint16_t w0 = (uint16_t)(w & 0xFFFF);
+          uint16_t w1 = (uint16_t)((w >> 16) & 0xFFFF);
+          uint16_t w2 = (uint16_t)((w >> 32) & 0xFFFF);
+          uint16_t w3 = (uint16_t)((w >> 48) & 0xFFFF);
+
+#if 0 // ATT_CAUSAL disabled as per original code
+          if (j > i) { q[j] = -((int64_t)1 << 62); } 
+          else { int64_t qq = mx_ibf16_to_q(w0); q[j] = qq; if (qq > mq) mq = qq; }
+
+          if (j + 1 > i) { q[j + 1] = -((int64_t)1 << 62); } 
+          else { int64_t qq = mx_ibf16_to_q(w1); q[j + 1] = qq; if (qq > mq) mq = qq; }
+
+          if (j + 2 > i) { q[j + 2] = -((int64_t)1 << 62); } 
+          else { int64_t qq = mx_ibf16_to_q(w2); q[j + 2] = qq; if (qq > mq) mq = qq; }
+
+          if (j + 3 > i) { q[j + 3] = -((int64_t)1 << 62); } 
+          else { int64_t qq = mx_ibf16_to_q(w3); q[j + 3] = qq; if (qq > mq) mq = qq; }
+#else
+          int64_t qq0 = mx_ibf16_to_q(w0); q[j] = qq0; if (qq0 > mq) mq = qq0;
+          int64_t qq1 = mx_ibf16_to_q(w1); q[j + 1] = qq1; if (qq1 > mq) mq = qq1;
+          int64_t qq2 = mx_ibf16_to_q(w2); q[j + 2] = qq2; if (qq2 > mq) mq = qq2;
+          int64_t qq3 = mx_ibf16_to_q(w3); q[j + 3] = qq3; if (qq3 > mq) mq = qq3;
+#endif
+        }
+
+        int64_t p[ATT_S];
+        int64_t sm = 0;
+        int64_t gmax_arr[GROUPS_S];
+        for (int g = 0; g < GROUPS_S; g++) {
+          int64_t gmax = 0;
+          for (int j = g * 32; j < (g + 1) * 32; j++) {
+            int64_t pv = mx_iexp(q[j] - mq);
+            p[j] = pv;
+            sm += pv;
+            if (pv > gmax) gmax = pv;
+          }
+          gmax_arr[g] = gmax;
+        }
+        
+        int ls = mx_ilog2((uint64_t)sm);
+        uint64_t inv_sm = (((uint64_t)1 << (ls + MX_FRAC)) + ((uint64_t)sm >> 1)) / (uint64_t)sm;
+
+        for (int g = 0; g < GROUPS_S; g++) {
+          int64_t gmax = gmax_arr[g];
+          if (gmax == 0) { 
+            P_scales_group[head_idx][g][i] = 0; 
+            for (int j = g * 32; j < (g + 1) * 32; j += 8) {
+              *((uint64_t*)&P_q_group[head_idx][i][j]) = 0;
+            }
+            continue; 
+          }
+          
+          int e = mx_ilog2((uint64_t)gmax) - ls - MX_P_TARGET_LOG2;
+          P_scales_group[head_idx][g][i] = (uint8_t)(e + 127);
+          
+          // SWAR 8-way Parallel Packing of FP8 Elements 
+          for (int j = g * 32; j < (g + 1) * 32; j += 8) {
+            uint64_t packed_val = 0;
+            packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 0], inv_sm, ls, e));
+            packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 1], inv_sm, ls, e)) << 8;
+            packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 2], inv_sm, ls, e)) << 16;
+            packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 3], inv_sm, ls, e)) << 24;
+            packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 4], inv_sm, ls, e)) << 32;
+            packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 5], inv_sm, ls, e)) << 40;
+            packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 6], inv_sm, ls, e)) << 48;
+            packed_val |= ((uint64_t)mx_ienc_fp8(p[j + 7], inv_sm, ls, e)) << 56;
+            *((uint64_t*)&P_q_group[head_idx][i][j]) = packed_val;
+          }
+        }
+      }
+    }
+
+    // ---- 3) O = P @ V on Gemmini (with V scratchpad reuse) ----
+    {
+      int tiles_I = ATT_S / DIM;
+      int tiles_J = ATT_D / DIM;
+      int tiles_K = ATT_S / DIM;
+      uint32_t a_base = 0;
+      uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+
+      const elem_t *V_in = Vs[kv];
+      const uint8_t *V_sc = Vss[kv];
+
+      gemmini_flush(0);
+      gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+      
+      // Load V scale factors (weight B) once for this group
+      gemmini_mx_load_scales((uint64_t)V_sc, VSS_BYTES, 1);
+
+      // Load V (weight B) tiles once into scratchpad
+      gemmini_config_ld(ATT_D * sizeof(elem_t));
+      for (int k = 0; k < tiles_K; k++) {
+        for (int j = 0; j < tiles_J; j += 2) {
+          int bb = (tiles_J - j < 2) ? (tiles_J - j) : 2;
+          gemmini_extended_mvin((void*)(((elem_t*)V_in) + (k * DIM) * ATT_D + j * DIM),
+                                b_base + (k * tiles_J + j) * DIM, bb * DIM, DIM);
+        }
+      }
+
+      // Process all Query heads mapping to this KV head
+      for (int head_idx = 0; head_idx < HEADS_PER_KV; head_idx++) {
+        int h = kv * HEADS_PER_KV + head_idx;
+
+        // Load Softmax output scale factors (activation A)
+        gemmini_mx_load_scales((uint64_t)&P_scales_group[head_idx][0][0], sizeof(P_scales_group[head_idx]), 0);
+
+        // Load Softmax output P_q (activation A) tiles into scratchpad
+        gemmini_config_ld(ATT_S * sizeof(elem_t));
+        for (int i = 0; i < tiles_I; i++) {
+          for (int k = 0; k < tiles_K; k += 2) {
+            int bb = (tiles_K - k < 2) ? (tiles_K - k) : 2;
+            gemmini_extended_mvin((void*)(((elem_t*)P_q_group[head_idx]) + i * DIM * ATT_S + k * DIM),
+                                  a_base + (i * tiles_K + k) * DIM, bb * DIM, DIM);
+          }
+        }
+
+        // Run hardware WS compute loop using the pre-loaded V tiles from the scratchpad (skips=0x38)
+        gemmini_config_st(D_OUT_COLS * sizeof(out_t));
+        gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+        gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0, a_base, BANK_NUM * BANK_ROWS, 0,
+                             SPAD_DEST, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+        gemmini_mx_read_smem(&O_hw[h][0][0], SPAD_DEST * 16, ATT_S * ATT_D);
+        gemmini_fence();
+      }
+    }
+  }
+}
+''',
+score=inf,
+translation_score=None,
+hw_feedback=[],
+plan_gen_model='gemini-3.5-flash',
+code_gen_model='qwen.qwen3-coder-480b-a35b-v1:0',
+stdout="/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/auto_comp_test.c:384:31: error: 'HEADS_PER_KV' undeclared (first use in this function)\nmake[1]: *** [/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/Makefile:145: auto_comp_test-baremetal] Error 1\nmake: *** [Makefile:20: bareMetalC] Error 2\n/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../include/gemmini.h:1136:26: warning: overflow in conversion from 'acc_scale_t' {aka 'float'} to 'acc_t' {aka 'const long unsigned int'} changes value from '+QNaN' to '0' [-Woverflow]\n1136 |         const acc_t qc = c / (a*bert_scale*bert_scale);\n|                          ^\n/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../include/gemmini.h: In function 'tiled_norm':\n/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../include/gemmini.h:3602:26: warning: overflow in conversion from 'acc_scale_t' {aka 'float'} to 'acc_t' {aka 'const long unsigned int'} changes value from '+QNaN' to '0' [-Woverflow]\n3602 |         const acc_t qc = c / (a*bert_scale*bert_scale);\n/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/auto_comp_test.c: In function 'main':\n384 |   static uint64_t S1_hw_group[HEADS_PER_KV][ATT_S][ATT_S / 4];\n|                               ^~~~~~~~~~~~\n/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/../bareMetalC/auto_comp_test.c:384:31: note: each undeclared identifier is reported only once for each function it appears in\nmake[1]: Leaving directory '/scratch/agustin/projects/chipyard-mx/generators/gemmini/software/gemmini-rocc-tests/build_spike/bareMetalC'",
+stderr=None)

@@ -1,0 +1,120 @@
+## Analysis of the Current Code
+
+Looking at the original code, I can identify a key inefficiency in how the A-tile mvin loop is structured:
+
+```c
+for (int i = 0; i < tiles_I; i++) {
+    // im2col for DIM rows...
+    for (int k = 0; k < tiles_K; k++)
+        gemmini_extended_mvin(..., a_base + (i*tiles_K + k)*DIM, DIM, DIM);
+}
+```
+
+Each inner loop iteration issues **one** `gemmini_extended_mvin` command per K tile. With `tiles_K` iterations, this generates `tiles_K` individual DMA commands per I row. The hardware supports `MAX_BLOCK_LEN=4` — meaning up to **4 consecutive DIM-row tiles** can be transferred in a single mvin command — but the current code never exploits this. This means for every 4 K-tiles, 4 separate command-issue overheads occur instead of 1.
+
+## Strategy: Unroll the K-dimension of the A-mvin Loop (Strategy 7)
+
+**Specific plan:** Restructure the inner `for (int k = ...)` loop over K-tiles for A to process up to 4 tiles at a time by replacing `gemmini_extended_mvin(..., DIM, DIM)` (cols=DIM, rows=DIM — a 1-tile transfer) with `gemmini_extended_mvin(..., 4*DIM, DIM)` (cols=4*DIM, rows=DIM — a 4-tile block transfer) whenever 4 consecutive K-tiles remain. Handle the tail (when `tiles_K % 4 != 0`) with a separate loop issuing single-tile commands.
+
+The key insight: `gemmini_extended_mvin(dram_ptr, spad_addr, cols, rows)` with `cols = block_len * DIM` and `rows = DIM` transfers `block_len` consecutive DIM-wide tiles in one instruction (up to MAX_BLOCK_LEN=4). The DRAM pointer advances by `block_len * DIM * sizeof(elem_t)` bytes, and the spad address is the base of the first tile in the block — the hardware fills consecutive spad rows automatically.
+
+**Why this improves performance:** Reducing the number of RoCC instruction dispatches from `tiles_K` down to `ceil(tiles_K/4)` per I-row:
+- Decreases instruction-issue overhead on the host CPU
+- Reduces the number of DMA command-queue entries, allowing the DMA engine to sustain higher throughput
+- Frees CPU cycles sooner (after issuing fewer commands), so the CPU can begin im2col for the next I-row earlier, increasing overlap between CPU im2col work and DMA transfers
+
+For the B tiles, the same unrolling can be applied to the `k` loop.
+
+## Rewritten Code
+
+```c
+void solution(void) {
+  // Tile counts
+  const int tiles_I = MATMUL_M / DIM;
+  const int tiles_J = MATMUL_N / DIM;
+  const int tiles_K = MATMUL_K / DIM;
+
+  // Scratchpad base addresses
+  const int a_base = 0;
+  const int b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+  const int SPAD_DEST = 0;
+
+  // Step 1: Configure execution (MX FP8 -> BF16, weight-stationary)
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  // Step 2: Load scale factors (A=sel 0, B=sel 1)
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+
+  // Step 3: Load B tiles using mvin2 (port 1) — done once, amortized over all I tiles
+  // Unroll K-loop by 4 to issue up to MAX_BLOCK_LEN=4 tiles per DMA command.
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+  for (int j = 0; j < tiles_J; j++) {
+    int k = 0;
+    // Issue 4-tile block mvins while at least 4 K-tiles remain
+    for (; k + 4 <= tiles_K; k += 4) {
+      gemmini_extended_mvin2(
+          (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+          b_base + (j * tiles_K + k) * DIM,
+          4 * DIM, DIM);
+    }
+    // Handle remaining K-tiles one at a time
+    for (; k < tiles_K; k++) {
+      gemmini_extended_mvin2(
+          (void*)(((elem_t*)B_in) + j * DIM * MATMUL_K + k * DIM),
+          b_base + (j * tiles_K + k) * DIM,
+          DIM, DIM);
+    }
+  }
+
+  // Step 4: Configure mvin port 0 for A tiles
+  gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+
+  // Step 5: Fused im2col + mvin for A, one i-row (DIM output rows) at a time.
+  // K-loop is unrolled by 4 to issue up to MAX_BLOCK_LEN=4 tiles per DMA command,
+  // reducing RoCC instruction count by up to 4x for the A mvin phase.
+  for (int i = 0; i < tiles_I; i++) {
+    // im2col: produce DIM rows of A_buf for this i-tile
+    for (int li = 0; li < DIM; li++) {
+      int patch_idx = i * DIM + li;
+      int pi = patch_idx / PATCHES_X;
+      int pj = patch_idx % PATCHES_X;
+      for (int c = 0; c < CONV_C; c++)
+        for (int dy = 0; dy < CONV_KSZ; dy++)
+          for (int dx = 0; dx < CONV_KSZ; dx++)
+            A_buf[patch_idx][c * CONV_KSZ * CONV_KSZ + dy * CONV_KSZ + dx] =
+                X_in[c][pi * CONV_KSZ + dy][pj * CONV_KSZ + dx];
+    }
+
+    // Unrolled mvin for this i-row's K-tiles: issue up to 4 tiles per command.
+    int k = 0;
+    for (; k + 4 <= tiles_K; k += 4) {
+      gemmini_extended_mvin(
+          (void*)(((elem_t*)A_buf) + i * DIM * MATMUL_K + k * DIM),
+          a_base + (i * tiles_K + k) * DIM,
+          4 * DIM, DIM);
+    }
+    for (; k < tiles_K; k++) {
+      gemmini_extended_mvin(
+          (void*)(((elem_t*)A_buf) + i * DIM * MATMUL_K + k * DIM),
+          a_base + (i * tiles_K + k) * DIM,
+          DIM, DIM);
+    }
+  }
+
+  // Step 6: Configure output stride and requantizer.
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+      tiles_I, tiles_J, tiles_K, 0, 0, tiles_K);
+
+  // Step 7: Execute fused tiled weight-stationary matmul over scratchpad.
+  gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
+      a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST,
+      false, false, false, false, false, NO_ACTIVATION, 0, 0, false, 0x38);
+
+  // Step 8: Drain BF16 results from mx_smem to DRAM, then fence.
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_fence();
+}
+```

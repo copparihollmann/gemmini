@@ -1,0 +1,108 @@
+void solution(void) {
+  gemmini_flush(0);
+
+  // Step 1: Configure execution - FP8 format (act=0, wgt=0, out=3 for BF16)
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      1, 1, 0, 0, false, 0, 0, 3, 0);
+
+  const int tiles_I = BLK / DIM;   // tiles along I (rows of A block)
+  const int tiles_J = BLK / DIM;   // tiles along J (rows of B block, i.e. cols of output)
+  const int tiles_K = MATMUL_K / DIM; // tiles along K (shared dimension)
+
+  // Scratchpad layout:
+  // A at bottom: a_base = 0, occupies tiles_I * tiles_K * DIM rows
+  // B at top: b_base = BANK_NUM*BANK_ROWS - tiles_J*tiles_K*DIM
+  const uint32_t a_base = 0;
+  const uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_J * tiles_K * DIM;
+
+  // Verify no overlap
+  // A uses rows [0, tiles_I*tiles_K*DIM)
+  // B uses rows [b_base, BANK_NUM*BANK_ROWS)
+  // Must have: tiles_I*tiles_K*DIM <= b_base
+
+  const int SPAD_DEST = 0; // Output destination in mx_smem (word offset)
+
+  for (int i0 = 0; i0 < BLOCKS_M; i0++) {
+    for (int j0 = 0; j0 < BLOCKS_N; j0++) {
+
+      // Stage A block (BLK rows x MATMUL_K cols) into A_blk
+      for (int r = 0; r < BLK; r++)
+        memcpy(&A_blk[r][0], &A_in[i0 * BLK + r][0], MATMUL_K * sizeof(elem_t));
+
+      // Stage B block (BLK rows x MATMUL_K cols) into B_blk
+      for (int r = 0; r < BLK; r++)
+        memcpy(&B_blk[r][0], &B_in[j0 * BLK + r][0], MATMUL_K * sizeof(elem_t));
+
+      // Gather per-32-group scales for this block
+      for (int g = 0; g < MATMUL_K / 32; g++) {
+        memcpy(&A_s[g][0], &A_scales_row[g][i0 * BLK], BLK * sizeof(uint8_t));
+        memcpy(&B_s[g][0], &B_scales_col[g][j0 * BLK], BLK * sizeof(uint8_t));
+      }
+
+      // Step 2: Load scale factors
+      // sel=0 for A (activation) scales, sel=1 for B (weight) scales
+      gemmini_mx_load_scales((uint64_t)A_s, A_S_BYTES, 0);  // sel=0 -> A scales
+      gemmini_mx_load_scales((uint64_t)B_s, B_S_BYTES, 1);  // sel=1 -> B scales
+
+      // Step 3: (No LUT needed for FP8, uselut=0)
+
+      // Step 4: MVIN A tiles into scratchpad (port 0 via mvin)
+      // A layout: a_base + (i * tiles_K + k) * DIM
+      // A_blk is BLK x MATMUL_K, row stride = MATMUL_K bytes
+      gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+      for (int i = 0; i < tiles_I; i++) {
+        for (int k = 0; k < tiles_K; k++) {
+          const elem_t *src_a = (const elem_t *)A_blk + i * DIM * MATMUL_K + k * DIM;
+          uint32_t dst_a = a_base + (i * tiles_K + k) * DIM;
+          gemmini_extended_mvin(src_a, dst_a, DIM, DIM);
+        }
+      }
+
+      // Step 4b: MVIN B tiles into scratchpad (port 1 via mvin2)
+      // B layout: b_base + (j * tiles_K + k) * DIM
+      // B_blk is BLK x MATMUL_K, row stride = MATMUL_K bytes
+      gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+      for (int j = 0; j < tiles_J; j++) {
+        for (int k = 0; k < tiles_K; k++) {
+          const elem_t *src_b = (const elem_t *)B_blk + j * DIM * MATMUL_K + k * DIM;
+          uint32_t dst_b = b_base + (j * tiles_K + k) * DIM;
+          gemmini_extended_mvin2(src_b, dst_b, DIM, DIM);
+        }
+      }
+
+      // Step 5: Configure output stride and requantizer
+      // Output is BLK x BLK bf16 values; output stride in bytes
+      gemmini_config_st(BLK_OUTC * sizeof(out_t));
+      gemmini_mxquant_config_mvout((uint64_t)scale_factors,
+          tiles_I, tiles_J, tiles_K,
+          0, 0, 1);  // scale_act_sel=0, scale_w_sel=0, lut_update_granularity=1
+
+      // Step 6: Compute - fused hardware weight-stationary matmul
+      // The macro internally issues LOOP_WS_CONFIG_SPAD_AB (funct 24) then LOOP_WS (funct 8)
+      // B spad end address = BANK_NUM * BANK_ROWS (top of scratchpad)
+      // D=0 means no bias, C=SPAD_DEST is the output destination in mx_smem
+      gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K,
+          0, 0, 0,
+          a_base, (uint32_t)(BANK_NUM * BANK_ROWS), 0, SPAD_DEST,
+          false, false,
+          false, false, false,
+          NO_ACTIVATION, 0, 0, false, 0x38);
+
+      // Step 7: Drain BF16 results from mx_smem to DRAM
+      // Results packed 4 BF16 per uint64; smem word offset = SPAD_DEST * 16
+      // num_bf16 = BLK * BLK (total BF16 elements)
+      gemmini_mx_read_smem((uint64_t)&C_blk[0][0], SPAD_DEST * 16, BLK * BLK);
+      gemmini_fence();
+
+      // Step 8: Unpack BF16 results from C_blk into C_acc
+      // C_blk is packed: 4 BF16 values per uint64 word
+      // C_blk[r][c/4] holds 4 consecutive BF16 values for row r
+      for (int r = 0; r < BLK; r++) {
+        for (int c = 0; c < BLK; c++) {
+          uint16_t b = (uint16_t)((C_blk[r][c / 4] >> ((c % 4) * 16)) & 0xFFFF);
+          C_acc[i0 * BLK + r][j0 * BLK + c] = bf16f(b);
+        }
+      }
+    }
+  }
+}
