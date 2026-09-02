@@ -123,7 +123,10 @@ class AccumulatorScale[T <: Data, U <: Data](
     val iexp_qln2_inv = io.in.bits.acc_read_resp.iexp_qln2_inv
     val scale = io.in.bits.acc_read_resp.scale
 
-    val activated_data = VecInit(data.map(v => VecInit(v.map { e =>
+    // Full-width (un-clipped) activation: keep precision for the MX requantizer, which
+    // wants the full accumulator-width operand (not the narrow rDataType clip used by the
+    // FP path). For SOFTMAX this is iexp(e-max) scaled by inv_sum_exp = the probability P.
+    val activated_full = VecInit(data.map(v => VecInit(v.map { e =>
       val e_act = MuxCase(e, if (has_normalizations) Seq(
         (has_nonlinear_activations.B && act === Activation.RELU) -> e.relu,
         (has_nonlinear_activations.B && has_normalizations.B && act === Activation.LAYERNORM) ->
@@ -143,14 +146,20 @@ class AccumulatorScale[T <: Data, U <: Data](
           io.in.bits.inv_sum_exp.asTypeOf(scale_t)
       )).asTypeOf(scale_t) else scale.asTypeOf(scale_t))
 
-      val e_clipped = e_scaled.clippedToWidthOf(rDataType.head.head)
-
-      e_clipped
+      e_scaled
     })))
+
+    // HW MX softmax: when the act is a normalization/activation, feed the activated data
+    // (e.g. softmax probabilities) into the MX requantizer; otherwise feed the raw accumulator
+    // (preserves the plain-matmul MX path byte-for-byte).
+    val mx_data_sel = if (has_normalizations)
+      Mux(act === Activation.SOFTMAX || act === Activation.LAYERNORM || act === Activation.IGELU,
+          activated_full, acc_read_data)
+      else acc_read_data
 
     io.mx_req_io.mx_data_in.valid := io.in.valid
     io.in.ready := io.mx_req_io.mx_data_in.ready
-    io.mx_req_io.mx_data_in.bits.full_mx_data_in := acc_read_data
+    io.mx_req_io.mx_data_in.bits.full_mx_data_in := mx_data_sel
     io.mx_req_io.mx_data_in.bits.fromDMA := io.in.bits.acc_read_resp.fromDMA
     io.mx_req_io.mx_data_in.bits.is_last_half := io.in.bits.acc_read_resp.is_last_half
     io.mx_req_io.mx_data_in.bits.acc_bank_id := io.in.bits.acc_read_resp.acc_bank_id

@@ -147,12 +147,17 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   val scale_mem_read_w_sel = RegInit(0.U(1.W))
   val scale_mem_counter_reset_flag = RegInit(0.U(1.W))
 
+  // fine-grained MX mode: set by mxquant_config_mvout rs1[63]. Selects the carried per-tile
+  // scale rows (operand-derived, order-independent) over the legacy loop-order counter FSM.
+  val mx_fine_grained_cfg = RegInit(false.B)
+
   val mx_state = if (use_mx_scaling) Some(RegInit((0.U).asTypeOf(new ExControllerMxScalingRegs))) else None
   when(functs(0) === CONFIG_SCALE_MEM) {
       if (use_mx_scaling) {
         mx_state.get.loop_bound_i := rs1s(0)(41,33)
         mx_state.get.loop_bound_j := rs1s(0)(50,42)
         mx_state.get.loop_bound_k := rs1s(0)(59,51)
+        mx_fine_grained_cfg := rs1s(0)(63)
       }
 
       scale_mem_mvout_base_addr_act := rs1s(0)(32,0)
@@ -1078,6 +1083,9 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
 
 
   val address = mesh.io.resp.bits.tag.addr
+  // fine-grained MX: gate for carried per-tile scale rows, from the config bit (mxquant rs1[63]).
+  // false keeps the legacy loop-order counter path → coarse loop_ws stays bit-identical.
+  val mx_fine_grained_w = WireDefault(if (use_mx_scaling) mx_fine_grained_cfg else false.B)
   //val address_no_offset = (address.asUInt & (~("h_f".U)).asUInt).asTypeOf(address)
   val address_no_offset = Cat(address.asUInt >> 4,
   0.U(4.W)).asTypeOf(address)
@@ -1168,12 +1176,21 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
       io.acc.write(i).bits.acc := w_address_sp.accumulate
       io.acc.write(i).bits.mask := w_mask.flatMap(b => Seq.fill(accType.getWidth / (aligned_to * 8))(b))
       io.acc.write(i).bits.offset := offset
+      // fine-grained MX: carry the per-tile scale rows the kernel stashed in the C-address
+      // garbage band [25:14] (act_row=[19:14], w_row=[25:20], 6b each; norm_cmd is at [28:26],
+      // data at [13:0], so this band is the only safe region). Decoded from the full tag addr.
+      io.acc.write(i).bits.mx_fine_grained := mx_fine_grained_w
+      io.acc.write(i).bits.mx_act_row := address.asUInt(19, 14)
+      io.acc.write(i).bits.mx_w_row := address.asUInt(25, 20)
     } else {
       io.acc.write(i).valid := false.B
       io.acc.write(i).bits.addr := DontCare
       io.acc.write(i).bits.data := DontCare
       io.acc.write(i).bits.acc := DontCare
       io.acc.write(i).bits.mask := DontCare
+      io.acc.write(i).bits.mx_fine_grained := false.B
+      io.acc.write(i).bits.mx_act_row := DontCare
+      io.acc.write(i).bits.mx_w_row := DontCare
     }
 
     assert(!(io.acc.write(i).valid && !io.acc.write(i).ready), "Execute controller write to AccumulatorMem was skipped")

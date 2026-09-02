@@ -403,7 +403,17 @@ class Normalizer[T <: Data, U <: Data](max_len: Int, num_reduce_lanes: Int, num_
       (s.state === get_mean || s.state === get_variance) -> i.U }
   )
   val sum_to_divide = stats(sum_to_divide_id).sum
-  val (divider_in, divider_out) = sum_to_divide.divider(stats.head.count, 16).get
+  // LAYERNORM-only integer divider (mean/variance). The MX float acc type has no HW Arithmetic
+  // divider (returns None) -- softmax uses the separate FP exp_divider below, so when the divider
+  // is unavailable we simply don't generate the layernorm divide path (compile-time .isDefined).
+  // getOrElse (not .get): MX float acc type returns None (no HW integer divider). divider_in/out are
+  // referenced in the layernorm state machine below, so provide dummy decoupled wires when absent;
+  // softmax never enters the mean/variance states so the dummies are never driven to fire.
+  val (divider_in, divider_out) = sum_to_divide.divider(stats.head.count, 16).getOrElse {
+    val di = Wire(Decoupled(UInt(1.W)));               di.valid := false.B; di.bits := DontCare
+    val dout = Wire(Decoupled(acc_t.cloneType)); dout.valid := false.B; dout.bits := DontCare
+    (di, dout)
+  }
 
   {
     // Divider input
@@ -460,14 +470,16 @@ class Normalizer[T <: Data, U <: Data](max_len: Int, num_reduce_lanes: Int, num_
 
     sqrt_out.ready := stat.state === waiting_for_stddev
 
-    // TODO this fallback for stddev === 0 only works if acc_t is an SInt
-    assert(acc_t.isInstanceOf[SInt])
-
+    // The stddev===0 fallback (1.asTypeOf) only works for SInt acc_t (layernorm path). For the MX
+    // float acc type, layernorm is unused (softmax-only), so skip the SInt-specific fallback.
     when (stat.state === waiting_for_stddev) {
-      stat.inv_stddev := Mux(sqrt_out.bits.asUInt === acc_t.zero.asUInt,
-        1.S(acc_t.getWidth.W).asTypeOf(acc_t),
-        sqrt_out.bits.asTypeOf(acc_t)
-      )
+      if (acc_t.isInstanceOf[SInt])
+        stat.inv_stddev := Mux(sqrt_out.bits.asUInt === acc_t.zero.asUInt,
+          1.S(acc_t.getWidth.W).asTypeOf(acc_t),
+          sqrt_out.bits.asTypeOf(acc_t)
+        )
+      else
+        stat.inv_stddev := sqrt_out.bits.asTypeOf(acc_t)
     }
   }
 
@@ -476,7 +488,13 @@ class Normalizer[T <: Data, U <: Data](max_len: Int, num_reduce_lanes: Int, num_
       (s.state === get_inv_stddev) -> i.U }
   )
   val stddev_to_inv = stats(stddev_to_inv_id).inv_stddev
-  val (reciprocal_in, reciprocal_out) = stddev_to_inv.reciprocal(scale_t, 16).get
+  // getOrElse: MX float type has no HW reciprocal (None); layernorm inv_stddev path is dead for
+  // softmax-only MX. Dummy wires keep the state-machine references valid (never fire for softmax).
+  val (reciprocal_in, reciprocal_out) = stddev_to_inv.reciprocal(scale_t, 16).getOrElse {
+    val ri = Wire(Decoupled(UInt(1.W)));        ri.valid := false.B; ri.bits := DontCare
+    val ro = Wire(Decoupled(scale_t.cloneType)); ro.valid := false.B; ro.bits := DontCare
+    (ri, ro)
+  }
 
   {
     // Reciprocal input

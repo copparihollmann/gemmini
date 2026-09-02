@@ -315,6 +315,10 @@ object GemminiMxFPConfigs {
     ex_write_to_acc = true,
 
     hardcode_d_to_garbage_addr = false,
+    // HW MX softmax (Normalizer enable) staged but OFF per user direction (don't change RTL yet).
+    // Enabling = set both true; the MX fixes (Vec lanes, divider/reciprocal/sqrt guards) are in the tree
+    // and gated/harmless when off. Next RTL error if enabled: MxFloat .zero/.minimum return a bare type
+    // (Normalizer.scala:778-780) -- needs Wire-wrapping / a hardware-literal MxFloat zero/minimum.
     has_normalizations = false,
 
     mesh_output_delay = 0,

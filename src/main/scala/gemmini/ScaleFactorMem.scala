@@ -5,8 +5,13 @@ import chisel3.util._
 
 
 class ScalingFactorReadReq(addrWidth: Int) extends Bundle {
-  val addr = UInt(addrWidth.W) 
-  val scaling_enable = Bool() 
+  val addr = UInt(addrWidth.W)
+  val scaling_enable = Bool()
+  // fine-grained MX: carried per-tile scale rows (act from i, weight from j), order-independent.
+  // When mx_fine_grained, the SRAM read uses these instead of the loop-order counter FSM.
+  val mx_fine_grained = Bool()
+  val act_row = UInt(7.W)
+  val w_row   = UInt(7.W)
 }
 
 class ScalingFactorReadResp(numRows: Int, numCols: Int) extends Bundle {  
@@ -186,8 +191,14 @@ class ScalingFactorMem(
   val row_addr_width = log2Ceil(2*depth_sram)
   val read_row_addr_act = Wire(UInt(row_addr_width.W))
   val read_row_addr_w = Wire(UInt(row_addr_width.W))
-  read_row_addr_act := (io.scaleMemCntl.loop_bound_i) * (counter_k_runtime >> 1.U) + (counter_i_runtime)
-  read_row_addr_w := (io.scaleMemCntl.loop_bound_j) * (counter_k_runtime >> 1.U) + (counter_j_runtime)
+  // fine-grained MX: address by the carried per-tile rows (order-independent); else the
+  // legacy loop-order counter FSM (keeps the coarse loop_ws path bit-identical).
+  read_row_addr_act := Mux(io.read_req.bits.mx_fine_grained,
+    io.read_req.bits.act_row,
+    (io.scaleMemCntl.loop_bound_i) * (counter_k_runtime >> 1.U) + (counter_i_runtime))
+  read_row_addr_w := Mux(io.read_req.bits.mx_fine_grained,
+    io.read_req.bits.w_row,
+    (io.scaleMemCntl.loop_bound_j) * (counter_k_runtime >> 1.U) + (counter_j_runtime))
   val read_bank_idx_act = WireDefault(read_row_addr_act(row_addr_width - 1))
   val read_bank_idx_w = WireDefault(read_row_addr_w(row_addr_width - 1))
   val read_row_addr_act_real = WireDefault(read_row_addr_act(row_addr_width - 2, 0))

@@ -760,7 +760,11 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
     val (acc_norm_unit_in, acc_norm_unit_out) = Normalizer(
       is_passthru = !config.has_normalizations,
       max_len = block_cols,
-      num_reduce_lanes = -1,
+      // MX feeds the Normalizer half-rows (half_t) per cycle via the is_last_half double-pump, but
+      // num_reduce_lanes=-1 sizes n_lanes from fullDataType (full row) -> AccumulationLanes Vec[full]
+      // vs half_t Vec[half] mismatch (Normalizer.scala:337). Size the reduce lanes to the half_t width
+      // for MX so vec_grouped(n_lanes) matches the per-cycle data. (-1 retains full-width for non-MX.)
+      num_reduce_lanes = if (config.use_mx_scaling) half_t.flatten.size else -1,
       num_stats = 2,
       latency = 4,
       fullDataType = acc_row_t,
@@ -1000,6 +1004,10 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
         }
         bio.write.valid := false.B
         bio.write.bits.offset := DontCare
+        // fine-grained MX carried scale rows (default: legacy counter-FSM path)
+        bio.write.bits.mx_fine_grained := false.B
+        bio.write.bits.mx_act_row := 0.U
+        bio.write.bits.mx_w_row := 0.U
 
         // bio.write.bits.acc := MuxCase(zero_writer.io.resp.bits.laddr.accumulate,
         bio.write.bits.acc := MuxCase(zero_writer_pixel_repeater.io.resp.bits.laddr.accumulate,
@@ -1018,6 +1026,9 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
           bio.write.bits.data := io.acc.write(i).bits.data
           bio.write.bits.mask := io.acc.write(i).bits.mask
           bio.write.bits.offset := io.acc.write(i).bits.offset
+          bio.write.bits.mx_fine_grained := io.acc.write(i).bits.mx_fine_grained
+          bio.write.bits.mx_act_row := io.acc.write(i).bits.mx_act_row
+          bio.write.bits.mx_w_row := io.acc.write(i).bits.mx_w_row
         }.elsewhen (dmaread && !spad_last && !consecutive_write_block) {
           bio.write.valid := true.B
           bio.write.bits.data := Mux(from_mvin_scale,

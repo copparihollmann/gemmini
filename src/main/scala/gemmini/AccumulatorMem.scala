@@ -46,6 +46,11 @@ class AccumulatorWriteReq[T <: Data: Arithmetic](n: Int, t: Vec[Vec[T]]) extends
   val acc = Bool()
   val mask = Vec(t.getWidth / 8, Bool()) // TODO Use aligned_to here
   val offset = UInt(4.W) // TODO(nicolas): not hardcoded
+  // fine-grained MX: carried per-tile scale-SRAM rows (decoupled from loop-order counters).
+  // mx_fine_grained selects these over the legacy counter-FSM addressing in ScaleFactorMem.
+  val mx_fine_grained = Bool()
+  val mx_act_row = UInt(7.W)
+  val mx_w_row   = UInt(7.W)
 }
 
 
@@ -260,14 +265,21 @@ class AccumulatorMem[T <: Data, U <: Data](
     scale_mem.io.read_req.valid := false.B
     scale_mem.io.read_req.bits.addr := DontCare
     scale_mem.io.read_req.bits.scaling_enable := false.B
+    scale_mem.io.read_req.bits.mx_fine_grained := false.B
+    scale_mem.io.read_req.bits.act_row := 0.U
+    scale_mem.io.read_req.bits.w_row := 0.U
     scale_mem.io.read_resp.ready := true.B
     //scale_buffer = RegInit(VecInit(Seq.fill(4)(0.U(9.W))))
-    
+
     when(io.write.fire) { //when accmulation buffer gets the write signal
       //printf(p"[AccumulatorMem] here!!!\n")
       scale_mem.io.read_req.valid := true.B
       scale_mem.io.read_req.bits.scaling_enable := true.B
       scale_mem.io.read_req.bits.addr := calculateScaleAddr(io.write.bits.addr)
+      // fine-grained MX: forward the carried per-tile scale rows from the acc write.
+      scale_mem.io.read_req.bits.mx_fine_grained := io.write.bits.mx_fine_grained
+      scale_mem.io.read_req.bits.act_row := io.write.bits.mx_act_row
+      scale_mem.io.read_req.bits.w_row := io.write.bits.mx_w_row
     }
     when(scale_mem.io.read_resp.valid) {
       when(dataType === 0.U) {
