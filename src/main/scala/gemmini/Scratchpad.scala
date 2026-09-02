@@ -213,7 +213,9 @@ class ScratchpadBank(n: Int, w: Int, aligned_to: Int, single_ported: Boolean, us
     io.read.req.ready := q_will_be_empty && ext_mem.read_req.ready
 
     // TODO (richard): the number of entries here should be configurable
-    val dma_q = Module(new Queue(Bool(), 4, false, true))
+    // TEMP EDIT (ModeLIR bank_dma closure): depth 4 -> 64 to prevent $finish
+    // on sustained >4 outstanding shared-SMEM reads (simt_contention). REVERT after run.
+    val dma_q = Module(new Queue(Bool(), 64, false, true))
     dma_q.io.enq.valid := ren
     dma_q.io.enq.bits := fromDMA
     dma_q.io.deq.ready := q.io.enq.fire
