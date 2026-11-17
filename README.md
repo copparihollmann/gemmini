@@ -12,6 +12,9 @@ Gemmini is part of the [Chipyard](https://github.com/ucb-bar/chipyard) ecosystem
 
 This document is intended to provide information for beginners wanting to try out Gemmini, as well as more advanced in-depth information for those who might want to start hacking on Gemmini's source code.
 
+For the opt-in DIM16 mixed-format transformer-layer kernels and their native
+repository layout, see [MicroMX software integration](docs/micromix-software.md).
+
 ![Gemmini's high-level architecture](./img/gemmini-system.png)
 
 Quick Start
