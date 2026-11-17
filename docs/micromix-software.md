@@ -16,7 +16,8 @@ interface use the supporting forks below.
 git clone --branch kernels/micro-mx https://github.com/copparihollmann/gemmini.git
 cd gemmini
 git submodule update --init npu-exploration software/libgemmini software/gemmini-rocc-tests
-git -C software/gemmini-rocc-tests submodule update --init --recursive
+git -C software/gemmini-rocc-tests submodule update --init riscv-tests
+git -C software/gemmini-rocc-tests/riscv-tests submodule update --init env
 ```
 
 | Component | Repository |
